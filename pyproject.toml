@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "optics-weave"
+version = "0.1.0"
+authors = [
+  { name="opticsWolf", email="opticswolf@protonmail.com" },
+]
+description = "A modular PySide6 framework for visual synthesis of high-concurrency simulation workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "PySide6>=6.4.0",
+]
+
+[project.scripts]
+weave-gui = "weave.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
