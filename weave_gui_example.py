@@ -46,7 +46,7 @@ if __name__ == "__main__":
         view.centerOn(0, 0)
         view.show()
         
-        print("\n=== Enhanced Node Canvas v12 (Performance Optimized) ===")
+        print("\n=== Weave Node Canvas v12 ===")
         print("Performance Improvements:")
         print("  • Cached style properties (50-100x faster access)")
         print("  • Optimized shake detection (delta-based, O(1))")
