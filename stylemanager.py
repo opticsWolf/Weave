@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Centralized Style Management System for Qt Node Canvas Components.
+Weave: A modular PySide6 framework for the visual synthesis 
+and execution of high-concurrency simulation workflows.
+Copyright (c) 2026 opticsWolf
+
+SPDX-License-Identifier: Apache-2.0
+
+Centralized Style Management System for Node Canvas Components.
 
 Based on your implementation with a few suggested enhancements:
 1. Added PortStyleSchema (was declared but missing)
