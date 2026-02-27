@@ -35,9 +35,7 @@ from PySide6.QtGui import (
 )
 
 # Import node components (unchanged from original)
-from weave.node.node_components import (
-    NodeBody, NodeHeader, NodeState, highlight_colors, ResizeHandle
-)
+from weave.node.node_components import NodeBody, NodeHeader
 from weave.node.node_subcomponents import (
    NodeState, highlight_colors, ResizeHandle
 )
@@ -82,8 +80,8 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
 
         # 1. Configuration & State Setup
         self._config = StyleManager.instance().get_all(StyleCategory.NODE)
-        self._config.update(self._get_port_config_for_node())
-
+        self._port_config = StyleManager.instance().get_all(StyleCategory.PORT)
+        
         if config:
             self.set_config(strict=False, **config)
 
@@ -95,7 +93,7 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         self.is_minimized = False
         self._is_hovered = False
 
-        # Custom color attributes
+        # Custom color attributes (no longer using fallbacks)
         self._custom_header_bg = None
         self._custom_header_outline = None
         self._custom_body_bg = None
@@ -139,7 +137,7 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         )
         self.setAcceptHoverEvents(True)
 
-        # 4. Animation Logic
+        # 4. Animation Logic - simplified
         self._anim = QVariantAnimation(self)
         self._anim.setDuration(self._config['minimize_anim_duration'])
         self._anim.setEasingCurve(QEasingCurve.Type.OutQuad)
@@ -231,14 +229,21 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         # 3. Restore Colors
         colors = state.get("colors", {})
 
-        def _parse_col(key):
-            val = colors.get(key)
-            return QColor(val) if val else None
+        def _parse_col(val):
+            """Convert color value to QColor using StyleManager's utilities."""
+            if not val:
+                return None
+            try:
+                # If it's already a QColor or compatible with QColor constructor, use directly
+                return QColor(val)
+            except Exception:
+                # Fallback: Return transparent black on error
+                return QColor(0, 0, 0, 0)
 
         self.set_node_colors(
-            header_bg=_parse_col("header_bg"),
-            body_bg=_parse_col("body_bg"),
-            outline=_parse_col("header_outline"),
+            header_bg=_parse_col(colors.get("header_bg")),
+            body_bg=_parse_col(colors.get("body_bg")),
+            outline=_parse_col(colors.get("header_outline")),
         )
         if colors.get("body_outline"):
             self._custom_body_outline = QColor(colors["body_outline"])
@@ -329,9 +334,9 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         # ==================================================================
         # 1. DROP SHADOW
         # ==================================================================
-        if cfg.get('shadow_enabled', True):
-            dist = cfg.get('shadow_offset', 5.0)
-            angle_deg = cfg.get('shadow_angle', 45.0)
+        if cfg['shadow_enabled']:
+            dist = cfg['shadow_offset']
+            angle_deg = cfg['shadow_angle']
             angle_rad = math.radians(angle_deg)
             dx = dist * math.cos(angle_rad)
             dy = dist * math.sin(angle_rad)
@@ -340,14 +345,14 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
             painter.translate(dx, dy)
 
             # A. Draw Solid Core
-            shadow_color = QColor(0, 0, 0, cfg.get('shadow_opacity', 60))
+            shadow_color = QColor(0, 0, 0, cfg['shadow_opacity'])
             painter.setBrush(shadow_color)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawPath(self._cached_outline_path)
 
             # B. Blur / Soft Edge
-            blur_rad = cfg.get('shadow_blur_radius', 8.0)
-            layers = cfg.get('shadow_blur_layers', 4)
+            blur_rad = cfg['shadow_blur_radius']
+            layers = cfg['shadow_blur_layers']
             if blur_rad > 0 and layers > 0:
                 margin = blur_rad * 2
                 clip_path = QPainterPath()
@@ -358,7 +363,7 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
                 painter.setClipPath(clip_path)
 
                 blur_color = QColor(0, 0, 0)
-                blur_color.setAlpha(cfg.get('shadow_blur_opacity', 5))
+                blur_color.setAlpha(cfg['shadow_blur_opacity'])
                 painter.setBrush(Qt.BrushStyle.NoBrush)
 
                 for i in range(layers):
@@ -395,26 +400,26 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         glow_opacity = 0
         current_glow_path = None
 
-        if is_selected and cfg.get('sel_glow_enabled', True):
+        if is_selected and cfg['sel_glow_enabled']:
             draw_glow = True
             current_glow_path = self._cached_glow_path
             glow_width = cfg['sel_glow_width']
             glow_layers = cfg['sel_glow_layers']
             glow_opacity = cfg['sel_glow_opacity_start']
 
-            if cfg.get('use_header_color_for_glow', True):
+            if cfg['use_header_color_for_glow']:
                 glow_color = QColor(self.header._bg_color)
             else:
                 glow_color = QColor(cfg['sel_border_color'])
 
-        elif self._is_hovered and not is_selected and cfg.get('hover_glow_enabled', True):
+        elif self._is_hovered and not is_selected and cfg['hover_glow_enabled']:
             draw_glow = True
             current_glow_path = self._cached_hover_path
             glow_width = cfg['hover_glow_width']
             glow_layers = cfg['hover_glow_layers']
             glow_opacity = cfg['hover_glow_opacity_start']
 
-            if cfg.get('use_header_color_for_hover_glow', True):
+            if cfg['use_header_color_for_hover_glow']:
                 glow_color = QColor(self.header._bg_color)
             else:
                 glow_color = QColor(cfg['hover_glow_color'])
@@ -439,7 +444,7 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
 
         # --- DRAW SELECTION BORDER ---
         if is_selected:
-            if cfg.get('use_header_color_for_outline', True):
+            if cfg['use_header_color_for_outline']:
                 border_base = self.header._bg_color
             else:
                 border_base = cfg['sel_border_color']
@@ -458,13 +463,13 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
 
             pulse_base = QColor(self.header._bg_color)
 
-            pulse_glow_width_min = cfg.get('computing_glow_width_min', 2.0)
-            pulse_glow_width_max = cfg.get('computing_glow_width_max', 14.0)
-            pulse_opacity_min = cfg.get('computing_glow_opacity_min', 15)
-            pulse_opacity_max = cfg.get('computing_glow_opacity_max', 90)
-            pulse_layers = cfg.get('computing_glow_layers', 5)
-            pulse_border_width = cfg.get('computing_border_width', 1.5)
-            pulse_border_opacity = cfg.get('computing_border_opacity', 160)
+            pulse_glow_width_min = cfg['computing_glow_width_min']
+            pulse_glow_width_max = cfg['computing_glow_width_max']
+            pulse_opacity_min = cfg['computing_glow_opacity_min']
+            pulse_opacity_max = cfg['computing_glow_opacity_max']
+            pulse_layers = cfg['computing_glow_layers']
+            pulse_border_width = cfg['computing_border_width']
+            pulse_border_opacity = cfg['computing_border_opacity']
 
             active_width = pulse_glow_width_min + phase * (pulse_glow_width_max - pulse_glow_width_min)
             active_opacity = int(pulse_opacity_min + phase * (pulse_opacity_max - pulse_opacity_min))

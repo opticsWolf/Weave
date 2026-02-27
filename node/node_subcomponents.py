@@ -98,13 +98,13 @@ class StateSlider(QGraphicsObject):
             self.prepareGeometryChange()
         
         # 1. Geometry properties
-        base_h = cfg.get('state_slider_height', 12.0)
-        self._padding = cfg.get('state_slider_padding', 2.0) 
+        base_h = cfg['state_slider_height']
+        self._padding = cfg['state_slider_padding'] 
         self._height = base_h + (2 * self._padding)
-        self._width = base_h * cfg.get('state_slider_width_ratio', 2.0)
+        self._width = base_h * cfg['state_slider_width_ratio']
         
         # 2. Animation properties
-        self._animation_duration = cfg.get('state_slider_animation_duration', 75)
+        self._animation_duration = cfg['state_slider_animation_duration']
         self._animation.setDuration(self._animation_duration)
         
         self.update()
@@ -137,7 +137,6 @@ class StateSlider(QGraphicsObject):
             
         self._current_state = state
         
-        # Map state to numeric value
         end_val = 0.0
         if state == NodeState.PASSTHROUGH:
             end_val = 1.0
@@ -153,27 +152,38 @@ class StateSlider(QGraphicsObject):
             self._anim_value = end_val
             self.update()
 
+    # ------------------------------------------------------------------
+    # Color Interpolation
+    # ------------------------------------------------------------------
+
     def _interpolate_color(self) -> QColor:
-        """Interpolates between icon_colors defined in node config based on anim_value."""
+        """
+        Interpolates between icon_colors based on anim_value.
+
+        Reads state_visuals through StyleManager.get() which performs
+        read-time conversion of list colors → QColor.  Uses STRING keys
+        ('NORMAL', 'PASSTHROUGH', 'DISABLED') matching core_theme.BASE_DEFAULTS.
+        """
+        
         v = self._anim_value
         cfg = self._node_header._node._config
-        visuals = cfg.get('state_visuals', {})
-        
-        # Fallback values if config is missing - ensuring they're always valid
-        c_norm = visuals.get(NodeState.NORMAL, {}).get("icon_color", QColor(100, 220, 100))
-        c_pass = visuals.get(NodeState.PASSTHROUGH, {}).get("icon_color", QColor(255, 180, 50))
-        c_dist = visuals.get(NodeState.DISABLED, {}).get("icon_color", QColor(220, 60, 60))
-        
+        visuals = cfg['state_visuals']
+
+        # Resolve the three relevant icon_colors (already QColor from read-time conversion)
+        normal_ic    = visuals.get('NORMAL',      {}).get('icon_color', QColor(100, 220, 100))
+        passthru_ic  = visuals.get('PASSTHROUGH',  {}).get('icon_color', QColor(255, 180, 50))
+        disabled_ic  = visuals.get('DISABLED',     {}).get('icon_color', QColor(220, 60, 60))
+
         if v <= 1.0:
             ratio = v
-            c1, c2 = c_norm, c_pass
+            c1, c2 = normal_ic, passthru_ic
         else:
             ratio = v - 1.0
-            c1, c2 = c_pass, c_dist
-            
-        r = c1.red() + (c2.red() - c1.red()) * ratio
+            c1, c2 = passthru_ic, disabled_ic
+
+        r = c1.red()   + (c2.red()   - c1.red())   * ratio
         g = c1.green() + (c2.green() - c1.green()) * ratio
-        b = c1.blue() + (c2.blue() - c1.blue()) * ratio
+        b = c1.blue()  + (c2.blue()  - c1.blue())  * ratio
         return QColor(int(r), int(g), int(b))
 
     # --- Hover Feedback (visual only) ---
@@ -204,12 +214,12 @@ class StateSlider(QGraphicsObject):
         
         # Use header outline color and body background color
         outline_color = self._node_header._outline_color 
-        body_bg = cfg.get('body_bg', QColor(45, 45, 45))
+        body_bg = cfg['body_bg']
         
         # Apply hover highlight to background and knob only (not the edge)
-        is_hover_hl = self._hovered and cfg.get('state_slider_highlight_on_hover', True)
+        is_hover_hl = self._hovered and cfg['state_slider_highlight_on_hover']
         if is_hover_hl:
-            shift = cfg.get('state_slider_highlight_color_shift', 10)
+            shift = cfg['state_slider_highlight_color_shift']
             body_bg = highlight_colors(body_bg, shift/2)
         
         painter.setPen(QPen(outline_color, 1.5))
@@ -272,17 +282,17 @@ class MinimizeButton(QGraphicsObject):
             self.prepareGeometryChange()
         
         # Load settings for button appearance
-        btn_size = cfg.get('minimize_btn_size', 12)
+        btn_size = cfg['minimize_btn_size']
         self._btn_radius = btn_size / 2.0
         
-        # Colors based on configuration
-        self._normal_color = cfg.get('minimize_btn_normal_color', QColor(200, 200, 200))
-        self._hover_color = cfg.get('minimize_btn_hover_color', QColor(240, 240, 240))
-        self._minimized_color = cfg.get('minimize_btn_minimized_color', QColor(150, 150, 150))
+        # Colors based on configuration - no fallback needed now that schema provides all defaults
+        self._normal_color = cfg['minimize_btn_normal_color']
+        self._hover_color = cfg['minimize_btn_hover_color']
+        self._minimized_color = cfg['minimize_btn_minimized_color']
         
         # Additional configuration options
-        self._border_width = cfg.get('minimize_btn_border_width', 0.0)
-        self._border_color = cfg.get('minimize_btn_border_color', QColor(0, 0, 0, 0))  # Transparent by default
+        self._border_width = cfg['minimize_btn_border_width']
+        self._border_color = cfg['minimize_btn_border_color']
         
         # Update rect based on current size
         if not self._rect.isEmpty():
@@ -404,10 +414,10 @@ class EditableTitle(QGraphicsTextItem):
         cfg = self._header._node._config
         font = QFont(cfg['font_family'], cfg['font_size'])
         if is_selected:
-            font.setWeight(QFont.Weight(cfg['sel_font_weight']))
+            font.setWeight(cfg['sel_font_weight'])
             font.setItalic(cfg['sel_font_italic'])
         else:
-            font.setWeight(QFont.Weight(cfg['font_weight']))
+            font.setWeight(cfg['font_weight'])
             font.setItalic(cfg['font_italic'])
         self.setFont(font)
 

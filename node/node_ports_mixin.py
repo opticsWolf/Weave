@@ -264,7 +264,7 @@ class NodePortsMixin:
 
         Handles COMPUTING state with animated pulsing glow.
         """
-        from PySide6.QtCore import QVariantAnimation
+        #from PySide6.QtCore import QVariantAnimation
 
         vis_conf = self._config.get('state_visuals', {})
         default_vis = vis_conf.get('NORMAL', {'opacity': 1.0, 'overlay': QColor(0, 0, 0, 0)})

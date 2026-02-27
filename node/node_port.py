@@ -11,37 +11,13 @@ Node Port - Fixed version with complete overlay propagation and rendering.
 This file contains the fixed NodePort class that properly propagates state overlays 
 to connected traces and renders them visually.
 """
-
-from typing import Optional, List, TYPE_CHECKING
+import uuid
+from typing import Optional, List
 from PySide6.QtWidgets import QGraphicsItem, QStyleOptionGraphicsItem
 from PySide6.QtCore import Qt, QRectF, QPointF
 from PySide6.QtGui import QPainter, QColor, QPainterPath, QFont, QBrush, QFontMetrics
 
-#if TYPE_CHECKING:
-#    from weave.node.node_trace import NodeTrace
-#    from weave.node.node_core import Node
-
-'''
-# Import the port registry for type management (this remains needed)
-import sys
-from pathlib import Path
-
-# 1. Resolve the absolute path to the parent directory
-# .parents[1] gets the grandparent (the project root)
-root_path = Path(__file__).resolve().parents[1]
-
-# 2. Add to sys.path if not already present
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
-try:
-    from portregistry import PortRegistry
-except ImportError as e:
-    print(f"Critial Import Failure: {e}")
-    sys.exit(1)
-'''
 from weave.portregistry import PortRegistry
-
-# Import StyleManager for compatibility
 from weave.stylemanager import StyleManager, StyleCategory
 
 
@@ -79,7 +55,8 @@ class NodePort(QGraphicsItem):
         'cfg',
         '_style_manager',
         '_state_overlay_color',  # New attribute for state overlay color
-        'is_summary_port'       # True for dummy ports on minimized nodes
+        'is_summary_port',       # True for dummy ports on minimized nodes
+        '_port_uuid'             # Added for unique port identification
     )
 
     def __init__(self, parent: 'Node', name: str, datatype: str, is_output: bool, 
@@ -113,17 +90,21 @@ class NodePort(QGraphicsItem):
         # Add state overlay color attribute - NEW
         self._state_overlay_color = Qt.GlobalColor.transparent
         
+        # ADD UUID GENERATION FOR PORT IDENTIFICATION
+        self._port_uuid = uuid.uuid4()
+        
         # 2. Geometry Config - Get from StyleManager instead of node config
         self.cfg = self._get_port_config()
         
         # Set radius from config (used by geometry calculations)
-        self.radius = self.cfg.get('port_radius', 8)
+        # Uses 'radius' — the canonical name from PortStyleSchema
+        self.radius = self.cfg.get('radius', 8)
         
         # 3. Pre-calculate Brushes (Performance: Avoid creating QBrush in paint loop)
         self._brush_default = QBrush(self.color)
         
         # Use helper function for highlight color
-        hl_color = self._highlight_colors(self.color, self.cfg['port_highlight'], 20)
+        hl_color = self._highlight_colors(self.color, self.cfg['highlight'], 20)
         self._brush_highlight = QBrush(hl_color)
         
         # 4. Pre-calculate Paths
@@ -134,7 +115,7 @@ class NodePort(QGraphicsItem):
         
         # 5. Port Label (Create if port area is enabled)
         self._label: Optional[PortLabel] = None
-        if self.cfg.get('enable_port_area', False):
+        if self.cfg.get('enable_area', False):
             self._create_label()
         
         # 6. Set Tooltip
@@ -148,130 +129,44 @@ class NodePort(QGraphicsItem):
         self._style_manager.register(self, StyleCategory.PORT)
 
 
-    def _get_port_config(self):
+    def get_uuid(self) -> uuid.UUID:
         """
-        Get the current port configuration from StyleManager.
+        Get the unique identifier for this port.
         
-        Translates PortStyleSchema keys to the legacy key names expected by
-        the rest of the codebase (e.g., 'radius' -> 'port_radius').
+        This UUID provides a persistent way to identify ports across their lifetime,
+        even if other attributes like name or datatype change.
         
         Returns:
-            A dictionary of port-specific styling parameters with legacy keys.
+            A uuid.UUID object that uniquely identifies this port instance.
         """
-        raw = self._style_manager.get_all(StyleCategory.PORT)
+        return self._port_uuid
+    
+    def get_uuid_string(self) -> str:
+        """
+        Get the unique identifier for this port as a string representation.
         
-        # Map PortStyleSchema keys to legacy expected keys
-        return {
-            # Port Geometry
-            'port_radius': raw.get('radius', 8),
-            'port_offset': raw.get('offset', 1),
-            'port_min_spacing': raw.get('min_spacing', 25),
-            'port_highlight': raw.get('highlight', 50),
-            
-            # Inner Circle
-            'inner_port_radius': raw.get('inner_radius', 4),
-            'inner_port_color': raw.get('inner_color'),
-            'port_use_outline_color': raw.get('use_outline_color', True),
-            'port_use_outline_bright': raw.get('outline_bright', 50),
-            
-            # Connection Drag Visuals
-            'compatible_saturation': raw.get('compatible_saturation', 30),
-            'compatible_brightness': raw.get('compatible_brightness', 40),
-            'incompatible_opacity': raw.get('incompatible_opacity', 0.67),
-            'incompatible_saturation': raw.get('incompatible_saturation', -60),
-            'incompatible_brightness': raw.get('incompatible_brightness', -60),
-            
-            # Port Area
-            'enable_port_area': raw.get('enable_area', True),
-            'port_area_top': raw.get('area_top', True),
-            'port_area_padding': raw.get('area_padding', 10),
-            'port_area_margin': raw.get('area_margin', 10),
-            'port_area_bg': raw.get('area_bg'),
-            
-            # Port Labels
-            'port_label_font_family': raw.get('label_font_family', 'Segoe UI'),
-            'port_label_font_size': raw.get('label_font_size', 9),
-            'port_label_font_weight': raw.get('label_font_weight'),
-            'port_label_font_italic': raw.get('label_font_italic', False),
-            'port_label_color': raw.get('label_color'),
-            'port_label_max_width': raw.get('label_max_width', 120),
-            'port_label_spacing': raw.get('label_spacing', 8),
-            'port_label_connected_color_shift': raw.get('label_connected_color_shift', 40),
-            'port_label_connected_weight': raw.get('label_connected_weight'),
-            'port_label_connected_italic': raw.get('label_connected_italic', False),
-        }
-
-
-    # Key mapping from PortStyleSchema to legacy keys
-    _KEY_MAP = {
-        'radius': 'port_radius',
-        'offset': 'port_offset',
-        'min_spacing': 'port_min_spacing',
-        'highlight': 'port_highlight',
-        'inner_radius': 'inner_port_radius',
-        'inner_color': 'inner_port_color',
-        'use_outline_color': 'port_use_outline_color',
-        'outline_bright': 'port_use_outline_bright',
-        'enable_area': 'enable_port_area',
-        'area_top': 'port_area_top',
-        'area_padding': 'port_area_padding',
-        'area_margin': 'port_area_margin',
-        'area_bg': 'port_area_bg',
-        'label_font_family': 'port_label_font_family',
-        'label_font_size': 'port_label_font_size',
-        'label_font_weight': 'port_label_font_weight',
-        'label_font_italic': 'port_label_font_italic',
-        'label_color': 'port_label_color',
-        'label_max_width': 'port_label_max_width',
-        'label_spacing': 'port_label_spacing',
-        'label_connected_color_shift': 'port_label_connected_color_shift',
-        'label_connected_weight': 'port_label_connected_weight',
-        'label_connected_italic': 'port_label_connected_italic',
-    }
-
-    def on_style_changed(self, category: StyleCategory, changes: dict) -> None:
-        """
-        Callback method called when the StyleManager notifies about style changes.
+        This is useful for serialization, logging, and other string-based operations
+        where working with UUID objects directly might be cumbersome.
         
-        Args:
-            category: The style category that changed (should be StyleCategory.PORT)
-            changes: Dictionary of changed keys and their new values (schema keys)
+        Returns:
+            A string representation of the port's UUID.
         """
-        if category == StyleCategory.PORT:
-            # Translate schema keys to legacy keys and update config
-            translated = {self._KEY_MAP.get(k, k): v for k, v in changes.items()}
-            self.cfg.update(translated)
-            
-            # Update self.radius if it changed
-            if 'radius' in changes:
-                self.radius = changes['radius']
-            
-            # Rebuild brushes for any color-related changes
-            if 'inner_color' in changes or 'highlight' in changes:
-                # Only rebuild highlight brush if we need to (optimization)
-                hl_color = self._highlight_colors(self.color, self.cfg['port_highlight'], 20)
-                self._brush_highlight = QBrush(hl_color)
-            
-            # Rebuild paths if radius changed
-            if 'radius' in changes or 'inner_radius' in changes:
-                self._rebuild_paths()
-                
-            # Update label style if needed
-            if self._label and ('label_font_family' in changes or 
-                               'label_font_size' in changes or
-                               'label_font_weight' in changes or
-                               'label_font_italic' in changes or
-                               'label_color' in changes or
-                               'label_connected_color_shift' in changes or
-                               'label_connected_weight' in changes or
-                               'label_connected_italic' in changes):
-                self.refresh_label_style()
-            
-            # Update label if it exists and port area settings changed
-            if self._label:
-                self._position_label()
-                
-            self.update()
+        return str(self._port_uuid)
+    
+    def _get_port_config(self) -> dict:
+        """
+        Get the current port configuration from StyleManager.
+
+        Returns the raw style dictionary from StyleManager directly, using the
+        canonical key names defined in PortStyleSchema (core_theme.py). No
+        remapping is performed — callers must use the schema's own names
+        (e.g. 'radius', not 'port_radius'; 'inner_color', not 'inner_port_color';
+        'enable_area', not 'enable_port_area').
+
+        Returns:
+            A dictionary of port styling parameters keyed by PortStyleSchema field names.
+        """
+        return self._style_manager.get_all(StyleCategory.PORT)
 
 
     def _highlight_colors(self, color: QColor, b_offset: int, s_offset: int = 0) -> QColor:
@@ -282,7 +177,7 @@ class NodePort(QGraphicsItem):
         return QColor.fromHsl(h, s, l, a)
 
     # ==========================================================================
-    # PORT AREA & LABEL METHODS (unchanged)
+    # PORT AREA & LABEL METHODS
     # ==========================================================================
 
     def _create_label(self):
@@ -296,22 +191,22 @@ class NodePort(QGraphicsItem):
         else:
             label_text = f"{self.name} ({type_display})"
         
-        # Create label with configuration
+        # Create label with configuration using PortStyleSchema key names
         self._label = PortLabel(self, label_text)
         self._label.set_config(
-            font_family=cfg.get('port_label_font_family', 'Segoe UI'),
-            font_size=cfg.get('port_label_font_size', 9),
-            font_weight=cfg.get('port_label_font_weight', QFont.Weight.Normal),
-            font_italic=cfg.get('port_label_font_italic', False),
-            color=cfg.get('port_label_color', QColor(200, 200, 200)),
-            max_width=cfg.get('port_label_max_width', 120)
+            font_family=cfg.get('label_font_family', 'Segoe UI'),
+            font_size=cfg.get('label_font_size', 9),
+            font_weight=cfg.get('label_font_weight', QFont.Weight.Normal),
+            font_italic=cfg.get('label_font_italic', False),
+            color=cfg.get('label_color', QColor(200, 200, 200)),
+            max_width=cfg.get('label_max_width', 120)
         )
         
         self._position_label()
 
     def _rebuild_paths(self) -> None:
         r = self.radius
-        inner_r = self.cfg.get('inner_port_radius', 4.0)
+        inner_r = self.cfg.get('inner_radius', 4.0)
         
         # Outer Path (Half-Circle)
         self._cached_path = QPainterPath()
@@ -329,14 +224,14 @@ class NodePort(QGraphicsItem):
         
         # Bounding Rect (Slightly larger to avoid clipping)
         margin = 2.0
-        self._boundingRect = QRectF(-r - margin, -r - margin, 2*r + 2*margin, 2*r + 2*margin)
+        self._boundingRect = QRectF(-r - margin, -r -margin, 2*r + 2*margin, 2*r + 2*margin)
 
     def _position_label(self) -> None:
         """Positions the label relative to the port."""
         if not self._label:
             return
         
-        spacing = self.cfg.get('port_label_spacing', 8)
+        spacing = self.cfg.get('label_spacing', 8)
         r = self.radius
         
         if self.is_output:
@@ -369,7 +264,7 @@ class NodePort(QGraphicsItem):
         """Returns the total width occupied by the label."""
         if not self._label:
             return 0.0
-        return self._label.get_width() + self.cfg.get('port_label_spacing', 8) + self.radius
+        return self._label.get_width() + self.cfg.get('label_spacing', 8) + self.radius
     
     def get_label_height(self) -> float:
         """Returns the height of the label."""
@@ -441,49 +336,50 @@ class NodePort(QGraphicsItem):
         self.disconnect_all()
 
     # ==========================================================================
-    # CONNECTION STATE VISUALS (still needed)
+    # CONNECTION STATE VISUALS
     # ==========================================================================
 
     def set_connection_state(self, is_compatible: bool) -> None:
         self._is_connection_active = True
         
         if is_compatible:
-            sat_delta = self.cfg.get('conn_compatible_saturation', 30)
-            val_delta = self.cfg.get('conn_compatible_brightness', 40)
+            sat_delta = self.cfg['compatible_saturation']
+            val_delta = self.cfg['compatible_brightness']
             new_color = self._highlight_colors(self.color, val_delta, sat_delta)
             
             self._temp_opacity = 1.0
             self._temp_brush = QBrush(new_color)
             
             # Inner circle highlight logic
-            if self.cfg.get('port_use_outline_color', True):
-                base_inner = self.node.body._outline_color
-                shift = self.cfg.get('port_use_outline_bright', 25)
-                base_inner = self._highlight_colors(base_inner, shift, 0)
+            if self.cfg['use_outline_color']:
+                # Derive base from the node body's outline color, shifted by outline_bright
+                base_inner = self._highlight_colors(
+                    self.node.body._outline_color, self.cfg['outline_bright'], 0
+                )
+                inner_col = self._highlight_colors(base_inner, self.cfg['highlight'] * 1.33, 20)
+                self._temp_inner_brush = QBrush(inner_col)
             else:
-                base_inner = self.cfg.get('inner_port_color', QColor(50, 53, 61))
-            
-            hl_val = self.cfg['port_highlight'] * 1.33
-            inner_col = self._highlight_colors(base_inner, hl_val, 20)
-            self._temp_inner_brush = QBrush(inner_col)
+                base_inner = self.cfg['inner_color']
+                self._temp_inner_brush = QBrush(base_inner)
         else:
-            self._temp_opacity = self.cfg.get('conn_incompatible_opacity', 0.2)
-            sat_delta = self.cfg.get('conn_incompatible_saturation', -150)
-            val_delta = self.cfg.get('conn_incompatible_brightness', -50)
+            self._temp_opacity = self.cfg['incompatible_opacity']
+            sat_delta = self.cfg['incompatible_saturation']
+            val_delta = self.cfg['incompatible_brightness']
             
             new_color = self._highlight_colors(self.color, val_delta, sat_delta)
             self._temp_brush = QBrush(new_color)
 
             # Inner circle dimming logic
-            if self.cfg.get('port_use_outline_color', True):
-                base_inner = self.node.body._outline_color
-                shift = self.cfg.get('port_use_outline_bright', 25)
-                base_inner = self._highlight_colors(base_inner, shift, 0)
+            if self.cfg['use_outline_color']:
+                # Derive base from the node body's outline color, shifted by outline_bright
+                base_inner = self._highlight_colors(
+                    self.node.body._outline_color, self.cfg['outline_bright'], 0
+                )
+                inner_col = self._highlight_colors(base_inner, val_delta, sat_delta)
+                self._temp_inner_brush = QBrush(inner_col)
             else:
-                base_inner = self.cfg.get('inner_port_color', QColor(50, 53, 61))
-            
-            inner_col = self._highlight_colors(base_inner, val_delta, sat_delta)
-            self._temp_inner_brush = QBrush(inner_col)
+                base_inner = self.cfg['inner_color']
+                self._temp_inner_brush = QBrush(base_inner)
 
         self.update()
 
@@ -513,7 +409,7 @@ class NodePort(QGraphicsItem):
             self.update() 
 
     # ==========================================================================
-    # STATE MANAGEMENT (unchanged)
+    # STATE MANAGEMENT
     # ==========================================================================
     
     def get_state(self) -> dict:
@@ -529,7 +425,7 @@ class NodePort(QGraphicsItem):
         }
 
     # ==========================================================================
-    # RENDERING (FIXED)
+    # RENDERING
     # ==========================================================================
 
     def boundingRect(self) -> QRectF:
@@ -705,7 +601,7 @@ class NodePort(QGraphicsItem):
                     if other_port:
                         other_col = other_port.color
                         if self._is_highlighted:
-                            other_col = self._highlight_colors(other_col, self.cfg['port_highlight'], 20)
+                            other_col = self._highlight_colors(other_col, self.cfg['highlight'], 20)
                         
                         # Also blend overlay with the complementary color
                         if (self._state_overlay_color is not None and 
@@ -724,15 +620,16 @@ class NodePort(QGraphicsItem):
         if self._temp_inner_brush:
             inner_brush = self._temp_inner_brush
         else:
-            if self.cfg.get('port_use_outline_color', True):
-                base_inner = self.node.body._outline_color
-                shift = self.cfg.get('port_use_outline_bright', 25)
-                base_inner = self._highlight_colors(base_inner, shift, 0)
+            # Determine base inner color: derive from node body outline, or use inner_color directly
+            if self.cfg['use_outline_color']:
+                base_inner = self._highlight_colors(
+                    self.node.body._outline_color, self.cfg['outline_bright'], 0
+                )
             else:
-                base_inner = self.cfg.get('inner_port_color', QColor(50, 53, 61))
-    
+                base_inner = self.cfg['inner_color']
+            
             if self.connected_traces or (self.is_summary_port and self._has_real_connections()):
-                final_inner = self._highlight_colors(base_inner, self.cfg['port_highlight'], 0)
+                final_inner = self._highlight_colors(base_inner, self.cfg['highlight'], 0)
             else:
                 final_inner = base_inner
             
@@ -775,28 +672,36 @@ class PortLabel(QGraphicsItem):
         self._calculate_layout()
     
     def refresh_style(self):
-        """Updates font and color based on connection status."""
+        """Updates font and color based on connection status.
+        
+        All keys use the canonical names from PortStyleSchema in core_theme.py.
+        """
         cfg = self._port.cfg
         is_conn = len(self._port.connected_traces) > 0
         
-        base_color = cfg.get('port_label_color', QColor(200, 200, 200))
+        # 'label_color' — PortStyleSchema.label_color
+        base_color = cfg['label_color']
         if is_conn:
-            shift = cfg.get('port_label_connected_color_shift', 40)
+            # 'label_connected_color_shift' — PortStyleSchema.label_connected_color_shift
+            shift = cfg['label_connected_color_shift']
             self._color = self._port._highlight_colors(base_color, shift)
         else:
             self._color = base_color
             
+        # 'label_font_family', 'label_font_size' — PortStyleSchema fields
         self._font = QFont(
-            cfg.get('port_label_font_family', 'Segoe UI'),
-            cfg.get('port_label_font_size', 9)
+            cfg['label_font_family'],
+            cfg['label_font_size']
         )
         
         if is_conn:
-            self._font.setWeight(cfg.get('port_label_connected_weight', QFont.Weight.Bold))
-            self._font.setItalic(cfg.get('port_label_connected_italic', True))
+            # 'label_connected_weight', 'label_connected_italic' — PortStyleSchema fields
+            self._font.setWeight(cfg['label_connected_weight'])
+            self._font.setItalic(cfg['label_connected_italic'])
         else:
-            self._font.setWeight(cfg.get('port_label_font_weight', QFont.Weight.Normal))
-            self._font.setItalic(cfg.get('port_label_font_italic', False))
+            # 'label_font_weight', 'label_font_italic' — PortStyleSchema fields
+            self._font.setWeight(cfg['label_font_weight'])
+            self._font.setItalic(cfg['label_font_italic'])
             
         self.update()
 
@@ -845,5 +750,3 @@ class PortLabel(QGraphicsItem):
         y_offset = self._cached_rect.top()
         for i, line in enumerate(self._text_lines):
             painter.drawText(QPointF(0, y_offset + (i + 1) * self._line_height - 3), line)
-
-# End of NodePort and PortLabel classes

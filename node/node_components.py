@@ -42,6 +42,13 @@ def shift_color(color: QColor, shift: int) -> QColor:
     Shifts Saturation, Lightness, and Hue by a single value.
     All values cast to int to prevent PySide6 C++ signature mismatch
     with QColor.fromHsl when shift/4 produces a float.
+    
+    Args:
+        color (QColor): The base color to shift
+        shift (int): Amount to shift HSL channels
+        
+    Returns:
+        QColor: A new color with shifted values
     """
     h, s, l, a = color.getHsl()
     s = int(max(0, min(255, s + shift)))
@@ -53,6 +60,15 @@ def shift_color(color: QColor, shift: int) -> QColor:
 def create_angled_gradient(rect: QRectF, angle_deg: float, color_start: QColor, color_end: QColor) -> QLinearGradient:
     """
     Creates a QLinearGradient angled across a rectangle.
+    
+    Args:
+        rect (QRectF): The bounding rectangle for the gradient
+        angle_deg (float): Angle in degrees
+        color_start (QColor): Start color of the gradient  
+        color_end (QColor): End color of the gradient
+        
+    Returns:
+        QLinearGradient: Configured linear gradient object
     """
     angle_rad = math.radians(angle_deg % 360)
     cx, cy = rect.center().x(), rect.center().y()
@@ -83,6 +99,7 @@ class NodeHeader(QGraphicsItem):
     - contextMenuEvent (now handled at Canvas level)
     - mousePressEvent (selection logic now via standard flags)
     """
+    
     __slots__ = (
         '_node', '_width', '_title', '_bg_color', '_outline_color',
         '_height', '_minimize_btn', '_state_slider',
@@ -90,6 +107,13 @@ class NodeHeader(QGraphicsItem):
     )
 
     def __init__(self, parent: 'Node', title_text: str):
+        """
+        Initialize NodeHeader with a parent node.
+        
+        Args:
+            parent (Node): The owning node
+            title_text (str): Initial title text
+        """
         super().__init__(parent)
         self._node = parent
         self._width = parent._config['width']
@@ -101,6 +125,7 @@ class NodeHeader(QGraphicsItem):
         self.setAcceptHoverEvents(True)
         self._title = EditableTitle(title_text, self)
         
+        # Use the node's already-configured colors
         self._bg_color = parent._config['header_bg']
         self._outline_color = parent._config['outline_color']
         
@@ -114,12 +139,22 @@ class NodeHeader(QGraphicsItem):
         self._recalculate_layout()
 
     def get_height(self) -> float:
+        """Get the header's current height."""
         return self._height
 
     def get_title_width(self) -> float:
+        """Get the width of the title text."""
         return self._title.boundingRect().width()
 
     def set_colors(self, bg: QColor, outline: QColor, text: QColor) -> None:
+        """
+        Set all header colors at once.
+        
+        Args:
+            bg (QColor): Background color
+            outline (QColor): Outline color  
+            text (QColor): Text color
+        """
         self._bg_color = bg
         self._outline_color = outline
         self._title.set_color(text)
@@ -135,6 +170,10 @@ class NodeHeader(QGraphicsItem):
         """
         Synchronizes the StateSlider to reflect the current node state.
         Called by Node when state changes.
+        
+        Args:
+            state (NodeState): Current node state
+            animate (bool): Whether to animate the change
         """
         if hasattr(self, '_state_slider'):
             self._state_slider.sync_to_state(state, animate)
@@ -143,6 +182,9 @@ class NodeHeader(QGraphicsItem):
         """
         Returns the StateSlider's bounding rect in NODE-LOCAL coordinates.
         Used by canvas state machine for hit testing.
+        
+        Returns:
+            QRectF: Slider rectangle
         """
         if hasattr(self, '_state_slider'):
             # Get slider rect in header coords, then map to node coords
@@ -156,6 +198,9 @@ class NodeHeader(QGraphicsItem):
         """
         Synchronizes the MinimizeButton appearance with the node's minimized state.
         Called by Node when minimize state changes.
+        
+        Args:
+            is_minimized (bool): Whether node is currently minimized
         """
         if hasattr(self, '_minimize_btn'):
             self._minimize_btn.sync_to_minimized_state(is_minimized)
@@ -164,6 +209,9 @@ class NodeHeader(QGraphicsItem):
         """
         Returns the MinimizeButton's bounding rect in NODE-LOCAL coordinates.
         Used by canvas state machine for hit testing.
+        
+        Returns:
+            QRectF: Button rectangle
         """
         if hasattr(self, '_minimize_btn'):
             btn_rect = self._minimize_btn.boundingRect()
@@ -176,6 +224,7 @@ class NodeHeader(QGraphicsItem):
     # with global mouse move tracking for better performance
 
     def update_selection_style(self, is_selected: bool):
+        """Update title style based on selection state."""
         self._title.update_selection_style(is_selected)
         self._recalculate_layout()
 
@@ -202,10 +251,10 @@ class NodeHeader(QGraphicsItem):
             self._minimize_btn.update_config()
     
         # --- 1. Load Configuration ---
-        left_padding = cfg.get('header_left_padding', cfg.get('header_h_padding', 10))
-        right_padding = cfg.get('header_right_padding', cfg.get('header_h_padding', 10))
-        title_slider_spacing = cfg.get('header_title_slider_spacing', cfg.get('header_item_spacing', 10))
-        slider_minimize_spacing = cfg.get('header_slider_minimize_spacing', cfg.get('header_item_spacing', 10))
+        left_padding = cfg.get('header_left_padding', 'header_h_padding')
+        right_padding = cfg.get('header_right_padding', 'header_h_padding')
+        title_slider_spacing = cfg.get('header_title_slider_spacing', 'header_item_spacing')
+        slider_minimize_spacing = cfg.get('header_slider_minimize_spacing', 'header_item_spacing')
     
         # --- 2. Calculate Vertical Geometry ---
         font = self._title.font()
@@ -314,6 +363,12 @@ class NodeHeader(QGraphicsItem):
         self._shape_path = fill_path
 
     def set_width(self, width: float) -> None:
+        """
+        Set the header's width and update layout.
+        
+        Args:
+            width (float): New width
+        """
         if self._width != width:
             if self.scene():
                 self.prepareGeometryChange()
@@ -322,6 +377,7 @@ class NodeHeader(QGraphicsItem):
             self.update()
 
     def boundingRect(self) -> QRectF:
+        """Get the header's bounding rectangle."""
         return QRectF(0, 0, self._width, self._height)
 
     def shape(self) -> QPainterPath:
@@ -329,11 +385,19 @@ class NodeHeader(QGraphicsItem):
         return self._shape_path
 
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget: Optional[QWidget] = None) -> None:
+        """
+        Paint the header component.
+        
+        Args:
+            painter (QPainter): The painter
+            option (QStyleOptionGraphicsItem): Style options  
+            widget (QWidget, optional): Widget being painted on
+        """
         cfg = self._node._config
 
         if cfg.get('header_gradient_enabled', False):
-            shift = cfg.get('header_gradient_shift', 10)
-            angle = cfg.get('header_gradient_angle', 0.0)
+            shift = cfg['header_gradient_shift']
+            angle = cfg['header_gradient_angle']
             col_start = self._bg_color
             col_end = shift_color(col_start, shift)
             grad = create_angled_gradient(self.boundingRect(), angle, col_start, col_end)
@@ -354,11 +418,11 @@ class NodeHeader(QGraphicsItem):
         painter.drawPath(self._outline_path)
         
         if not self._bottom_line_path.isEmpty() and cfg.get('header_bottom_line_enabled', False):
-            line_shift = cfg.get('header_bottom_line_shift', 20)
+            line_shift = cfg['header_bottom_line_shift']
             line_color = self._bg_color
             line_color = highlight_colors(line_color, line_shift, line_shift)
             
-            line_pen = QPen(line_color, cfg.get('header_bottom_line_width', 2.0))
+            line_pen = QPen(line_color, cfg['header_bottom_line_width'])
             line_pen.setCapStyle(Qt.PenCapStyle.FlatCap) 
             painter.setPen(line_pen)
             painter.drawPath(self._bottom_line_path)
@@ -374,6 +438,7 @@ class NodeBody(QGraphicsItem):
     - contextMenuEvent (now handled at Canvas level)
     - mousePressEvent / mouseMoveEvent (selection/hover now via standard flags)
     """
+    
     __slots__ = (
         '_node', '_width', '_height', '_bg_color', '_outline_color',
         '_proxy', '_widget', '_shape_path', '_outline_path',
@@ -381,6 +446,12 @@ class NodeBody(QGraphicsItem):
     )
 
     def __init__(self, parent: 'Node'):
+        """
+        Initialize NodeBody with a parent node.
+        
+        Args:
+            parent (Node): The owning node
+        """
         super().__init__(parent)
         self._node = parent
         self._width = parent._config['width']
@@ -417,6 +488,14 @@ class NodeBody(QGraphicsItem):
         """
         Updates the geometry of the body and its content proxy.
         This replaces the old set_size() to allow for port area reservation.
+        
+        Args:
+            width (float): New width
+            height (float): New height  
+            input_rect (QRectF): Input area rectangle
+            output_rect (QRectF): Output area rectangle
+            widget_y (float): Widget Y position
+            widget_h (float): Widget height
         """
         if self.scene():
             self.prepareGeometryChange()
@@ -435,6 +514,10 @@ class NodeBody(QGraphicsItem):
         """
         Compatibility wrapper for update_layout.
         Preserves old behavior where widget consumes full available space (minus padding).
+        
+        Args:
+            width (float): New width
+            height (float): New height
         """
         # Assume 10px padding on top, 10px on bottom
         widget_y = 10.0
@@ -442,15 +525,34 @@ class NodeBody(QGraphicsItem):
         self.update_layout(width, height, QRectF(), QRectF(), widget_y, widget_h)
 
     def get_content_min_size(self) -> Tuple[float, float]:
+        """
+        Get the minimum size required for content.
+        
+        Returns:
+            tuple: (width, height) minimum content sizes
+        """
         size_hint = self._widget.minimumSizeHint()
         return size_hint.width() + 20, size_hint.height()
 
     def set_colors(self, bg: QColor, outline: QColor) -> None:
+        """
+        Set body colors.
+        
+        Args:
+            bg (QColor): Background color
+            outline (QColor): Outline color
+        """
         self._bg_color = bg
         self._outline_color = outline
         self.update()
 
     def set_content(self, widget: QWidget) -> None:
+        """
+        Set the content widget.
+        
+        Args:
+            widget (QWidget): Widget to display in body
+        """
         layout = self._widget.layout()
         while layout.count():
             item = layout.takeAt(0)
@@ -484,6 +586,7 @@ class NodeBody(QGraphicsItem):
         self._outline_path = outline_path
 
     def boundingRect(self) -> QRectF:
+        """Get the body's bounding rectangle."""
         return QRectF(0, 0, self._width, self._height)
 
     def shape(self) -> QPainterPath:
@@ -491,11 +594,19 @@ class NodeBody(QGraphicsItem):
         return self._shape_path
 
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget: Optional[QWidget] = None) -> None:
+        """
+        Paint the body component.
+        
+        Args:
+            painter (QPainter): The painter
+            option (QStyleOptionGraphicsItem): Style options  
+            widget (QWidget, optional): Widget being painted on
+        """
         cfg = self._node._config
         
-        if cfg.get('body_gradient_enabled', False):
-            shift = cfg.get('body_gradient_shift', 10)
-            angle = cfg.get('body_gradient_angle', 90.0)
+        if cfg['body_gradient_enabled']:
+            shift = cfg['body_gradient_shift']
+            angle = cfg['body_gradient_angle']
             col_start = self._bg_color
             col_end = shift_color(col_start, shift)
             grad = create_angled_gradient(self.boundingRect(), angle, col_start, col_end)

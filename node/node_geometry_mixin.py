@@ -16,6 +16,15 @@ Handles:
 - Minimize / maximize animation (toggle, value-changed, finished)
 - Computing pulse animation (start / stop / tick)
 - Resize handle callback
+
+Style Integration:
+    All visual properties are resolved through StyleManager.get() with their
+    correct StyleCategory (NODE or PORT) and canonical schema field names
+    defined in core_theme.py.  Port geometry values (radius, offset,
+    area_margin, etc.) are read from StyleCategory.PORT; node-level values
+    (corner radius, glow offsets, etc.) from StyleCategory.NODE.  This
+    guarantees read-time conversion (list → QColor, str → enum) and ensures
+    live theme / batch_update changes are respected.
 """
 
 from typing import Optional, List, Tuple, Any
@@ -23,6 +32,7 @@ from PySide6.QtCore import Qt, QRectF, QVariantAnimation
 from PySide6.QtGui import QPainterPath
 
 from weave.node.node_port import NodePort
+from weave.stylemanager import StyleManager, StyleCategory
 
 from weave.logger import get_logger
 log = get_logger("NodeGeometryMixin")
@@ -67,9 +77,9 @@ class NodeGeometryMixin:
         """Calculates total height required for a stack of ports."""
         if not ports:
             return 0.0
-        cfg = self._config
-        margin = cfg.get('port_area_margin', 10)
-        port_dia = cfg['port_radius'] * 2
+
+        margin = self._port_config['area_margin']
+        port_dia = self._port_config['radius'] * 2
 
         total_h = margin
         for p in ports:
@@ -84,14 +94,15 @@ class NodeGeometryMixin:
 
     def _calculate_layout_metrics(self) -> Tuple[float, float, float, float]:
         """Calculates internal heights for top area, widget, and bottom area."""
-        cfg = self._config
-
         h_in = self._calculate_port_stack_height(self.inputs)
         h_out = self._calculate_port_stack_height(self.outputs)
         area_h = max(h_in, h_out)
 
-        if cfg.get('enable_port_area', False):
-            if cfg.get('port_area_top', True):
+        enable_area = self._port_config['enable_area']
+        area_top = self._port_config['area_top']
+
+        if enable_area:
+            if area_top:
                 top_area_h = area_h
                 bottom_area_h = 0.0
             else:
@@ -119,15 +130,15 @@ class NodeGeometryMixin:
         required_port_width = max_in_w + min_middle_gap + max_out_w
 
         title_width = self.header.get_title_width() if hasattr(self.header, 'get_title_width') else 0
-        final_min_w = max(cfg['min_width'], widget_min_w, required_port_width, title_width + 60)
+        node_min_width = self._config['min_width']
+        final_min_w = max(node_min_width, widget_min_w, required_port_width, title_width + 60)
 
         return top_area_h, widget_min_h, bottom_area_h, final_min_w
 
     def _calculate_expanded_min_size(self) -> Tuple[float, float]:
         """Calculates min size ignoring minimized state (used for restoration)."""
         top_h, widget_h, bot_h, min_w = self._calculate_layout_metrics()
-        cfg = self._config
-        padding = cfg.get('port_area_padding', 10)
+        padding = self._port_config['area_padding']
 
         total_h = self.header.get_height()
 
@@ -150,7 +161,8 @@ class NodeGeometryMixin:
                 (self.header.get_title_width() if hasattr(self.header, 'get_title_width') else 0)
                 + 80
             )
-            return max(self._config['min_width'], title_min_w), self.header.get_height()
+            node_min_width = self._config['min_width']
+            return max(node_min_width, title_min_w), self.header.get_height()
         return self._calculate_expanded_min_size()
 
     def enforce_min_dimensions(self):
@@ -178,18 +190,19 @@ class NodeGeometryMixin:
 
     def update_geometry(self):
         """Re-layouts the body, ports, and handles based on current width/height."""
-        cfg = self._config
         header_h = self.header.get_height()
 
         top_h, widget_min_h, bot_h, _ = self._calculate_layout_metrics()
-        padding = cfg.get('port_area_padding', 10)
+        padding = self._port_config['area_padding']
+        enable_area = self._port_config['enable_area']
+        area_top = self._port_config['area_top']
 
         current_y = 0.0
         input_rect = QRectF()
         output_rect = QRectF()
 
         # 1. Top Port Area
-        if cfg.get('enable_port_area', False) and cfg.get('port_area_top', True):
+        if enable_area and area_top:
             if top_h > 0:
                 half_w = self._width / 2
                 input_rect = QRectF(0, 0, half_w, top_h)
@@ -199,7 +212,7 @@ class NodeGeometryMixin:
         # 2. Body Widget Area
         total_body_h = max(0, self._total_height - header_h)
 
-        if not cfg.get('port_area_top', True) and bot_h > 0:
+        if not area_top and bot_h > 0:
             widget_y = 0
             half_w = self._width / 2
             area_y = widget_min_h + padding
@@ -237,9 +250,8 @@ class NodeGeometryMixin:
         if header_h is None:
             header_h = self.header.get_height()
 
-        cfg = self._config
-        margin = cfg.get('port_area_margin', 10)
-        offset = cfg['port_offset']
+        margin = self._port_config['area_margin']
+        offset = self._port_config['offset']
 
         # 1. Position Summary Ports
         y_sum = header_h / 2
@@ -249,7 +261,7 @@ class NodeGeometryMixin:
         if self.is_minimized and self._anim.state() != QVariantAnimation.State.Running:
             return
 
-        port_dia = cfg['port_radius'] * 2
+        port_dia = self._port_config['radius'] * 2
 
         # 2. Input Ports
         if self.inputs:
@@ -290,9 +302,8 @@ class NodeGeometryMixin:
         if self.scene():
             self.prepareGeometryChange()
 
-        cfg = self._config
         w, h = self._width, self._total_height
-        r = cfg['radius']
+        r = self._config['radius']
         eff_r = min(r, h / 2)
 
         # 1. Base Outline
@@ -301,28 +312,33 @@ class NodeGeometryMixin:
         self._cached_outline_path.addRoundedRect(base_rect, eff_r, eff_r)
 
         # 2. Glow Path (Expanded)
-        glow_off = cfg['sel_border_offset'] + cfg['sel_glow_offset']
+        sel_border_offset = self._config['sel_border_offset']
+        sel_glow_offset = self._config['sel_glow_offset']
+        glow_off = sel_border_offset + sel_glow_offset
         glow_rect = base_rect.adjusted(-glow_off, -glow_off, glow_off, glow_off)
         glow_rad = eff_r + glow_off
         self._cached_glow_path = QPainterPath()
         self._cached_glow_path.addRoundedRect(glow_rect, glow_rad, glow_rad)
 
         # 3. Hover Glow Path (Tighter Offset)
-        hover_off = cfg['hover_glow_offset']
+        hover_off = self._config['hover_glow_offset']
         hover_rect = base_rect.adjusted(-hover_off, -hover_off, hover_off, hover_off)
         hover_rad = eff_r + hover_off
         self._cached_hover_path = QPainterPath()
         self._cached_hover_path.addRoundedRect(hover_rect, hover_rad, hover_rad)
 
         # 4. Selection Sharp Border
-        sel_off = cfg['sel_border_offset']
-        sel_rect = base_rect.adjusted(-sel_off, -sel_off, sel_off, sel_off)
-        sel_rad = eff_r + sel_off
+        sel_rect = base_rect.adjusted(
+            -sel_border_offset, -sel_border_offset,
+            sel_border_offset, sel_border_offset,
+        )
+        sel_rad = eff_r + sel_border_offset
         self._cached_sel_path = QPainterPath()
         self._cached_sel_path.addRoundedRect(sel_rect, sel_rad, sel_rad)
 
         # 5. Computing Pulse Glow Path
-        computing_off = glow_off + cfg.get('computing_glow_extra_offset', 4.0)
+        computing_extra = self._config['computing_glow_extra_offset']
+        computing_off = glow_off + computing_extra
         computing_rect = base_rect.adjusted(
             -computing_off, -computing_off, computing_off, computing_off
         )
@@ -370,8 +386,10 @@ class NodeGeometryMixin:
             self._summary_input.setVisible(False)
             self._summary_output.setVisible(False)
 
+        anim_duration = self._config['minimize_anim_duration']
+
         self._anim.stop()
-        self._anim.setDuration(self._config['minimize_anim_duration'])
+        self._anim.setDuration(anim_duration)
         self._anim.setStartValue(start_h)
         self._anim.setEndValue(end_h)
         self._anim.start()
