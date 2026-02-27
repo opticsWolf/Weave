@@ -24,6 +24,7 @@ REPLACES duplicated code in:
 """
 
 from typing import Optional, Any, Tuple, List, Set, TYPE_CHECKING
+import uuid  # Added for UUID support
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtWidgets import QGraphicsScene
 
@@ -284,8 +285,21 @@ class PortUtils:
             trace_source = getattr(trace, 'source', None)
             trace_target = getattr(trace, 'target', None)
             
+            # Enhanced check using UUID comparison
             if trace_source is port_b or trace_target is port_b:
                 return True
+            
+            # If we have UUIDs available for both ports, use that instead of identity 
+            trace_source_uuid = getattr(trace_source, '_port_uuid', None)  
+            trace_target_uuid = getattr(trace_target, '_port_uuid', None)
+            port_b_uuid = getattr(port_b, '_port_uuid', None)
+            
+            if (trace_source_uuid is not None and 
+                trace_target_uuid is not None and
+                port_b_uuid is not None):
+                if (trace_source_uuid == port_b_uuid or 
+                    trace_target_uuid == port_b_uuid):
+                    return True
         
         return False
     
@@ -313,6 +327,37 @@ class PortUtils:
         if PortUtils.is_output(port_a):
             return (port_a, port_b)
         return (port_b, port_a)
+
+    # ==========================================================================
+    # UUID-AWARE FUNCTIONS
+    # ==========================================================================
+
+    @staticmethod
+    def get_port_uuid(port: 'NodePort') -> Optional[uuid.UUID]:
+        """
+        Get the UUID of a port.
+        
+        Args:
+            port: The port to get UUID for
+            
+        Returns:
+            A uuid.UUID object or None if not available
+        """
+        return getattr(port, '_port_uuid', None)
+
+    @staticmethod
+    def port_matches_uuid(port: 'NodePort', target_uuid: uuid.UUID) -> bool:
+        """
+        Check if a port matches the given UUID.
+        
+        Args:
+            port: The port to check
+            target_uuid: The UUID to match against
+            
+        Returns:
+            True if the port's UUID matches, False otherwise
+        """
+        return getattr(port, '_port_uuid', None) == target_uuid
 
 
 class PortFinder:
@@ -498,90 +543,3 @@ class ConnectionFactory:
         # Trigger recomputation (mirrors _trigger_compute in create)
         if trigger_compute and target_port is not None:
             ConnectionFactory._trigger_compute(target_port)
-
-
-# =============================================================================
-# MIGRATION GUIDE
-# =============================================================================
-"""
-## How to migrate existing code:
-
-### 1. Replace direction detection (7 locations)
-
-BEFORE:
-```python
-start_is_output = getattr(start, 'is_output', None)
-if start_is_output is None:
-    start_is_output = not getattr(start, 'is_input', True)
-```
-
-AFTER:
-```python
-from qt_portutils import PortUtils
-start_is_output = PortUtils.is_output(start)
-```
-
-### 2. Replace compatibility checks (4 locations)
-
-BEFORE:
-```python
-def _check_port_compatibility(self, port_a, port_b):
-    if port_a == port_b: return False
-    node_a = getattr(port_a, 'node', None) or getattr(port_a, '_node', None)
-    # ... 40+ lines of validation ...
-```
-
-AFTER:
-```python
-from qt_portutils import PortUtils
-is_valid = PortUtils.are_compatible(port_a, port_b)
-```
-
-### 3. Replace port finding (2 locations)
-
-BEFORE:
-```python
-def _find_snap_port(self, pos, start_port, snap_radius):
-    search_rect = QRectF(...)
-    # ... 40+ lines ...
-```
-
-AFTER:
-```python
-from qt_portutils import PortFinder
-target = PortFinder.find_nearest_compatible(scene, pos, start_port, snap_radius)
-```
-
-### 4. Replace connection creation (3 locations)
-
-BEFORE:
-```python
-def _create_connection(self, source, target):
-    # ... determine order ...
-    trace = NodeTrace(output, input)
-    scene.addItem(trace)
-```
-
-AFTER:
-```python
-from qt_portutils import ConnectionFactory
-trace = ConnectionFactory.create(scene, source, target)
-```
-
-### 5. Replace DragTrace._detect_port_direction
-
-BEFORE (in qt_nodetrace.py):
-```python
-@staticmethod
-def _detect_port_direction(port: NodePort) -> float:
-    if hasattr(port, "is_output"):
-        return +1.0 if port.is_output else -1.0
-    # ... more fallbacks ...
-```
-
-AFTER:
-```python
-from qt_portutils import PortUtils
-self._start_sign = PortUtils.get_direction_sign(start_port)
-```
-"""
