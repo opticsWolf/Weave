@@ -397,10 +397,12 @@ class NodePort(QGraphicsItem):
 
     def hoverEnterEvent(self, event) -> None:
         self.set_highlight(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event) -> None:
         self.set_highlight(False)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         super().hoverLeaveEvent(event)
 
     def set_highlight(self, active: bool) -> None:

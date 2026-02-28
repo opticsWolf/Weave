@@ -22,6 +22,7 @@ This file retains:
 
 import sys
 import math
+import uuid
 from typing import Optional, List, Dict, Any
 from PySide6.QtWidgets import (
     QApplication, QGraphicsObject, QGraphicsView, QGraphicsScene,
@@ -161,6 +162,37 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
 
         # Initialize summary ports after all setup
         self._initialize_summary_ports()
+
+        # 6. Node UUID - NEW: Add unique identifier for this node instance
+        self._node_uuid = uuid.uuid4()
+
+    # ==================================================================
+    # UUID METHODS (ADDED)
+    # ==================================================================
+
+    def get_uuid(self) -> uuid.UUID:
+        """
+        Get the unique identifier for this node.
+        
+        This UUID provides a persistent way to identify nodes across their lifetime,
+        even if other attributes like title or position change.
+        
+        Returns:
+            A uuid.UUID object that uniquely identifies this node instance.
+        """
+        return self._node_uuid
+    
+    def get_uuid_string(self) -> str:
+        """
+        Get the unique identifier for this node as a string representation.
+        
+        This is useful for serialization, logging, and other string-based operations
+        where working with UUID objects directly might be cumbersome.
+        
+        Returns:
+            A string representation of the node's UUID.
+        """
+        return str(self._node_uuid)
 
     # ==================================================================
     # SERIALIZATION
