@@ -263,22 +263,23 @@ class WidgetCore(QWidget):
         Returns True if *scene_pos* (QPointF in scene coordinates) lands
         on an interactive child widget (spin box, combo, line-edit …).
 
-        Usage from the canvas state machine::
-
-            proxy = scene.itemAt(pos, QTransform())
-            if isinstance(proxy, QGraphicsProxyWidget):
-                embedded = proxy.widget()
-                if embedded and hasattr(embedded, 'is_interactive_at'):
-                    if embedded.is_interactive_at(pos):
-                        return False  # yield to widget
+        Coordinate path:
+            scene_pos  →  proxy.mapFromScene()  →  proxy-local coords
+            (proxy-local coords ≡ root-widget coords for QGraphicsProxyWidget)
+            root.childAt()  →  deepest child widget at that position
         """
         proxy = self._find_proxy()
         if proxy is None:
             return False
-        local = self.mapFromGlobal(
-            proxy.mapToScene(scene_pos).toPoint()
-        )
-        child = self.childAt(local.x(), local.y())
+
+        # Scene → proxy-local coordinates (= root widget coordinates)
+        root = proxy.widget()
+        if root is None:
+            return False
+        local = proxy.mapFromScene(scene_pos).toPoint()
+
+        # Find the deepest child in the entire embedded widget tree
+        child = root.childAt(local.x(), local.y())
         if child is None:
             return False
         if isinstance(child, QLabel):
@@ -286,6 +287,10 @@ class WidgetCore(QWidget):
         if type(child) is QWidget:
             return False
         return True
+
+    def get_proxy(self) -> Optional[QGraphicsProxyWidget]:
+        """Public accessor for the hosting QGraphicsProxyWidget."""
+        return self._find_proxy()
 
     # ══════════════════════════════════════════════════════════════════════
     # Widget Registration

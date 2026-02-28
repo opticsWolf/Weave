@@ -18,6 +18,7 @@ Key improvements:
 """
 
 import sys
+import uuid
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Set, Final, ClassVar, Callable
 from dataclasses import dataclass, field
@@ -441,15 +442,42 @@ class BaseControlNode(Node, NodeDataFlow):
 
     def __init__(self, title: str, **kwargs):
         """Initialize the node with UI and Logic components."""
-        import uuid as _uuid
         Node.__init__(self, title, **kwargs)
         NodeDataFlow.__init__(self)
         
-        # Unique identifier for serialization round-tripping
-        self.unique_id: str = str(_uuid.uuid4())
+        # Removed: self.unique_id: str = str(_uuid.uuid4())  # REMOVED
+        # UUID is now handled at the Node level in node_core.py
         
         # Deferred initial evaluation
         QTimer.singleShot(0, self._post_init_eval)
+
+    # ==================================================================
+    # UUID METHODS - PROXY TO PARENT NODE'S UUID FUNCTIONALITY 
+    # ==================================================================
+
+    def get_uuid(self) -> uuid.UUID:
+        """
+        Get the unique identifier for this node.
+        
+        This method provides access to the underlying Node's UUID functionality,
+        ensuring consistent identification across all node types in the system.
+        
+        Returns:
+            A uuid.UUID object that uniquely identifies this node instance.
+        """
+        return super().get_uuid()
+    
+    def get_uuid_string(self) -> str:
+        """
+        Get the unique identifier for this node as a string representation.
+        
+        This is useful for serialization, logging, and other string-based operations
+        where working with UUID objects directly might be cumbersome.
+        
+        Returns:
+            A string representation of the node's UUID.
+        """
+        return super().get_uuid_string()
 
     def _post_init_eval(self) -> None:
         """Runs initial evaluation after constructor completes."""
