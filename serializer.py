@@ -6,7 +6,7 @@ Copyright (c) 2026 opticsWolf
 
 SPDX-License-Identifier: Apache-2.0
 
-qt_serializer.py - Comprehensive Graph Serializer v3
+serializer.py - Comprehensive Graph Serializer v3
 -----------------------------------------------------
 Handles full application state serialization/deserialization for the Node Canvas.
 
@@ -20,12 +20,6 @@ Captures:
     QtNode.get_state(): pos, size, colors, port defs, minimized, node_state
     BaseControlNode.get_state(): widget_data (via WeaveWidgetCore), dataflow metadata
 - Connections (source/target node IDs and port indices)
-
-State ownership:
-    Serializer        → graph-level metadata (id, class), canvas placement
-    QtNode            → GUI state (position, geometry, colors, ports, minimized)
-    BaseControlNode   → widget state (exclusively via WeaveWidgetCore)
-                      → dataflow state (manual_mode, disabled_behavior, port_defaults)
 
 Format v3:
 {
@@ -47,29 +41,20 @@ Format v3:
     ],
     "connections": [ ... ]
 }
-
-Breaking changes from v2:
-- Removed: "widget_state" key (was from get_widget_state(), now "widget_data")
-- Removed: top-level "state" key (string name, now "node_state" int from QtNode)
-- Removed: top-level "manual_mode" key (now in "dataflow" sub-dict)
-- Removed: "header_color" key (now in "colors" sub-dict from QtNode)
-- Removed: "size" key (redundant with "width"/"height")
-- Node restore no longer does field-by-field patching; delegates entirely
-  to node.restore_state() protocol.
 """
 
 import json
 import uuid
 import time
-from typing import Dict, Any, Type, Optional, List, Tuple
+from typing import Dict, Any, Type, Optional, List
 
 from PySide6.QtGui import QColor, QTransform
 from PySide6.QtCore import QPointF, QRectF
 
-from weave.logger import get_logger
-from weave.portutils import ConnectionFactory
-
+from logger import get_logger
 log = get_logger("Serializer")
+
+from weave.portutils import ConnectionFactory
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +102,7 @@ class _QtJsonEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, QColor):
             return {"__type__": "QColor",
-                    "rgba": [obj.red(), obj.green(), obj.blue(), obj.alpha()]}
+                    "rgba": _color_to_list(obj)}
         if isinstance(obj, QPointF):
             return {"__type__": "QPointF", "xy": [obj.x(), obj.y()]}
         if isinstance(obj, QRectF):
@@ -131,11 +116,7 @@ class _QtJsonEncoder(json.JSONEncoder):
 
 
 def _qt_object_hook(obj: dict) -> Any:
-    """JSON object_hook that reconstructs Qt types from tagged dicts.
-    
-    Handles both the tagged format produced by _QtJsonEncoder and
-    the StyleManager's export format.
-    """
+    """JSON object_hook that reconstructs Qt types from tagged dicts."""
     tag = obj.get("__type__")
     if tag is None:
         return obj
@@ -156,95 +137,8 @@ def _qt_object_hook(obj: dict) -> Any:
     if tag == "QTransform":
         return _list_to_transform(obj.get("matrix", []))
 
-    # StyleManager enum types — pass through as plain values since
-    # the StyleManager handles its own reconstruction of these.
-    if tag in ("FontWeight", "PenStyle", "PenCapStyle", "PenJoinStyle"):
-        return obj
-
     # Unknown tagged type — return dict as-is
     return obj
-
-
-# ---------------------------------------------------------------------------
-# Config sanitizer for backward-compatible deserialization
-# ---------------------------------------------------------------------------
-
-def _coerce_to_qcolor(val) -> Optional[QColor]:
-    """Convert a value to QColor if possible, return None otherwise."""
-    if isinstance(val, QColor):
-        return val
-    if isinstance(val, (list, tuple)) and len(val) >= 3:
-        if all(isinstance(x, (int, float)) for x in val[:4]):
-            a = int(val[3]) if len(val) > 3 else 255
-            return QColor(int(val[0]), int(val[1]), int(val[2]), a)
-    return None
-
-
-def _sanitize_config(incoming: Dict[str, Any],
-                     template: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert serialized config values back to Qt types using the node's
-    live _config as a type template.
-
-    When _config is serialized via get_state() -> JSON, QColor objects
-    may become plain [r,g,b,a] lists (old format) or tagged dicts that
-    the object_hook already converted. This function catches anything
-    the object_hook missed by comparing against what the freshly-
-    instantiated node already has in _config.
-
-    Handles:
-    - QColor stored as [r,g,b,a] list
-    - List of QColors (e.g. header_color_palette)
-    - state_visuals nested dict with QColor values
-    """
-    result = {}
-    for k, v in incoming.items():
-        existing = template.get(k)
-
-        # QColor field — convert list back to QColor
-        if isinstance(existing, QColor):
-            qc = _coerce_to_qcolor(v)
-            result[k] = qc if qc is not None else existing
-            continue
-
-        # List of QColors (e.g. header_color_palette)
-        if (isinstance(existing, list) and existing
-                and isinstance(existing[0], QColor)
-                and isinstance(v, list)):
-            result[k] = [
-                _coerce_to_qcolor(c) or QColor()
-                for c in v
-            ]
-            continue
-
-        # state_visuals: nested dict with QColor values
-        if k == 'state_visuals' and isinstance(v, dict):
-            result[k] = _sanitize_state_visuals(v)
-            continue
-
-        # Everything else passes through
-        result[k] = v
-
-    return result
-
-
-def _sanitize_state_visuals(visuals: Dict) -> Dict:
-    """Convert color values inside state_visuals sub-dicts."""
-    _COLOR_KEYS = {'overlay', 'icon_color'}
-    sanitized = {}
-    for state_name, state_dict in visuals.items():
-        if not isinstance(state_dict, dict):
-            sanitized[state_name] = state_dict
-            continue
-        new_dict = {}
-        for k, v in state_dict.items():
-            if k in _COLOR_KEYS:
-                qc = _coerce_to_qcolor(v)
-                new_dict[k] = qc if qc is not None else QColor(0, 0, 0, 0)
-            else:
-                new_dict[k] = v
-        sanitized[state_name] = new_dict
-    return sanitized
 
 
 # ===========================================================================
@@ -254,17 +148,6 @@ def _sanitize_state_visuals(visuals: Dict) -> Dict:
 class GraphSerializer:
     """
     Comprehensive serializer for the entire Node Canvas application state.
-
-    Usage:
-        # Build registry map from NodeRegistry or manually
-        registry_map = {'FloatNode': FloatNode, 'IntNode': IntNode, ...}
-        serializer = GraphSerializer(registry_map)
-
-        # Save
-        json_str = serializer.serialize(canvas, view=view, minimap=minimap)
-
-        # Load
-        serializer.deserialize(canvas, json_str, view=view, minimap=minimap)
     """
 
     FORMAT_VERSION = "3.0"
@@ -441,27 +324,6 @@ class GraphSerializer:
     def _serialize_node(self, node) -> Dict[str, Any]:
         """
         Serialize a single node to a dict.
-
-        Ownership boundary:
-            node.get_state()  owns ALL node state (GUI + widget + dataflow).
-            The serializer only adds graph-level metadata: ``id`` and ``class``.
-
-        The returned dict structure (BaseControlNode):
-            {
-                # --- Graph metadata (serializer) ---
-                "id":    "...",
-                "class": "FloatNode",
-
-                # --- GUI state (QtNode.get_state) ---
-                "title", "width", "height", "pos", "config",
-                "colors", "inputs", "outputs", "minimized", "node_state",
-
-                # --- Widget state (BaseControlNode.get_state) ---
-                "widget_data": { ... },
-
-                # --- Dataflow state (BaseControlNode.get_state) ---
-                "dataflow": { "manual_mode", "disabled_behavior", "port_defaults" },
-            }
         """
         # Node's own protocol captures everything
         try:
@@ -551,90 +413,58 @@ class GraphSerializer:
         Returns:
             True on success, False on failure.
         """
-        import sys
-        def _trace(msg):
-            print(f"[DESERIALIZE] {msg}", flush=True)
-            log.info(msg)
-
         try:
-            _trace("Parsing JSON...")
             data = json.loads(json_str, object_hook=_qt_object_hook)
-            _trace(f"JSON parsed OK. Keys: {list(data.keys())}")
         except json.JSONDecodeError as e:
             log.error(f"Invalid JSON: {e}")
             return False
 
         version = data.get("meta", {}).get("version", "1.0")
-        _trace(f"Format version: {version}")
 
         # --- Clear ---
         if clear_first:
-            _trace("Clearing canvas...")
             try:
                 self._clear_canvas(canvas)
-                _trace("Canvas cleared OK")
             except Exception as e:
-                _trace(f"EXCEPTION in _clear_canvas: {type(e).__name__}: {e}")
-                import traceback; traceback.print_exc()
+                log.error(f"Exception in _clear_canvas: {type(e).__name__}: {e}")
 
         # --- Style (restore BEFORE nodes so colors/settings are correct) ---
         if restore_style and "style" in data:
-            _trace("Restoring style...")
             try:
                 self._restore_style(canvas, data["style"])
-                _trace("Style restored OK")
             except Exception as e:
-                _trace(f"EXCEPTION in _restore_style: {type(e).__name__}: {e}")
-                import traceback; traceback.print_exc()
+                log.error(f"Exception in _restore_style: {type(e).__name__}: {e}")
 
         # --- Canvas settings ---
         if "canvas" in data:
-            _trace("Restoring canvas settings...")
             try:
                 self._restore_canvas(canvas, data["canvas"])
-                _trace("Canvas settings restored OK")
             except Exception as e:
-                _trace(f"EXCEPTION in _restore_canvas: {type(e).__name__}: {e}")
-                import traceback; traceback.print_exc()
+                log.error(f"Exception in _restore_canvas: {type(e).__name__}: {e}")
 
         # --- Nodes ---
         uuid_map: Dict[str, Any] = {}  # id string -> node instance
         node_list = data.get("nodes", [])
-        _trace(f"Restoring {len(node_list)} nodes...")
         for i, n_data in enumerate(node_list):
             cls_name = n_data.get("class", "???")
             node_id = n_data.get("id", "???")[:8]
-            _trace(f"  Node {i+1}/{len(node_list)}: {cls_name} (id={node_id}...)")
             try:
                 node = self._restore_node(canvas, n_data)
                 if node is not None:
                     uuid_map[getattr(node, "unique_id", "")] = node
-                    _trace(f"    -> OK (in scene: {node.scene() is not None})")
-                else:
-                    _trace(f"    -> SKIPPED (returned None)")
             except Exception as e:
-                _trace(f"    -> EXCEPTION: {type(e).__name__}: {e}")
-                import traceback; traceback.print_exc()
-        _trace(f"Nodes phase complete: {len(uuid_map)} nodes restored")
+                log.error(f"Exception restoring node {cls_name}: {type(e).__name__}: {e}")
 
         # --- Connections ---
         conn_list = data.get("connections", [])
-        _trace(f"Restoring {len(conn_list)} connections...")
         for i, c_data in enumerate(conn_list):
-            src_id = c_data.get("source_id", "???")[:8]
-            dst_id = c_data.get("target_id", "???")[:8]
-            _trace(f"  Connection {i+1}/{len(conn_list)}: {src_id}... -> {dst_id}...")
             try:
                 self._restore_connection(canvas, c_data, uuid_map)
-                _trace(f"    -> OK")
             except Exception as e:
-                _trace(f"    -> EXCEPTION: {type(e).__name__}: {e}")
-                import traceback; traceback.print_exc()
+                log.error(f"Exception restoring connection: {type(e).__name__}: {e}")
 
         # --- Post-restore: mark all nodes dirty so they evaluate with
-        #     connections in place (connections were created with
-        #     trigger_compute=False to avoid premature partial evaluation) ---
-        _trace("Post-restore: marking nodes dirty...")
+        #     connections in place ---
         for node in uuid_map.values():
             try:
                 if hasattr(node, "set_dirty"):
@@ -642,31 +472,22 @@ class GraphSerializer:
                 elif hasattr(node, "_is_dirty"):
                     node._is_dirty = True
             except Exception as e:
-                _trace(f"  EXCEPTION marking dirty on {type(node).__name__}: {type(e).__name__}: {e}")
-                import traceback; traceback.print_exc()
+                log.error(f"Exception marking dirty on {type(node).__name__}: {type(e).__name__}: {e}")
 
         # --- View ---
         if view is not None and "view" in data:
-            _trace("Restoring view state...")
             try:
                 self._restore_view(view, data["view"])
-                _trace("View restored OK")
             except Exception as e:
-                _trace(f"EXCEPTION in _restore_view: {type(e).__name__}: {e}")
-                import traceback; traceback.print_exc()
+                log.error(f"Exception in _restore_view: {type(e).__name__}: {e}")
 
         # --- Minimap ---
         if minimap is not None and "minimap" in data:
-            _trace("Restoring minimap state...")
             try:
                 self._restore_minimap(minimap, data["minimap"])
-                _trace("Minimap restored OK")
             except Exception as e:
-                _trace(f"EXCEPTION in _restore_minimap: {type(e).__name__}: {e}")
-                import traceback; traceback.print_exc()
+                log.error(f"Exception in _restore_minimap: {type(e).__name__}: {e}")
 
-        _trace(f"=== RESTORE COMPLETE: {len(uuid_map)} nodes, "
-               f"{len(conn_list)} connections (format v{version}) ===")
         return True
 
     # -- Clear --------------------------------------------------------------
@@ -795,10 +616,6 @@ class GraphSerializer:
         """
         Instantiate a node, place it on the canvas, and restore its state.
         """
-        import sys
-        def _trace(msg):
-            print(f"[RESTORE_NODE] {msg}", flush=True)
-
         cls_name = n_data.get("class")
         cls_type = self.node_registry.get(cls_name)
 
@@ -806,49 +623,21 @@ class GraphSerializer:
             log.warning(f"Unknown node type: {cls_name}")
             return None
 
-        _trace(f"Instantiating {cls_name}...")
         try:
             node = cls_type()
-            _trace(f"  Instantiated OK: {type(node).__name__}")
         except Exception as e:
             log.error(f"Failed to instantiate {cls_name}: {e}")
-            import traceback; traceback.print_exc()
             return None
 
         try:
             # --- Graph-level metadata (serializer's responsibility) ---
             node.unique_id = n_data.get("id", str(uuid.uuid4()))
-            _trace(f"  unique_id set: {node.unique_id[:8]}...")
-
-            # --- Sanitize config: convert serialized [r,g,b,a] lists back
-            #     to QColor using the freshly-instantiated node's _config
-            #     as a type template (serializer's responsibility) ---
-            if "config" in n_data and hasattr(node, "_config"):
-                _trace(f"  Sanitizing config types...")
-                n_data["config"] = _sanitize_config(
-                    n_data["config"], node._config
-                )
-                _trace(f"  Config sanitized OK")
 
             # --- Restore state BEFORE adding to scene ---
-            # This prevents Qt scene signals (changed, selectionChanged)
-            # and deferred paint events from firing during incomplete state.
-            # The node is fully configured by the time it enters the scene.
             if hasattr(node, "restore_state"):
-                _trace(f"  Calling restore_state() with keys: {list(n_data.keys())}")
-                _trace(f"    config keys: {list(n_data.get('config', {}).keys())[:5]}..." 
-                       if 'config' in n_data else "    no config")
-                _trace(f"    colors: {n_data.get('colors', 'N/A')}")
-                _trace(f"    inputs: {len(n_data.get('inputs', []))} ports")
-                _trace(f"    outputs: {len(n_data.get('outputs', []))} ports")
-                _trace(f"    widget_data: {n_data.get('widget_data', 'N/A')}")
-                _trace(f"    minimized: {n_data.get('minimized', 'N/A')}")
-                _trace(f"    node_state: {n_data.get('node_state', 'N/A')}")
-                
                 node.restore_state(n_data)
-                _trace(f"  restore_state() OK")
 
-            # --- Now place on canvas (node state is complete) ---
+            # --- Now place on canvas ---
             pos = n_data.get("pos", [0, 0])
             if isinstance(pos, QPointF):
                 pos = [pos.x(), pos.y()]
@@ -857,17 +646,11 @@ class GraphSerializer:
             else:
                 pos = [0, 0]
 
-            _trace(f"  Adding to canvas at ({pos[0]}, {pos[1]})...")
             canvas.add_node(node, (pos[0], pos[1]))
-            _trace(f"  Added to canvas OK")
-
-            _trace(f"  Node {cls_name} fully restored")
             return node
 
         except Exception as e:
-            _trace(f"  EXCEPTION during restore: {type(e).__name__}: {e}")
             log.error(f"Failed to restore node {cls_name}: {e}")
-            import traceback; traceback.print_exc()
             return None
 
     # -- Restore Connection -------------------------------------------------
@@ -876,15 +659,10 @@ class GraphSerializer:
         self, canvas, c_data: Dict[str, Any], uuid_map: Dict[str, Any]
     ) -> None:
         """Recreate a single connection between two ports."""
-        import sys
-        def _trace(msg):
-            print(f"[RESTORE_CONN] {msg}", flush=True)
-
         src_node = uuid_map.get(c_data.get("source_id"))
         dst_node = uuid_map.get(c_data.get("target_id"))
 
         if not (src_node and dst_node):
-            _trace(f"  SKIP: missing node (src={src_node is not None}, dst={dst_node is not None})")
             return
 
         try:
@@ -896,9 +674,6 @@ class GraphSerializer:
 
             src_outputs = getattr(src_node, "outputs", [])
             dst_inputs = getattr(dst_node, "inputs", [])
-
-            _trace(f"  src_outputs={len(src_outputs)}, dst_inputs={len(dst_inputs)}, "
-                   f"src_idx={src_idx}, dst_idx={dst_idx}")
 
             if src_idx is not None and src_idx < len(src_outputs):
                 src_port = src_outputs[src_idx]
@@ -915,21 +690,13 @@ class GraphSerializer:
                     dst_inputs, c_data["target_port_name"]
                 )
 
-            _trace(f"  src_port={src_port}, dst_port={dst_port}")
-
             if src_port and dst_port:
-                _trace(f"  Calling ConnectionFactory.create...")
                 ConnectionFactory.create(
                     canvas, src_port, dst_port,
                     validate=False, trigger_compute=False
                 )
-                _trace(f"  Connection created OK")
-            else:
-                _trace(f"  SKIP: ports not found")
         except Exception as e:
-            _trace(f"  EXCEPTION: {type(e).__name__}: {e}")
             log.error(f"Connection restore error: {e}")
-            import traceback; traceback.print_exc()
 
     @staticmethod
     def _find_port_by_name(ports, name: str):
@@ -975,41 +742,24 @@ class GraphSerializer:
         restore_style: bool = True,
     ) -> bool:
         """Read from a file and deserialize."""
-        print(f"[LOAD] Opening file: {filepath}", flush=True)
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 json_str = f.read()
-            print(f"[LOAD] File read OK ({len(json_str)} chars). Starting deserialize...", flush=True)
             result = self.deserialize(
                 canvas, json_str,
                 view=view, minimap=minimap, restore_style=restore_style
             )
-            print(f"[LOAD] Deserialize returned: {result}", flush=True)
             return result
         except FileNotFoundError:
             log.warning(f"File not found: {filepath}")
             return False
         except Exception as e:
-            print(f"[LOAD] EXCEPTION: {type(e).__name__}: {e}", flush=True)
-            import traceback; traceback.print_exc()
             log.error(f"Load failed: {e}")
             return False
 
     # =======================================================================
-    # BACKWARD COMPATIBILITY
+    # BACKWARD COMPATIBILITY (Removed for clean version)
     # =======================================================================
-
-    @staticmethod
-    def is_v1_format(data: Dict[str, Any]) -> bool:
-        """Check if data is in the old v1 format (no 'meta' key)."""
-        return "meta" not in data and "nodes" in data
-
-    @staticmethod
-    def is_v2_format(data: Dict[str, Any]) -> bool:
-        """Check if data is in v2 format (has 'meta' but node dicts use
-        legacy keys like 'widget_state', 'state', top-level 'manual_mode')."""
-        meta = data.get("meta", {})
-        return meta.get("version", "").startswith("2.")
 
 
 # ===========================================================================

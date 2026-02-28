@@ -27,6 +27,9 @@ from contextlib import contextmanager
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtCore import Qt, QObject, Signal
 
+from weave.logger import get_logger
+log = get_logger("Stylemanager")
+
 from weave.themes.core_theme import (
     StyleCategory, CanvasStyleSchema, NodeStyleSchema, PortStyleSchema,
     TraceStyleSchema, MinimapStyleSchema, BASE_DEFAULTS
