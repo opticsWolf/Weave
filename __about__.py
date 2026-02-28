@@ -17,7 +17,7 @@ __description__: Final[str] = (
     "A modular PySide6 framework for the visual synthesis and "
     "execution of high-concurrency simulation workflows."
 )
-__version__: Final[str] = "0.1.0"
+__version__: Final[str] = "0.1.1"
 __author__: Final[str] = "opticsWolf"
 __license__: Final[str] = "Apache-2.0"
 __copyright__: Final[str] = "Copyright (c) 2026 opticsWolf"
@@ -29,4 +29,5 @@ def metadata_summary() -> dict[str, str]:
         "version": __version__,
         "license": __license__,
         "description": __description__,
+
     }
