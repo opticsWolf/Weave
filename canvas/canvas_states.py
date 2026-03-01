@@ -360,6 +360,53 @@ class IdleState(CanvasInteractionState):
                 self._sync_style_cache()
                 logging.debug("Shake parameters updated from StyleManager")
     
+    # ── Interactive proxy-widget detection ─────────────────────────────
+
+    def _is_interactive_widget_click(self, scene_pos: QPointF) -> bool:
+        """
+        Returns True if *scene_pos* lands on an interactive child widget
+        (QComboBox, QSpinBox, QLineEdit …) inside a node's WidgetCore.
+
+        Goes through the node → WidgetCore → is_interactive_at() path,
+        which correctly maps scene → widget coordinates and checks the
+        deepest child under the cursor.  Returns False for clicks on
+        empty canvas, header, ports, body background, labels, or any
+        non-interactive area — so normal canvas interaction is unaffected.
+        """
+        node = ItemResolver.resolve_node_at(self.canvas, scene_pos)
+        if node is None:
+            return False
+
+        core = getattr(node, '_weave_core', None)
+        if core is None:
+            return False
+
+        return core.is_interactive_at(scene_pos)
+
+    def _yield_to_proxy(self, scene_pos: QPointF) -> bool:
+        """
+        Set focus on the proxy and return False so that Canvas falls
+        through to ``super().mousePressEvent()`` which handles the
+        coordinate translation natively — mapping scene coordinates to
+        local widget coordinates — while bypassing the state machine's
+        drag / selection logic.
+        """
+        node = ItemResolver.resolve_node_at(self.canvas, scene_pos)
+        if node is None:
+            return False
+
+        core = getattr(node, '_weave_core', None)
+        if core is None:
+            return False
+
+        proxy = core.get_proxy()
+        if proxy is not None:
+            proxy.setFocus(Qt.FocusReason.MouseFocusReason)
+
+        return False   # let Qt's native event router handle delivery
+
+    # ── Event handlers ────────────────────────────────────────────────
+
     def on_mouse_press(self, event: QGraphicsSceneMouseEvent) -> bool:
         """
         Handle mouse press events.
@@ -367,12 +414,10 @@ class IdleState(CanvasInteractionState):
         PATCHED: Added proxy widget detection to allow interactive widgets
                  like dropdowns and spinboxes to receive click events properly.
         """
-        # ──── Let proxy widgets handle their own clicks ────
-        # NOTE: self.canvas IS the QGraphicsScene (Canvas).
-        item = self.canvas.itemAt(event.scenePos(), QTransform())
-        if isinstance(item, QGraphicsProxyWidget):
-            return False  # yield to widget — don't start drag / selection
-        # ──── END proxy detection ───────────────────────────────
+        # ──── Interactive-widget fast-path ─────────────────────────
+        if self._is_interactive_widget_click(event.scenePos()):
+            return self._yield_to_proxy(event.scenePos())
+        # ──── END proxy detection ──────────────────────────────────
 
         logging.debug("IdleState.on_mouse_press: Initializing drag state")
         
@@ -499,6 +544,11 @@ class IdleState(CanvasInteractionState):
     
     def on_mouse_double_click(self, event: QGraphicsSceneMouseEvent) -> bool:
         """Handle mouse double click."""
+        # ──── Interactive-widget fast-path ─────────────────────────
+        if self._is_interactive_widget_click(event.scenePos()):
+            return self._yield_to_proxy(event.scenePos())
+        # ──── END proxy detection ──────────────────────────────────
+
         # Check for title editing first
         node = ItemResolver.resolve_node_at(self.canvas, event.scenePos())
         

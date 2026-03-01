@@ -9,6 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 import os
 from functools import partial
+#import uuid  # Added for UUID support
 from typing import Optional, List, Dict, Any
 from PySide6.QtWidgets import (
     QMenu, QGraphicsItem, QWidgetAction, QLineEdit,

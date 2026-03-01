@@ -97,16 +97,8 @@ class Canvas(QGraphicsScene):
         # Initialize Style Manager singleton access
         self._style_manager = StyleManager.instance()
         
-        # Register this canvas for CANVAS-category style updates
-        self._style_manager.register(self, StyleCategory.CANVAS)
-        
-        # 1. Inject provided config into StyleManager immediately
-        if config:
-            self._style_manager.update(StyleCategory.CANVAS, **config)
-        
         # ===== CACHED STYLE PARAMETERS =====
-        # These are updated via _sync_style_cache() when styles change
-        # instead of calling StyleManager.get() on every property access
+        # Set up default cache properties before initializing subsystems
         self._cached_bg_color = QColor(30, 33, 40)
         self._cached_grid_color = QColor(50, 55, 62)
         self._cached_grid_type = GridType.DOTS
@@ -123,12 +115,13 @@ class Canvas(QGraphicsScene):
         # Grid pen caching (updated when grid settings change)
         self._grid_pen = None
         
-        # Sync cache with current StyleManager values
+        # Sync cache with current StyleManager values FIRST
         self._sync_style_cache()
         
         # Initialize grid pen with cached values  
         self._update_grid_pen()
 
+        # Initialize core subsystems BEFORE registering for style updates
         # Layout & Z-Order - use cached values
         self._orchestrator = CanvasOrchestrator(
             self,
@@ -160,6 +153,13 @@ class Canvas(QGraphicsScene):
         self.changed.connect(self._orchestrator.schedule_resize)
         self.selectionChanged.connect(self._on_selection_changed)
         self._orchestrator.recalculate_bounds()
+
+        # NOW that all subsystems are initialized, register for style updates
+        self._style_manager.register(self, StyleCategory.CANVAS)
+        
+        # Apply provided config (will trigger on_style_changed safely)
+        if config:
+            self._style_manager.update(StyleCategory.CANVAS, **config)
 
     def _sync_style_cache(self):
         """
