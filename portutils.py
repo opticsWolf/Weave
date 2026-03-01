@@ -45,6 +45,8 @@ from weave.portregistry import PortRegistry, PortType
 from weave.node.node_port import NodePort
 HAS_NODE_PORT = True
 
+from weave.logger import get_logger
+log = get_logger("PortUtils")
 
 class PortUtils:
     """
@@ -494,8 +496,7 @@ class ConnectionFactory:
             return trace
             
         except Exception as e:
-            import logging
-            logging.warning(f"Failed to create connection: {e}")
+            log.warning(f"Failed to create connection: {e}")
             return None
     
     @staticmethod
