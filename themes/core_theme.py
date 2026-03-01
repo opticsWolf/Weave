@@ -45,6 +45,11 @@ class CanvasStyleSchema:
     shake_time_window_ms: int = 500
     min_stroke_length: int = 50
     shake_to_disconnect: bool = True
+    
+    zoom_min: float = 0.2
+    zoom_max: float = 3.0
+    zoom_factor: float = 1.15
+    scrollbar_policy: str = "never"
 
 
 @dataclass
@@ -130,7 +135,7 @@ class NodeStyleSchema:
     hover_glow_opacity_start: int = 25
     use_header_color_for_hover_glow: bool = True
     
-    # Computing Glow (animated pulse for COMPUTING state)
+    # Computing Glow
     computing_glow_extra_offset: float = 4.0
     computing_glow_width_min: float = 2.0
     computing_glow_width_max: float = 14.0
@@ -165,8 +170,8 @@ class NodeStyleSchema:
     # Font
     font_family: str = "Segoe UI"
     font_size: int = 10
-    font_weight: Union[str, int, QFont.Weight] = "bold"  # Support string or numeric values
-    font_italic: bool = True
+    font_weight: Union[str, int, QFont.Weight] = "bold"
+    font_italic: bool = False
     sel_font_weight: Union[str, int, QFont.Weight] = "bold"
     sel_font_italic: bool = False
     
@@ -185,33 +190,28 @@ class NodeStyleSchema:
 @dataclass
 class PortStyleSchema:
     """Port-specific style defaults using list-based color and enum string definitions."""
-    # Port Geometry
     radius: int = 8
     offset: int = 1
     min_spacing: int = 25
     highlight: int = 50
     
-    # Inner Circle
     inner_radius: int = 4
     inner_color: Optional[List[int]] = None
     use_outline_color: bool = True
     outline_bright: int = 50
     
-    # Connection Drag Visuals
     compatible_saturation: int = 30
     compatible_brightness: int = 40
     incompatible_opacity: float = 0.67
     incompatible_saturation: int = -60
     incompatible_brightness: int = -60
     
-    # Port Area
     enable_area: bool = True
     area_top: bool = True
     area_padding: int = 10
     area_margin: int = 10
     area_bg: Optional[List[int]] = None
     
-    # Port Labels
     label_font_family: str = "Segoe UI"
     label_font_size: int = 9
     label_font_weight: Union[str, int, QFont.Weight] = "normal"
@@ -227,24 +227,20 @@ class PortStyleSchema:
 @dataclass
 class TraceStyleSchema:
     """Connection trace style defaults using list-based color and enum string definitions."""
-    # Main trace
     width: float = 3.0
     color: Optional[List[int]] = None
-    style: Union[str, int, Qt.PenStyle] = "solid"  # Support strings like "dash", numbers, or enums
+    style: Union[str, int, Qt.PenStyle] = "solid"
     cap_style: Union[str, int, Qt.PenCapStyle] = "round"
     join_style: Union[str, int, Qt.PenJoinStyle] = "round"
     
-    # Outline/Halo
     outline_width: float = 1.0
     outline_color: Optional[List[int]] = None
     
-    # Shadow
     shadow_enable: bool = True
     shadow_color: Optional[List[int]] = None
     shadow_offset_x: float = 1.5
     shadow_offset_y: float = 2.5
     
-    # Drag trace specific
     drag_width: float = 2.0
     drag_style: Union[str, int, Qt.PenStyle] = "dash"
     drag_color: Optional[List[int]] = None
@@ -261,34 +257,28 @@ class TraceStyleSchema:
 @dataclass
 class MinimapStyleSchema:
     """Minimap widget style defaults using list-based color and enum string definitions."""
-    # Dimensions
     width: int = 240
     height: int = 180
     margin: int = 20
     minimized_size: int = 40
     
-    # Animation
     anim_duration: int = 35
     hover_enter_delay: int = 25
     hover_leave_delay: int = 200
     
-    # Body
     bg_color: Optional[List[int]] = None
     border_color: Optional[List[int]] = None
     border_width: float = 1.5
     corner_radius: int = 10
     
-    # Viewport Lens
     lens_fill_color: Optional[List[int]] = None
     lens_border_color: Optional[List[int]] = None
     lens_border_width: float = 1.0
     lens_corner_radius: int = 3
     
-    # Node representation
     node_color: Optional[List[int]] = None
     node_radius: float = 4.0
     
-    # UI Buttons
     icon_size: int = 22
     icon_padding: int = 6
     icon_spacing: int = 4
@@ -296,18 +286,16 @@ class MinimapStyleSchema:
     icon_hover_color: Optional[List[int]] = None
     active_icon_color: Optional[List[int]] = None
     
-    # Text
     text_color: Optional[List[int]] = None
     font_size: int = 10
     font_family: str = "Segoe UI"
     
-    # Snapping overlay
     snap_color: Optional[List[int]] = None
     snap_width: float = 1.5
 
 
 # ============================================================================ 
-# BASE DEFAULTS DICTIONARY (Replaces lambda factories)  
+# BASE DEFAULTS DICTIONARY  
 # ============================================================================
 
 BASE_DEFAULTS: Dict[StyleCategory, Dict[str, Any]] = {
