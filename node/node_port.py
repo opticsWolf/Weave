@@ -19,7 +19,7 @@ from PySide6.QtGui import QPainter, QColor, QPainterPath, QFont, QBrush, QFontMe
 
 from weave.portregistry import PortRegistry
 from weave.stylemanager import StyleManager, StyleCategory
-
+from weave.node.node_subcomponents import highlight_colors
 
 class NodePort(QGraphicsItem):
     """
@@ -168,13 +168,9 @@ class NodePort(QGraphicsItem):
         """
         return self._style_manager.get_all(StyleCategory.PORT)
 
-
     def _highlight_colors(self, color: QColor, b_offset: int, s_offset: int = 0) -> QColor:
-        """Helper to highlight colors."""
-        h, s, l, a = color.getHsl()
-        l = max(0, min(255, l + b_offset))
-        s = max(0, min(255, s + s_offset))
-        return QColor.fromHsl(h, s, l, a)
+        #print ('Node Port _highlight_colors', color, b_offset, s_offset)
+        return highlight_colors(color, b_offset, s_offset)
 
     # ==========================================================================
     # PORT AREA & LABEL METHODS

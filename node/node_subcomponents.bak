@@ -29,16 +29,72 @@ if TYPE_CHECKING:
 # 1. HELPER FUNCTIONS
 # ==============================================================================
 
-def highlight_colors(color: QColor, b_offset: int, s_offset: int = 0) -> QColor:
+def _ensure_qcolor(val) -> QColor:
+    """Guarantee *val* is a QColor, converting from list/tuple/str if needed.
+
+    During deserialization, node._config may contain raw Python lists
+    (e.g. [30, 33, 40, 255]) instead of QColor objects.  Every paint
+    method and color utility that reads from _config must pass through
+    this helper so that .getHsl(), .red(), .alpha() etc. never crash
+    with ``AttributeError: 'list' object has no attribute …``.
+    """
+    if isinstance(val, QColor):
+        return val
+    if isinstance(val, (list, tuple)) and len(val) >= 3:
+        print ('_ensure_qcolor', val)
+        a = int(val[3]) if len(val) > 3 else 255
+        return QColor(int(val[0]), int(val[1]), int(val[2]), a)
+    if isinstance(val, str) and val.startswith("#"):
+        return QColor(val)
+    # Fallback: transparent black (safe, visible in debugging)
+    return QColor(0, 0, 0, 255)
+    return (val)
+
+def _ensure_font_weight(val) -> QFont.Weight:
+    """Guarantee *val* is a QFont.Weight, converting from str/int if needed.
+
+    During deserialization, font_weight / sel_font_weight may arrive as
+    raw strings ("bold") or ints (700) instead of QFont.Weight enums.
+    QFont.setWeight() crashes or silently fails on wrong types.
+    """
+    if isinstance(val, QFont.Weight):
+        return val
+    weight_map = {
+        "thin": QFont.Weight.Thin,
+        "light": QFont.Weight.Light,
+        "normal": QFont.Weight.Normal,
+        "medium": QFont.Weight.Medium,
+        "bold": QFont.Weight.Bold,
+        "black": QFont.Weight.Black,
+    }
+    if isinstance(val, str) and val.lower() in weight_map:
+        print('_ensure_font_weight', val)
+        return weight_map[val.lower()]
+    if isinstance(val, (int, float)):
+        v = int(val)
+        print('_ensure_font_weight', val)
+        if v >= 900: return QFont.Weight.Black
+        if v >= 700: return QFont.Weight.Bold
+        if v >= 500: return QFont.Weight.Medium
+        if v >= 400: return QFont.Weight.Normal
+        if v >= 300: return QFont.Weight.Light
+        if v >= 100: return QFont.Weight.Thin
+    return QFont.Weight.Normal
+
+def highlight_colors(color, b_offset: int, s_offset: int = 0) -> QColor:
     """
     Adjusts the brightness and saturation of a QColor.
     All values cast to int for PySide6 C++ signature safety.
+
+    Accepts QColor, [r,g,b,a] lists, or hex strings — converts
+    transparently so callers don't need to worry about type.
     """
+    #print ('highlight_color', color)
+    color = _ensure_qcolor(color)
     h, s, l, a = color.getHsl()
     l = int(max(0, min(255, l + b_offset)))
     s = int(max(0, min(255, s + s_offset)))
     return QColor.fromHsl(int(h), s, l, int(a))
-
 
 # ==============================================================================
 # 2. COMPONENTS 
@@ -164,16 +220,19 @@ class StateSlider(QGraphicsObject):
         Reads state_visuals through StyleManager.get() which performs
         read-time conversion of list colors → QColor.  Uses STRING keys
         ('NORMAL', 'PASSTHROUGH', 'DISABLED') matching core_theme.BASE_DEFAULTS.
+
+        Defensively converts values through _ensure_qcolor in case the
+        config contains raw lists (e.g. during deserialization).
         """
         
         v = self._anim_value
         cfg = self._node_header._node._config
         visuals = cfg['state_visuals']
 
-        # Resolve the three relevant icon_colors (already QColor from read-time conversion)
-        normal_ic    = visuals.get('NORMAL',      {}).get('icon_color', QColor(100, 220, 100))
-        passthru_ic  = visuals.get('PASSTHROUGH',  {}).get('icon_color', QColor(255, 180, 50))
-        disabled_ic  = visuals.get('DISABLED',     {}).get('icon_color', QColor(220, 60, 60))
+        # Resolve the three relevant icon_colors — convert defensively
+        normal_ic    = _ensure_qcolor(visuals.get('NORMAL',      {}).get('icon_color', QColor(100, 220, 100)))
+        passthru_ic  = _ensure_qcolor(visuals.get('PASSTHROUGH',  {}).get('icon_color', QColor(255, 180, 50)))
+        disabled_ic  = _ensure_qcolor(visuals.get('DISABLED',     {}).get('icon_color', QColor(220, 60, 60)))
 
         if v <= 1.0:
             ratio = v
@@ -214,14 +273,13 @@ class StateSlider(QGraphicsObject):
         radius = h / 2.0
         
         # Use header outline color and body background color
-        outline_color = self._node_header._outline_color 
-        body_bg = cfg['body_bg']
+        outline_color = _ensure_qcolor(self._node_header._outline_color)
+        body_bg = _ensure_qcolor(cfg['body_bg'])
         
         # Apply hover highlight to background and knob only (not the edge)
         is_hover_hl = self._hovered and cfg['state_slider_highlight_on_hover']
         if is_hover_hl:
             shift = cfg['state_slider_highlight_color_shift']
-            print ('is_hover_hl_body_bg', body_bg)
             body_bg = highlight_colors(body_bg, shift/2)
         
         painter.setPen(QPen(outline_color, 1.5))
@@ -239,7 +297,6 @@ class StateSlider(QGraphicsObject):
         # 3. Draw Knob (highlight knob color on hover)
         knob_color = self._interpolate_color()
         if is_hover_hl:
-            print ('is_hover_hl_knob_color', knob_color)
             knob_color = highlight_colors(knob_color, shift*2)
         painter.setBrush(knob_color)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -288,14 +345,14 @@ class MinimizeButton(QGraphicsObject):
         btn_size = cfg['minimize_btn_size']
         self._btn_radius = btn_size / 2.0
         
-        # Colors based on configuration - no fallback needed now that schema provides all defaults
-        self._normal_color = cfg['minimize_btn_normal_color']
-        self._hover_color = cfg['minimize_btn_hover_color']
-        self._minimized_color = cfg['minimize_btn_minimized_color']
+        # Colors based on configuration - convert defensively from raw lists
+        self._normal_color = _ensure_qcolor(cfg['minimize_btn_normal_color'])
+        self._hover_color = _ensure_qcolor(cfg['minimize_btn_hover_color'])
+        self._minimized_color = _ensure_qcolor(cfg['minimize_btn_minimized_color'])
         
         # Additional configuration options
         self._border_width = cfg['minimize_btn_border_width']
-        self._border_color = cfg['minimize_btn_border_color']
+        self._border_color = _ensure_qcolor(cfg['minimize_btn_border_color'])
         
         # Update rect based on current size
         if not self._rect.isEmpty():
@@ -407,8 +464,8 @@ class EditableTitle(QGraphicsTextItem):
         self._apply_font(is_selected=False)
         self._lock_interaction()
         
-    def set_color(self, color: QColor) -> None:
-        self.setDefaultTextColor(color)
+    def set_color(self, color) -> None:
+        self.setDefaultTextColor(_ensure_qcolor(color))
         
     def update_selection_style(self, is_selected: bool) -> None:
         self._apply_font(is_selected)
@@ -417,10 +474,10 @@ class EditableTitle(QGraphicsTextItem):
         cfg = self._header._node._config
         font = QFont(cfg['font_family'], cfg['font_size'])
         if is_selected:
-            font.setWeight(cfg['sel_font_weight'])
+            font.setWeight(_ensure_font_weight(cfg['sel_font_weight']))
             font.setItalic(cfg['sel_font_italic'])
         else:
-            font.setWeight(cfg['font_weight'])
+            font.setWeight(_ensure_font_weight(cfg['font_weight']))
             font.setItalic(cfg['font_italic'])
         self.setFont(font)
 
@@ -547,10 +604,10 @@ class ResizeHandle(QGraphicsItem):
         cfg = self._node._config
         
         if self._hovered or self._resizing:
-            color = cfg['resize_handle_hover_color']
+            color = _ensure_qcolor(cfg['resize_handle_hover_color'])
             width = cfg['resize_handle_hover_width']
         else:
-            color = cfg['resize_handle_color']
+            color = _ensure_qcolor(cfg['resize_handle_color'])
             width = cfg['resize_handle_width']
             
         pen = QPen(color, width)
