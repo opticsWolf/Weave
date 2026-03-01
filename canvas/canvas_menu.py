@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy,
     QFileDialog
 )
-from PySide6.QtCore import QPointF, Qt, QTimer, QEvent
+from PySide6.QtCore import QPointF, Qt, QTimer, QEvent, QSettings
 from PySide6.QtGui import QAction, QKeySequence, QColor, QPixmap, QIcon
 
 from weave.stylemanager import StyleManager, StyleCategory
@@ -356,6 +356,12 @@ class ContextMenuProvider:
         self._canvas = canvas
         self._current_filepath: Optional[str] = None
         self._serializer: Optional[Any] = None
+        
+        # File history management
+        self._file_history = []
+        self._max_history_items = 10
+        self._settings = QSettings("opticsWolf", "Weave")
+        self._load_file_history()
     
     def create_menu(self, scene_pos: QPointF, target_item: Optional[QGraphicsItem] = None) -> Optional[QMenu]:
         """
@@ -420,6 +426,12 @@ class ContextMenuProvider:
         delete_action.triggered.connect(lambda: self._on_delete_triggered(target_item))
         menu.addAction(delete_action)
         
+        # Action: Clear Canvas (only for single node selection or no selection)
+        clear_canvas_action = QAction("Clear Canvas", menu)
+        clear_canvas_action.setShortcut("Ctrl+Shift+C")  # Using Ctrl+Shift+C to avoid conflicts
+        clear_canvas_action.triggered.connect(self._on_clear_canvas_triggered)
+        menu.addAction(clear_canvas_action)
+        
         menu.addSeparator()
         
         # --- New Section: Header Color Sub-menu ---
@@ -471,6 +483,12 @@ class ContextMenuProvider:
         if HAS_SERIALIZER:
             file_menu = menu.addMenu("File")
             
+            # New command
+            new_action = QAction("New", file_menu)
+            new_action.setShortcut("Ctrl+N")
+            new_action.triggered.connect(self._on_new)
+            file_menu.addAction(new_action)
+            
             save_action = QAction("Save", file_menu)
             save_action.setShortcut("Ctrl+S")
             save_action.triggered.connect(self._on_save)
@@ -481,7 +499,17 @@ class ContextMenuProvider:
             save_as_action.triggered.connect(self._on_save_as)
             file_menu.addAction(save_as_action)
             
-            file_menu.addSeparator()
+            # Add recent files submenu
+            if self._file_history:
+                recent_files_menu = file_menu.addMenu("Recent Files")
+                for i, filepath in enumerate(self._file_history):
+                    action = QAction(filepath, recent_files_menu)
+                    action.triggered.connect(partial(self._on_load_recent_file, filepath))
+                    # Add keyboard shortcut (Alt+1 through Alt+0)
+                    if i < 9:
+                        action.setShortcut(f"Alt+{i + 1}")
+                    recent_files_menu.addAction(action)
+                file_menu.addSeparator()
             
             load_action = QAction("Open...", file_menu)
             load_action.setShortcut("Ctrl+O")
@@ -495,6 +523,12 @@ class ContextMenuProvider:
         select_all_action.setShortcut("Ctrl+A")
         select_all_action.triggered.connect(self._on_select_all)
         menu.addAction(select_all_action)
+        
+        # Action: Clear Canvas
+        clear_canvas_action = QAction("Clear Canvas", menu)
+        clear_canvas_action.setShortcut("Ctrl+Shift+C")
+        clear_canvas_action.triggered.connect(self._on_clear_canvas_triggered)
+        menu.addAction(clear_canvas_action)
         
         menu.addSeparator()
         
@@ -677,11 +711,79 @@ class ContextMenuProvider:
             if (item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable
                 and not (HAS_NODE_COMPONENTS and isinstance(item, (NodeTrace, DragTrace)))):
                 item.setSelected(True)
+    
+    def _on_clear_canvas_triggered(self) -> None:
+        """
+        Clear all nodes from the canvas.
+        
+        This action removes all managed nodes from the scene using 
+        NodeManager's clear_all method. It is available both when right-clicking
+        on background and in node context menu for consistency.
+        """
+        # Access the NodeManager directly to clear all nodes
+        if hasattr(self._canvas, '_node_manager'):
+            self._canvas._node_manager.clear_all()
+            
+            # Optional: Clear selection after clearing canvas
+            self._canvas.clearSelection()
+    
+    def _on_new(self) -> None:
+        """
+        Create a new blank canvas with default settings.
+        
+        This clears all nodes from the scene and resets style settings to defaults
+        by reapplying the currently active theme.
+        """
+        # Clear all nodes
+        if hasattr(self._canvas, '_node_manager'):
+            self._canvas._node_manager.clear_all()
+            
+        # Reset canvas to default styles (clear selection and reset config)
+        self._canvas.clearSelection()
+        
+        # Reapply current theme to restore default settings 
+        style_manager = StyleManager.instance()
+        current_theme = style_manager.current_theme
+        if current_theme:
+            style_manager.apply_theme(current_theme)
+        
+        # Update the canvas with new default settings
+        self._canvas.update()
+        
+        log.info("New canvas created with default settings")
 
     # ==========================================================================
-    # FILE OPERATIONS
+    # FILE OPERATIONS WITH HISTORY
     # ==========================================================================
 
+    def _load_file_history(self) -> None:
+        """Load file history from settings."""
+        history = self._settings.value("file_history", [])
+        if isinstance(history, list):
+            self._file_history = [f for f in history if os.path.exists(f)]
+        else:
+            self._file_history = []
+    
+    def _save_file_history(self) -> None:
+        """Save file history to settings."""
+        self._settings.setValue("file_history", self._file_history)
+    
+    def _add_to_file_history(self, filepath: str) -> None:
+        """Add a file path to the history, maintaining max items."""
+        # Remove if already exists
+        if filepath in self._file_history:
+            self._file_history.remove(filepath)
+        
+        # Add to front
+        self._file_history.insert(0, filepath)
+        
+        # Trim to max size
+        if len(self._file_history) > self._max_history_items:
+            self._file_history = self._file_history[:self._max_history_items]
+        
+        # Save updated history
+        self._save_file_history()
+    
     def _get_serializer(self) -> Optional[Any]:
         """
         Lazily create the :class:`GraphSerializer` from the node registry.
@@ -791,6 +893,16 @@ class ContextMenuProvider:
                 filepath += ".json"
             self._do_save(filepath)
 
+    def _on_load_recent_file(self, filepath: str) -> None:
+        """
+        Load a file from the recent files history.
+        
+        Args:
+            filepath: The path to load from.
+        """
+        if os.path.exists(filepath):
+            self._do_load(filepath)
+    
     def _do_save(self, filepath: str) -> None:
         """
         Perform the actual save operation.
@@ -816,6 +928,7 @@ class ContextMenuProvider:
 
         if success:
             self._current_filepath = filepath
+            self._add_to_file_history(filepath)
             log.info(f"Graph saved to: {filepath}")
         else:
             log.error(f"Save failed: {filepath}")
@@ -868,6 +981,7 @@ class ContextMenuProvider:
 
         if success:
             self._current_filepath = filepath
+            self._add_to_file_history(filepath)
             log.info(f"Graph loaded from: {filepath}")
         else:
             log.error(f"Load failed: {filepath}")

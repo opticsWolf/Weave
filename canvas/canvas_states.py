@@ -24,8 +24,8 @@ from abc import ABC, abstractmethod
 from collections import deque
 from typing import Optional, List, Type, TypeVar, Sequence
 from PySide6.QtWidgets import QGraphicsSceneMouseEvent, QGraphicsItem, QGraphicsProxyWidget
-from PySide6.QtCore import Qt, QPointF, QElapsedTimer
-from PySide6.QtGui import QTransform
+from PySide6.QtCore import Qt, QPointF, QElapsedTimer, QTimer
+from PySide6.QtGui import QTransform, QKeyEvent
 import logging
 
 from weave.portutils import PortUtils, PortFinder, ConnectionFactory
@@ -247,6 +247,15 @@ class CanvasInteractionState(ABC):
     def apply_grid_snapping(self, event: QGraphicsSceneMouseEvent) -> None:
         """Apply grid snapping after default mouse move behavior."""
         pass
+    
+    def keyPressEvent(self, event: QKeyEvent) -> bool:
+        """
+        Handle keyboard shortcuts for canvas operations.
+        
+        This method can be overridden in subclasses to add state-specific shortcuts.
+        Returns True if the event was handled and should not propagate further.
+        """
+        return False
 
 
 # ============================================================================= 
@@ -730,6 +739,119 @@ class IdleState(CanvasInteractionState):
                 
             logging.info(f"Shake disconnected {disconnect_count} traces")
             print(f"✓ Shake disconnected {disconnect_count} connections")
+
+    def keyPressEvent(self, event: QKeyEvent) -> bool:
+        """
+        Handle keyboard shortcuts for canvas operations.
+        
+        Shortcuts:
+        - Ctrl+N: New file
+        - Ctrl+O: Open file 
+        - Ctrl+S: Save file
+        - Ctrl+Shift+S: Save As
+        - Alt+[1-9]: Access recent files (Alt+1 through Alt+9)
+        - Ctrl+Shift+C: Clear canvas
+        """
+        modifiers = event.modifiers()
+        key = event.key()
+
+        # Handle New File shortcut (Ctrl+N)  
+        if key == Qt.Key_N and modifiers & Qt.KeyboardModifier.ControlModifier:
+            self._handle_new_file()
+            return True
+
+        # Handle Open File shortcut (Ctrl+O)
+        if key == Qt.Key_O and modifiers & Qt.KeyboardModifier.ControlModifier:
+            self._handle_open_file() 
+            return True
+
+        # Handle Save File shortcut (Ctrl+S)
+        if key == Qt.Key_S and modifiers & Qt.KeyboardModifier.ControlModifier:
+            self._handle_save_file()
+            return True
+            
+        # Handle Save As shortcut (Ctrl+Shift+S)  
+        if (key == Qt.Key_S and modifiers & Qt.KeyboardModifier.ControlModifier 
+            and modifiers & Qt.KeyboardModifier.ShiftModifier):
+            self._handle_save_as()
+            return True
+
+        # Handle Clear Canvas shortcut (Ctrl+Shift+C)
+        if (key == Qt.Key_C and modifiers & Qt.KeyboardModifier.ControlModifier
+            and modifiers & Qt.KeyboardModifier.ShiftModifier):
+            self._handle_clear_canvas()
+            return True
+
+        # Handle recent files shortcuts (Alt+[1-9])
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            # Map Alt+1 through Alt+9 to indices 0-8 for file history
+            if Qt.Key_1 <= key <= Qt.Key_9:
+                self._handle_recent_file(key - Qt.Key_1)
+                return True
+
+        return False
+
+    def _handle_new_file(self):
+        """Execute the new file operation."""
+        # Access ContextMenuProvider through canvas to get access to file operations
+        if hasattr(self.canvas, '_context_menu_provider'):
+            provider = self.canvas._context_menu_provider
+            
+            # Call the internal method directly 
+            if hasattr(provider, '_on_new'):
+                provider._on_new()
+                
+    def _handle_open_file(self):
+        """Execute the open file operation."""
+        # Access ContextMenuProvider through canvas to get access to file operations
+        if hasattr(self.canvas, '_context_menu_provider'):
+            provider = self.canvas._context_menu_provider
+            
+            # Call the internal method directly 
+            if hasattr(provider, '_on_load'):
+                provider._on_load()
+
+    def _handle_save_file(self):
+        """Execute the save operation."""
+        # Access ContextMenuProvider through canvas to get access to file operations
+        if hasattr(self.canvas, '_context_menu_provider'):
+            provider = self.canvas._context_menu_provider
+            
+            # Call the internal method directly 
+            if hasattr(provider, '_on_save'):
+                provider._on_save()
+
+    def _handle_save_as(self):
+        """Execute the save as operation."""
+        # Access ContextMenuProvider through canvas to get access to file operations
+        if hasattr(self.canvas, '_context_menu_provider'):
+            provider = self.canvas._context_menu_provider
+            
+            # Call the internal method directly 
+            if hasattr(provider, '_on_save_as'):
+                provider._on_save_as()
+
+    def _handle_clear_canvas(self):
+        """Execute the clear canvas operation."""
+        # Access Canvas methods directly
+        if hasattr(self.canvas, '_node_manager') and hasattr(self.canvas, 'clearSelection'):
+            self.canvas._node_manager.clear_all()
+            self.canvas.clearSelection()
+
+    def _handle_recent_file(self, index: int):
+        """Handle recent file access via Alt+[1-9]."""
+        # Access ContextMenuProvider through canvas to get access to file operations
+        if hasattr(self.canvas, '_context_menu_provider'):
+            provider = self.canvas._context_menu_provider
+            
+            # Check if we have a valid history and index
+            if (hasattr(provider, '_file_history') and 
+                len(provider._file_history) > index):
+                
+                filepath = provider._file_history[index]
+                # Call the internal method for loading recent file
+                if hasattr(provider, '_on_load_recent_file'):
+                    provider._on_load_recent_file(filepath)
 
 
 # ============================================================================= 
