@@ -32,6 +32,7 @@ from weave.portutils import PortUtils, PortFinder, ConnectionFactory
 from weave.node.node_port import NodePort
 from weave.node.node_trace import DragTrace, NodeTrace
 from weave.basenode import BaseControlNode
+from weave.canvas.commands_mixin import CanvasCommandsMixin
 
 # Import StyleManager at module level (not in properties)
 from weave.stylemanager import StyleCategory, StyleManager
@@ -743,115 +744,94 @@ class IdleState(CanvasInteractionState):
     def keyPressEvent(self, event: QKeyEvent) -> bool:
         """
         Handle keyboard shortcuts for canvas operations.
-        
+
+        All command logic is delegated to :class:`CanvasCommandsMixin` via
+        ``canvas._context_menu_provider``.
+
         Shortcuts:
-        - Ctrl+N: New file
-        - Ctrl+O: Open file 
-        - Ctrl+S: Save file
-        - Ctrl+Shift+S: Save As
-        - Alt+[1-9]: Access recent files (Alt+1 through Alt+9)
-        - Ctrl+Shift+C: Clear canvas
+        - Delete / Backspace: Delete selected nodes
+        - Ctrl+D:             Duplicate selected nodes
+        - Ctrl+A:             Select all nodes
+        - Ctrl+N:             New canvas
+        - Ctrl+O:             Open file
+        - Ctrl+S:             Save file
+        - Ctrl+Shift+S:       Save As  (checked BEFORE Ctrl+S to avoid shadowing)
+        - Ctrl+Shift+C:       Clear canvas
+        - Alt+[1-9]:          Open recent file by index
         """
         modifiers = event.modifiers()
         key = event.key()
+        ctrl  = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        alt   = bool(modifiers & Qt.KeyboardModifier.AltModifier)
 
-        # Handle New File shortcut (Ctrl+N)  
-        if key == Qt.Key_N and modifiers & Qt.KeyboardModifier.ControlModifier:
-            self._handle_new_file()
+        # ── Shortcuts that don't need the provider ─────────────────
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            delete_selected_nodes(self.canvas)
             return True
 
-        # Handle Open File shortcut (Ctrl+O)
-        if key == Qt.Key_O and modifiers & Qt.KeyboardModifier.ControlModifier:
-            self._handle_open_file() 
+        if key == Qt.Key.Key_D and ctrl:
+            self._cmd('cmd_duplicate_selected')
             return True
 
-        # Handle Save File shortcut (Ctrl+S)
-        if key == Qt.Key_S and modifiers & Qt.KeyboardModifier.ControlModifier:
-            self._handle_save_file()
-            return True
-            
-        # Handle Save As shortcut (Ctrl+Shift+S)  
-        if (key == Qt.Key_S and modifiers & Qt.KeyboardModifier.ControlModifier 
-            and modifiers & Qt.KeyboardModifier.ShiftModifier):
-            self._handle_save_as()
+        if key == Qt.Key.Key_A and ctrl:
+            self._cmd('cmd_select_all')
             return True
 
-        # Handle Clear Canvas shortcut (Ctrl+Shift+C)
-        if (key == Qt.Key_C and modifiers & Qt.KeyboardModifier.ControlModifier
-            and modifiers & Qt.KeyboardModifier.ShiftModifier):
-            self._handle_clear_canvas()
+        # ── File shortcuts ──────────────────────────────────────────
+        # IMPORTANT: Ctrl+Shift+S must be checked before Ctrl+S alone,
+        # because Ctrl+S also matches when Shift is held.
+        if key == Qt.Key.Key_S and ctrl and shift:
+            self._cmd('cmd_save_as')
             return True
 
-        # Handle recent files shortcuts (Alt+[1-9])
-        if modifiers & Qt.KeyboardModifier.AltModifier:
-            # Map Alt+1 through Alt+9 to indices 0-8 for file history
-            if Qt.Key_1 <= key <= Qt.Key_9:
-                self._handle_recent_file(key - Qt.Key_1)
-                return True
+        if key == Qt.Key.Key_S and ctrl:
+            self._cmd('cmd_save')
+            return True
+
+        if key == Qt.Key.Key_N and ctrl:
+            self._cmd('cmd_new')
+            return True
+
+        if key == Qt.Key.Key_O and ctrl:
+            self._cmd('cmd_open')
+            return True
+
+        if key == Qt.Key.Key_C and ctrl and shift:
+            self._cmd('cmd_clear_canvas')
+            return True
+
+        # ── Recent files (Alt+1 … Alt+9) ───────────────────────────
+        if alt and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+            index = key - Qt.Key.Key_1  # 0-based
+            self._cmd('cmd_open_recent_by_index', index)
+            return True
 
         return False
 
-    def _handle_new_file(self):
-        """Execute the new file operation."""
-        # Access ContextMenuProvider through canvas to get access to file operations
-        if hasattr(self.canvas, '_context_menu_provider'):
-            provider = self.canvas._context_menu_provider
-            
-            # Call the internal method directly 
-            if hasattr(provider, '_on_new'):
-                provider._on_new()
-                
-    def _handle_open_file(self):
-        """Execute the open file operation."""
-        # Access ContextMenuProvider through canvas to get access to file operations
-        if hasattr(self.canvas, '_context_menu_provider'):
-            provider = self.canvas._context_menu_provider
-            
-            # Call the internal method directly 
-            if hasattr(provider, '_on_load'):
-                provider._on_load()
+    # ──────────────────────────────────────────────────────────────────────────
+    # Command dispatch helper
+    # ──────────────────────────────────────────────────────────────────────────
 
-    def _handle_save_file(self):
-        """Execute the save operation."""
-        # Access ContextMenuProvider through canvas to get access to file operations
-        if hasattr(self.canvas, '_context_menu_provider'):
-            provider = self.canvas._context_menu_provider
-            
-            # Call the internal method directly 
-            if hasattr(provider, '_on_save'):
-                provider._on_save()
+    def _cmd(self, method_name: str, *args):
+        """
+        Call ``method_name(*args)`` on the canvas's ContextMenuProvider.
 
-    def _handle_save_as(self):
-        """Execute the save as operation."""
-        # Access ContextMenuProvider through canvas to get access to file operations
-        if hasattr(self.canvas, '_context_menu_provider'):
-            provider = self.canvas._context_menu_provider
-            
-            # Call the internal method directly 
-            if hasattr(provider, '_on_save_as'):
-                provider._on_save_as()
-
-    def _handle_clear_canvas(self):
-        """Execute the clear canvas operation."""
-        # Access Canvas methods directly
-        if hasattr(self.canvas, '_node_manager') and hasattr(self.canvas, 'clearSelection'):
-            self.canvas._node_manager.clear_all()
-            self.canvas.clearSelection()
-
-    def _handle_recent_file(self, index: int):
-        """Handle recent file access via Alt+[1-9]."""
-        # Access ContextMenuProvider through canvas to get access to file operations
-        if hasattr(self.canvas, '_context_menu_provider'):
-            provider = self.canvas._context_menu_provider
-            
-            # Check if we have a valid history and index
-            if (hasattr(provider, '_file_history') and 
-                len(provider._file_history) > index):
-                
-                filepath = provider._file_history[index]
-                # Call the internal method for loading recent file
-                if hasattr(provider, '_on_load_recent_file'):
-                    provider._on_load_recent_file(filepath)
+        The provider inherits from :class:`CanvasCommandsMixin` so all
+        ``cmd_*`` methods are available there.  Failing gracefully keeps
+        shortcuts silent when the provider isn't set up yet.
+        """
+        provider: Optional[CanvasCommandsMixin] = getattr(
+            self.canvas, '_context_menu_provider', None
+        )
+        if provider is None:
+            logging.debug(f"_cmd({method_name}): no _context_menu_provider on canvas")
+            return
+        fn = getattr(provider, method_name, None)
+        if fn is None:
+            logging.warning(f"_cmd: provider has no method '{method_name}'")
+            return
+        fn(*args)
 
 
 # ============================================================================= 

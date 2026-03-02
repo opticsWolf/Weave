@@ -448,30 +448,27 @@ class Canvas(QGraphicsScene):
         """
         Handle keyboard shortcuts for canvas operations.
         
-        Shortcuts:
-        - Delete: Remove selected nodes
+        Delegates to the active state's keyPressEvent method first,
+        then handles fallback behaviors if no state consumes the event.
+        
+        Shortcuts (handled by IdleState):
+        - Delete / Backspace: Remove selected nodes
         - Ctrl+D: Duplicate selected nodes (with internal traces)
         - Ctrl+A: Select all nodes
+        - Ctrl+N: New canvas
+        - Ctrl+O: Open file  
+        - Ctrl+S: Save file
+        - Ctrl+Shift+S: Save As
+        - Ctrl+Shift+C: Clear canvas
+        - Alt+[1-9]: Open recent file by index
+        
+        Other keys are passed to the parent implementation.
         """
-        modifiers = event.modifiers()
-        key = event.key()
-        
-        # Ctrl+D: Duplicate selected nodes
-        if key == Qt.Key_D and modifiers & Qt.KeyboardModifier.ControlModifier:
-            self._duplicate_selected_nodes()
+        # Delegate keyboard handling to current interaction state first
+        if self._current_state.keyPressEvent(event):
+            event.accept()
             return
         
-        # Ctrl+A: Select all nodes
-        if key == Qt.Key_A and modifiers & Qt.KeyboardModifier.ControlModifier:
-            self._select_all_nodes()
-            return
-        
-        # Delete: Remove selected nodes
-        if key == Qt.Key_Delete:
-            if self.selectedItems():
-                delete_selected_nodes(self)
-            return
-            
         # Allow default handling for other keys
         super().keyPressEvent(event)
     
