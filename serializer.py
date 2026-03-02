@@ -51,7 +51,7 @@ from typing import Dict, Any, Type, Optional, List
 from PySide6.QtGui import QColor, QFont, QTransform
 from PySide6.QtCore import Qt, QPointF, QRectF
 
-from logger import get_logger
+from weave.logger import get_logger
 log = get_logger("Serializer")
 
 from weave.portutils import ConnectionFactory
