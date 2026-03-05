@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import sys
+import importlib.util
 import typing
 from dataclasses import dataclass, fields
 from enum import Enum, auto
@@ -28,7 +31,7 @@ from weakref import WeakSet
 from contextlib import contextmanager
 
 from PySide6.QtGui import QColor, QFont
-from PySide6.QtCore import Qt, QObject, Signal
+from PySide6.QtCore import Qt, QObject, Signal, QSettings
 
 from weave.logger import get_logger
 log = get_logger("Stylemanager")
@@ -39,6 +42,15 @@ from weave.themes.core_theme import (
 )
 
 from weave.themes.custome_theme import THEMES
+
+# ============================================================================
+# PERSISTENCE CONSTANTS
+# ============================================================================
+
+_SETTINGS_ORG  = "opticsWolf"
+_SETTINGS_APP  = "Weave"
+_SETTINGS_KEY  = "ui/active_theme"
+_DEFAULT_THEME = "dark"          # Hard fallback when everything else fails
 
 DEBUG_STYLE_MANAGER = True
 
@@ -330,6 +342,9 @@ class StyleManager(QObject):
     def instance(cls) -> 'StyleManager':
         if cls._instance is None:
             cls._instance = cls()
+            # Discover external theme files and restore the persisted theme
+            # immediately so it is ready before any subscriber registers.
+            cls._instance._boot()
         return cls._instance
     
     @classmethod
@@ -355,6 +370,10 @@ class StyleManager(QObject):
         }
         self._suppress_signals = False
         self._pending_changes: Dict[StyleCategory, Dict[str, Any]] = {}
+        # Initialize all categories to ensure no KeyError when accessing via enum keys
+        for cat in StyleCategory:
+            self._pending_changes[cat] = {}
+        self._initialized = False   # Set True after discover + restore in _boot()
     
     # ==========================================================================
     # BATCH UPDATES
@@ -446,10 +465,22 @@ class StyleManager(QObject):
         
         if changed:
             self._dict_cache[category] = None
+            # Build the notification payload with Qt-converted values so that
+            # on_style_changed(category, changes) subscribers always receive
+            # QColor / QFont.Weight / Qt.PenStyle etc., never raw lists.
+            # Reading back from the schema (post-setattr) mirrors get_all().
+            enum_fields = _get_enum_fields(type(schema))
+            qt_changes = {
+                k: _convert_field_for_read(k, getattr(schema, k), enum_fields)
+                for k in changed
+            }
             if self._suppress_signals:
-                self._pending_changes[category].update({k: kwargs[k] for k in changed})
+                # Ensure the category key exists in _pending_changes to prevent KeyError.
+                if category not in self._pending_changes:
+                    self._pending_changes[category] = {}
+                self._pending_changes[category].update(qt_changes)
             else:
-                self._notify_subscribers(category, {k: kwargs[k] for k in changed})
+                self._notify_subscribers(category, qt_changes)
         
         return changed
     
@@ -462,21 +493,197 @@ class StyleManager(QObject):
         return self._current_theme
     
     @property
+    def default_theme(self) -> str:
+        """
+        The hard-coded fallback theme used when a persisted or requested theme
+        cannot be applied.  Always one of the themes in BASE_DEFAULTS / THEMES.
+        """
+        return _DEFAULT_THEME
+
+    @property
     def available_themes(self) -> List[str]:
         return list(THEMES.keys())
     
     def apply_theme(self, theme_name: str) -> bool:
         if theme_name not in THEMES:
             return False
-        
-        with self.batch_update():
+
+        # Suppress all signals while we reset + apply overrides.
+        # We will do a single full broadcast afterwards so there is
+        # no need for the incremental batch notifications.
+        self._suppress_signals = True
+        try:
             self._reset_to_defaults()
             for category, overrides in THEMES[theme_name].items():
                 self.update(category, **overrides)
-        
+        finally:
+            self._suppress_signals = False
+            
+            # Process any pending changes and clear them to avoid issues 
+            # that could have occurred during batch operations
+            for category, changes in self._pending_changes.items():
+                if changes:
+                    self._notify_subscribers(category, changes)
+            self._pending_changes = {}
+
         self._current_theme = theme_name
+
+        # Single full broadcast: send get_all() for every category so
+        # that every subscriber refreshes its complete appearance —
+        # including keys that reverted to defaults (which would be
+        # missing from an incremental delta).
+        for category in StyleCategory:
+            self._notify_subscribers(category, self.get_all(category))
+
         self.theme_changed.emit(theme_name)
+
+        # Persist so the next session starts with this theme.
+        self._persist_theme(theme_name)
+
         return True
+
+    # ==========================================================================
+    # STARTUP: DISCOVERY + RESTORE
+    # ==========================================================================
+
+    def _boot(self) -> None:
+        """
+        Called exactly once after the singleton is created (from ``instance()``).
+        Discovers external theme files, then restores the last-used theme.
+        Guarded by ``_initialized`` so re-entrant calls are harmless.
+        """
+        if self._initialized:
+            return
+        self._initialized = True
+        self._discover_theme_files()
+        self.restore_theme()
+
+    def _discover_theme_files(self) -> None:
+        """
+        Scan the ``weave/themes/`` package directory for every ``*.py`` module
+        that exposes a ``THEMES`` dict and register any unknown theme names.
+
+        Skips ``core_theme.py`` (schemas only), ``__init__.py``, and private
+        files (those starting with ``_``).  Already-imported modules are reused
+        from ``sys.modules`` so each file is executed at most once per process.
+        """
+        existing = set(self.available_themes)
+
+        try:
+            import weave.themes.core_theme as _ct_mod
+            themes_dir = os.path.dirname(os.path.abspath(_ct_mod.__file__))
+        except Exception:
+            log.warning("Could not locate weave/themes directory; skipping theme discovery.")
+            return
+
+        skip = {"core_theme.py", "__init__.py"}
+
+        for filename in sorted(os.listdir(themes_dir)):
+            if not filename.endswith(".py") or filename in skip or filename.startswith("_"):
+                continue
+
+            module_path = os.path.join(themes_dir, filename)
+            module_name = f"weave.themes.{filename[:-3]}"
+
+            module = sys.modules.get(module_name)
+            if module is None:
+                try:
+                    spec = importlib.util.spec_from_file_location(module_name, module_path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    sys.modules[module_name] = module
+                except Exception as exc:
+                    log.warning(f"Failed to import theme file '{filename}': {exc}")
+                    continue
+
+            themes_dict = getattr(module, "THEMES", None)
+            if not isinstance(themes_dict, dict):
+                continue
+
+            for theme_name, overrides in themes_dict.items():
+                if theme_name not in existing and isinstance(overrides, dict):
+                    try:
+                        self.register_theme(theme_name, overrides)
+                        existing.add(theme_name)
+                        _debug_print(f"Discovered theme '{theme_name}' from '{filename}'")
+                    except Exception as exc:
+                        log.warning(f"Could not register theme '{theme_name}': {exc}")
+
+    # ==========================================================================
+    # PERSISTENCE
+    # ==========================================================================
+
+    @staticmethod
+    def _settings() -> QSettings:
+        return QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+
+    @staticmethod
+    def _persist_theme(theme_name: str) -> None:
+        """Write *theme_name* to QSettings so it survives restarts."""
+        try:
+            s = StyleManager._settings()
+            s.setValue(_SETTINGS_KEY, theme_name)
+            s.sync()
+            _debug_print(f"Persisted active theme: '{theme_name}'")
+        except Exception as exc:
+            _debug_print(f"_persist_theme() failed: {exc}")
+
+    @staticmethod
+    def _load_persisted_theme_name() -> Optional[str]:
+        """Return the theme name stored in QSettings, or None if absent."""
+        try:
+            s = StyleManager._settings()
+            value = s.value(_SETTINGS_KEY, defaultValue=None)
+            return str(value) if value is not None else None
+        except Exception as exc:
+            _debug_print(f"_load_persisted_theme_name() failed: {exc}")
+            return None
+
+    def restore_theme(self) -> str:
+        """
+        Restore the last-used theme from QSettings.
+
+        Resolution order
+        ----------------
+        1. Persisted theme name  → if known and applies successfully.
+        2. ``_DEFAULT_THEME``    → unconditional hard fallback.
+
+        Returns the name of the theme that was actually applied.
+        Called automatically once all theme files have been discovered so that
+        third-party themes are available before the look-up is attempted.
+        """
+        persisted = self._load_persisted_theme_name()
+
+        if persisted:
+            if persisted in THEMES:
+                if self.apply_theme(persisted):
+                    _debug_print(f"restore_theme(): restored '{persisted}'")
+                    return persisted
+                _debug_print(
+                    f"restore_theme(): apply_theme('{persisted}') failed – falling back."
+                )
+            else:
+                _debug_print(
+                    f"restore_theme(): persisted theme '{persisted}' is not registered "
+                    f"(yet). Will fall back to default. Re-run after theme discovery if "
+                    f"the theme comes from an external file."
+                )
+
+        # Hard fallback
+        fallback = _DEFAULT_THEME
+        if self.apply_theme(fallback):
+            _debug_print(f"restore_theme(): applied default fallback '{fallback}'")
+            return fallback
+
+        # Absolute last resort: apply first available theme
+        if THEMES:
+            first = next(iter(THEMES))
+            self.apply_theme(first)
+            _debug_print(f"restore_theme(): applied first-available theme '{first}'")
+            return first
+
+        _debug_print("restore_theme(): no themes available at all!")
+        return self._current_theme
     
     def register_theme(self, name: str, overrides: Dict[StyleCategory, Dict[str, Any]]) -> None:
         THEMES[name] = overrides
