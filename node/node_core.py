@@ -100,6 +100,12 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         self._custom_body_bg = None
         self._custom_body_outline = None
 
+        # Palette index for the header color.
+        # Stored as an int (position in header_color_palette) so that when the
+        # active theme changes, _reapply_header_color_from_index() can swap in the
+        # equivalent color from the new palette.  None means "use theme default".
+        self._header_color_index: Optional[int] = None
+
         # Initialize cache containers
         self._cached_rect = QRectF()
         self._cached_outline_path = QPainterPath()
@@ -160,6 +166,8 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         # Deferred refinement
         QTimer.singleShot(25, self._sync_to_widget_size)
 
+        self.setCacheMode(QGraphicsItem.NoCache)
+
         # Initialize summary ports after all setup
         self._initialize_summary_ports()
 
@@ -195,6 +203,94 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         return str(self._node_uuid)
 
     # ==================================================================
+    # HEADER COLOR — INDEX-BASED API
+    # ==================================================================
+
+    def get_header_color_index(self) -> Optional[int]:
+        """
+        Return the currently active palette index for the header color.
+
+        Returns None when the node is using the theme's default header color
+        (i.e. no per-node override has been set).
+        """
+        return self._header_color_index
+
+    def set_header_color_by_index(self, index: Optional[int]) -> None:
+        """
+        Set the node's header color via its position in the active theme's
+        ``header_color_palette``.
+
+        Storing an index rather than an absolute colour value means that when
+        the active theme changes, ``_reapply_header_color_from_index()`` can
+        substitute the equivalent colour from the new palette automatically.
+
+        Passing ``None`` (or an out-of-range index) clears the per-node
+        override so the node falls back to the theme's default header colour.
+
+        Args:
+            index: 0-based position in ``header_color_palette``, or None.
+        """
+        palette = self._config.get('header_color_palette') or []
+        if index is not None and 0 <= index < len(palette):
+            self._header_color_index = index
+            raw = palette[index]
+            if isinstance(raw, QColor):
+                self._custom_header_bg = QColor(raw)
+            else:
+                r, g, b = int(raw[0]), int(raw[1]), int(raw[2])
+                a = int(raw[3]) if len(raw) > 3 else 255
+                self._custom_header_bg = QColor(r, g, b, a)
+        else:
+            # Out-of-range or explicit None → revert to theme default.
+            self._header_color_index = None
+            self._custom_header_bg = None
+
+        self._update_colors(self.isSelected())
+        if hasattr(self, 'header'):
+            self.header.update()
+        self.update()
+
+    def _reapply_header_color_from_index(self) -> None:
+        """
+        Re-derive ``_custom_header_bg`` from ``_header_color_index`` against
+        the *current* theme's palette.
+
+        Must be called from ``on_style_changed()`` **after** ``self._config``
+        has been refreshed from the StyleManager so that the new palette is
+        available.
+
+        Behaviour:
+        - If ``_header_color_index`` is None → nothing to do (no override).
+        - If the index is valid in the new palette → update ``_custom_header_bg``
+          to the new palette's colour at that position.
+        - If the index is out-of-range in the new palette → clear the override
+          and reset ``_header_color_index`` to None (fall back to theme default).
+
+        The caller is responsible for invoking ``_update_colors()`` afterwards.
+        """
+        if self._header_color_index is None:
+            return  # No per-node override — nothing to do.
+
+        palette = self._config.get('header_color_palette') or []
+        if 0 <= self._header_color_index < len(palette):
+            raw = palette[self._header_color_index]
+            if isinstance(raw, QColor):
+                self._custom_header_bg = QColor(raw)
+            else:
+                r, g, b = int(raw[0]), int(raw[1]), int(raw[2])
+                a = int(raw[3]) if len(raw) > 3 else 255
+                self._custom_header_bg = QColor(r, g, b, a)
+        else:
+            # The new theme's palette is shorter — gracefully reset to default.
+            log.debug(
+                f"Node '{self.header._title.toPlainText()}': header_color_index "
+                f"{self._header_color_index} out of range for new theme palette "
+                f"(len={len(palette)}). Reverting to theme default."
+            )
+            self._header_color_index = None
+            self._custom_header_bg = None
+
+    # ==================================================================
     # SERIALIZATION
     # ==================================================================
 
@@ -208,19 +304,34 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         inputs_state = [p.get_state() for p in self.inputs]
         outputs_state = [p.get_state() for p in self.outputs]
 
+        # Use HexArgb (#AARRGGBB) so that alpha is preserved in the JSON.
+        # Also store the palette index so that theme-switching can map the color
+        # to the equivalent slot in a different theme's palette.
+        def _col_name(c):
+            return c.name(QColor.NameFormat.HexArgb) if c else None
+
         colors = {
-            "header_bg": self._custom_header_bg.name() if self._custom_header_bg else None,
-            "body_bg": self._custom_body_bg.name() if self._custom_body_bg else None,
-            "header_outline": self._custom_header_outline.name() if self._custom_header_outline else None,
-            "body_outline": self._custom_body_outline.name() if self._custom_body_outline else None,
+            "header_bg": _col_name(self._custom_header_bg),
+            "header_color_index": self._header_color_index,
+            "body_bg": _col_name(self._custom_body_bg),
+            "header_outline": _col_name(self._custom_header_outline),
+            "body_outline": _col_name(self._custom_body_outline),
         }
 
+        # Use toolTip() as the full-text source of truth: _recalculate_layout() always
+        # stores the full (unelided) title there, while toPlainText() may be truncated
+        # when the node is narrow.  Fall back to toPlainText() for brand-new nodes
+        # whose toolTip has not been populated yet.
+        _full_title = self.header._title.toolTip() or self.header._title.toPlainText()
+
+        # NOTE: _config is intentionally NOT saved. Style properties come from the
+        # StyleManager (theme). Only the per-node custom color overrides (colors dict)
+        # are saved — everything else is re-derived from the active theme on load.
         return {
-            "title": self.header._title.toPlainText(),
+            "title": _full_title,
             "width": self._width,
             "height": self._total_height,
             "pos": (self.pos().x(), self.pos().y()),
-            "config": self._config.copy(),
             "colors": colors,
             "inputs": inputs_state,
             "outputs": outputs_state,
@@ -238,14 +349,30 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         was_visible = self.isVisible()
         self.setVisible(False)
 
-        # 1. Apply Configuration (directly, no side-effects)
-        if "config" in state:
-            for k, v in state["config"].items():
-                if k in self._config:
-                    self._config[k] = v
+        # NOTE: _config is not restored from the save file — style properties are
+        # owned by the StyleManager (theme). Only the per-node custom color overrides
+        # are restored below via set_node_colors().
 
-        # 2. Geometry & Title
-        self.header._title.setPlainText(state.get("title", "Node"))
+        # 1. Geometry & Title
+        # FIX: Restore the full title into BOTH setPlainText and setToolTip.
+        # _recalculate_layout() (called at step 7) reads toolTip() as the full-text
+        # source of truth for base nodes.  Without this, it finds an empty toolTip
+        # and falls back to the stale toPlainText(), silently discarding the saved title.
+        _title_text = state.get("title", "Node")
+        self.header._title.setToolTip(_title_text)
+        self.header._title.setPlainText(_title_text)
+
+        # FIX: If the node exposes a `name` attribute (used by subclasses and read
+        # by _recalculate_layout() with higher priority than toolTip()), update it
+        # now so the layout pass doesn't overwrite the restored title with the
+        # stale constructor value.
+        if hasattr(self, "set_name") and callable(self.set_name):
+            self.set_name(_title_text)
+        elif hasattr(self, "name"):
+            try:
+                self.name = _title_text
+            except (AttributeError, TypeError):
+                pass  # read-only or method — leave it alone
         if self.scene():
             self.prepareGeometryChange()
         self._width = state.get("width", 200)
@@ -266,19 +393,36 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
             if not val:
                 return None
             try:
-                # If it's already a QColor or compatible with QColor constructor, use directly
                 return QColor(val)
             except Exception:
-                # Fallback: Return transparent black on error
                 return QColor(0, 0, 0, 0)
 
-        self.set_node_colors(
-            header_bg=_parse_col(colors.get("header_bg")),
-            body_bg=_parse_col(colors.get("body_bg")),
-            outline=_parse_col(colors.get("header_outline")),
-        )
-        if colors.get("body_outline"):
-            self._custom_body_outline = QColor(colors["body_outline"])
+        # Restore non-header custom colors unconditionally.
+        body_bg      = _parse_col(colors.get("body_bg"))
+        hdr_outline  = _parse_col(colors.get("header_outline"))
+        body_outline = _parse_col(colors.get("body_outline"))
+
+        # Header color: prefer the saved palette index.  This ensures that when the
+        # file is loaded under a different active theme the correct equivalent color
+        # from that theme's palette is used (and falls back to the theme default if
+        # the index no longer exists in the new palette).
+        header_color_index = colors.get("header_color_index")
+        if header_color_index is not None:
+            # set_header_color_by_index also calls _update_colors internally.
+            self.set_header_color_by_index(header_color_index)
+            # Apply remaining custom colors without touching the header.
+            if body_bg or hdr_outline:
+                self.set_node_colors(body_bg=body_bg, outline=hdr_outline)
+        else:
+            # Legacy path: header stored as a raw hex color value.
+            self.set_node_colors(
+                header_bg=_parse_col(colors.get("header_bg")),
+                body_bg=body_bg,
+                outline=hdr_outline,
+            )
+
+        if body_outline:
+            self._custom_body_outline = body_outline
             self._update_colors(self.isSelected())
 
         # 4. Rebuild Ports
@@ -287,13 +431,13 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
             self.add_input(
                 p_data["name"],
                 p_data.get("datatype", "flow"),
-                p_data.get("description", p_data.get("desc", "")),
+                p_data.get("description", ""),
             )
         for p_data in state.get("outputs", []):
             self.add_output(
                 p_data["name"],
                 p_data.get("datatype", "flow"),
-                p_data.get("description", p_data.get("desc", "")),
+                p_data.get("description", ""),
             )
 
         # 5. Node Visual State
@@ -386,9 +530,12 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
             blur_rad = cfg['shadow_blur_radius']
             layers = cfg['shadow_blur_layers']
             if blur_rad > 0 and layers > 0:
-                margin = blur_rad * 2
+                # FIX: Clamp the blur clip to boundingRect() so no painted
+                # pixels can ever land outside the region Qt invalidates
+                # on movement.  We translate by (-dx, -dy) because the
+                # painter is currently offset for the shadow position.
                 clip_path = QPainterPath()
-                clip_path.addRect(self._cached_rect.adjusted(-margin, -margin, margin, margin))
+                clip_path.addRect(self.boundingRect().translated(-dx, -dy))
                 clip_path.addPath(self._cached_outline_path)
                 clip_path.setFillRule(Qt.FillRule.OddEvenFill)
 

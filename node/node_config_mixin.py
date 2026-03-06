@@ -137,18 +137,43 @@ class NodeConfigMixin:
     def on_style_changed(self, category: StyleCategory, changes: Dict[str, Any]) -> None:
         """
         Callback method called when the StyleManager notifies about style changes.
+    
+        FIX: Explicitly update colors so the header and body receive new brushes.
+        Previously, this method updated self._config but did not trigger color updates
+        for visual components. This caused nodes to not refresh immediately when styles changed.
+    
+        Args:
+            category (StyleCategory): The style category that changed.
+            changes (Dict[str, Any]): Dictionary of style key-value pairs that changed.
         """
         if category == StyleCategory.NODE:
             self._config.update(changes)
-
+    
             if hasattr(self, 'header'):
                 self.header._recalculate_layout()
                 self.header._title.update_selection_style(self.isSelected())
+    
+            # Re-derive _custom_header_bg from the stored palette index against the
+            # freshly-updated theme palette.  Must be called AFTER _config.update()
+            # (so the new palette is available) but BEFORE _update_colors() (so the
+            # correct derived colour is used for painting).
+            # If no index is stored this is a no-op.
+            if hasattr(self, '_reapply_header_color_from_index'):
+                self._reapply_header_color_from_index()
 
+            # Explicitly update colors so the header and body receive new brushes
+            self._update_colors(is_selected=self.isSelected())
+    
             self._recalculate_paths()
             self.enforce_min_dimensions()
             self.update_geometry()
             self.update()
+    
+            # Ensure sub-components also repaint
+            if hasattr(self, 'header'): 
+                self.header.update()
+            if hasattr(self, 'body'): 
+                self.body.update()
 
     # ------------------------------------------------------------------
     # Color Management
@@ -217,9 +242,20 @@ class NodeConfigMixin:
         body_bg: Optional[QColor] = None,
         outline: Optional[QColor] = None
     ) -> None:
-        """Sets custom colors for the node components."""
+        """Sets custom colors for the node components.
+
+        When ``header_bg`` is supplied as an absolute ``QColor`` value the
+        palette-index override is cleared, because the two systems would
+        otherwise disagree on the "true" header colour after a theme switch.
+        Use ``set_header_color_by_index()`` (defined in Node) when you want
+        the colour to follow the active theme's palette instead.
+        """
         if header_bg is not None:
             self._custom_header_bg = header_bg
+            # Absolute colour was provided — discard any palette-index override
+            # so _reapply_header_color_from_index() does not overwrite it later.
+            if hasattr(self, '_header_color_index'):
+                self._header_color_index = None
 
         if body_bg is not None:
             self._custom_body_bg = body_bg

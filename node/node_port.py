@@ -168,6 +168,42 @@ class NodePort(QGraphicsItem):
         """
         return self._style_manager.get_all(StyleCategory.PORT)
 
+    # ==========================================================================
+    # STYLE CHANGE CALLBACK
+    # ==========================================================================
+
+    def on_style_changed(self, category: StyleCategory, changes: dict) -> None:
+        """
+        Called by the StyleManager when PORT style values change (e.g. theme switch).
+
+        Refreshes every cached property that was snapshot at __init__ time:
+        config dict, radius, geometry paths, brushes, and label styling.
+        """
+        if category != StyleCategory.PORT:
+            return
+
+        # 1. Refresh the cached config snapshot
+        self.cfg = self._get_port_config()
+
+        # 2. Update radius (used everywhere: paths, layout, paint)
+        self.radius = self.cfg.get('radius', 8)
+
+        # 3. Rebuild geometry paths (half-circle, inner circle, bounding rect)
+        self._rebuild_paths()
+
+        # 4. Rebuild brushes — the highlight offset may have changed
+        hl_color = self._highlight_colors(self.color, self.cfg['highlight'], 20)
+        self._brush_highlight = QBrush(hl_color)
+
+        # 5. Refresh label style and reposition it (font, color, spacing may differ)
+        if self._label:
+            self._label.refresh_style()
+            self._label._calculate_layout()
+            self._position_label()
+
+        # 6. Repaint
+        self.update()
+
     def _highlight_colors(self, color: QColor, b_offset: int, s_offset: int = 0) -> QColor:
         #print ('Node Port _highlight_colors', color, b_offset, s_offset)
         return highlight_colors(color, b_offset, s_offset)

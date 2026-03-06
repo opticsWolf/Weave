@@ -28,6 +28,7 @@ Style Integration:
 """
 
 from typing import Optional, List, Tuple, Any
+import math
 from PySide6.QtCore import Qt, QRectF, QVariantAnimation
 from PySide6.QtGui import QPainterPath
 
@@ -67,7 +68,76 @@ class NodeGeometryMixin:
     # ------------------------------------------------------------------
 
     def boundingRect(self) -> QRectF:
-        return self._cached_rect
+        """
+        Returns the outer drawing bounds of the item.
+        Dynamically calculates exact bounds based on path offsets, 
+        specific pen widths for each state, and drop shadow gaussian tails.
+        """
+        w = getattr(self, '_width', 100)
+        h = getattr(self, '_total_height', 100)
+        base_rect = QRectF(0, 0, w, h)
+        
+        cfg = getattr(self, '_config', {})
+        
+        # 1. Base Border Extent
+        base_extent = cfg.get('border_width', 0) / 2.0
+        
+        # 2. Selection Glow Extent (Path offset + Glow Pen thickness)
+        sel_offset = cfg.get('sel_border_offset', 0) + cfg.get('sel_glow_offset', 0)
+        sel_pen = cfg.get('sel_glow_width', 0)
+        sel_extent = sel_offset + (sel_pen / 2.0)
+        
+        # 3. Hover Glow Extent
+        hover_offset = cfg.get('hover_glow_offset', 0)
+        hover_pen = cfg.get('hover_glow_width', 0)
+        hover_extent = hover_offset + (hover_pen / 2.0)
+        
+        # 4. Computing Pulse Extent
+        comp_offset = sel_offset + cfg.get('computing_glow_extra_offset', 0)
+        comp_pen = cfg.get('computing_glow_width_max', 0)
+        comp_extent = comp_offset + (comp_pen / 2.0)
+        
+        # The absolute maximum outward reach of any drawn path + its specific pen width
+        max_stroke_extent = max(base_extent, sel_extent, hover_extent, comp_extent)
+        
+        # 5. Drop Shadow (Angle-aware)  
+        shadow_margin = 0.0
+        if cfg.get('shadow_enabled', False):  
+            dist = cfg.get('shadow_offset', 0.0)  
+            angle_deg = cfg.get('shadow_angle', 0.0)  
+            angle_rad = math.radians(angle_deg)  
+  
+            dx = abs(dist * math.cos(angle_rad))  
+            dy = abs(dist * math.sin(angle_rad))  
+  
+            blur_tail = cfg.get('shadow_blur_radius', 0.0) * 2.0  
+  
+            shadow_margin = max(dx, dy) + blur_tail
+
+        # 6. Absolute mathematical max required margin
+        total_margin = max(max_stroke_extent, shadow_margin)
+        
+        # math.ceil() ensures we snap to the next full pixel boundary.
+        # The + 1.0 is the standard mathematical safe-guard for sub-pixel anti-aliasing 
+        # (Qt draws floats; screen pixels are discrete integers).
+        exact_margin = math.ceil(total_margin) + 1.0
+        
+        return base_rect.adjusted(-exact_margin, -exact_margin, exact_margin, exact_margin)
+
+    def shape(self) -> QPainterPath:
+        """
+        Defines the precise interactive area for mouse collisions, selection, and hover events.
+        This ensures the expanded boundingRect (for shadows/glows) doesn't intercept mouse events.
+        """
+        # Since node_core.py uses self._cached_sel_path to draw the selection glow, 
+        # we know it perfectly outlines the physical node body and header.
+        if hasattr(self, '_cached_sel_path') and not self._cached_sel_path.isEmpty():
+            return self._cached_sel_path
+            
+        # Safe fallback if paths haven't been calculated yet during initial instantiation
+        path = QPainterPath()
+        path.addRect(QRectF(0, 0, getattr(self, '_width', 100), getattr(self, '_total_height', 100)))
+        return path
 
     # ------------------------------------------------------------------
     # Port Stack Height
@@ -299,9 +369,8 @@ class NodeGeometryMixin:
 
     def _recalculate_paths(self):
         """Pre-calculates geometric paths for painting."""
-        if self.scene():
-            self.prepareGeometryChange()
-
+        # DO NOT call prepareGeometryChange here - only call it when boundingRect actually changes
+        
         w, h = self._width, self._total_height
         r = self._config['radius']
         eff_r = min(r, h / 2)
@@ -348,9 +417,51 @@ class NodeGeometryMixin:
             computing_rect, computing_rad, computing_rad
         )
 
-        # 6. Bounding Rect
-        margin = max(glow_off + 4, computing_off + 4, 30)
-        self._cached_rect = base_rect.adjusted(-margin, -margin, margin, margin)
+        # ======================================================================
+        # 6. Bounding Rect Cache — MUST mirror boundingRect() logic exactly
+        #    so that paint() clip regions never exceed what Qt invalidates.
+        #
+        #    GHOSTING FIX: The previous code used full pen widths (sel_glow_width,
+        #    hover_glow_width, etc.) instead of half-widths, making _cached_rect
+        #    wider than boundingRect().  The shadow blur clip in paint() then
+        #    expanded _cached_rect even further, painting pixels outside Qt's
+        #    dirty invalidation region.  On node movement those orphaned pixels
+        #    were never cleared — producing the visible ghost trails.
+        #
+        #    Now _cached_rect uses the identical half-pen-width math as
+        #    boundingRect(), and paint()'s blur clip is clamped to
+        #    boundingRect() directly.
+        # ======================================================================
+
+        base_extent = self._config.get('border_width', 0) / 2.0
+
+        sel_offset_val = sel_border_offset + sel_glow_offset
+        sel_pen_val = self._config['sel_glow_width']
+        sel_extent = sel_offset_val + (sel_pen_val / 2.0)
+
+        hover_extent = hover_off + (self._config['hover_glow_width'] / 2.0)
+
+        comp_offset_val = sel_offset_val + computing_extra
+        comp_extent = comp_offset_val + (self._config['computing_glow_width_max'] / 2.0)
+
+        max_stroke_extent = max(base_extent, sel_extent, hover_extent, comp_extent)
+
+        shadow_margin = 0.0
+        if self._config.get('shadow_enabled', False):
+            dist = self._config.get('shadow_offset', 0.0)
+            angle_deg = self._config.get('shadow_angle', 0.0)
+            angle_rad = math.radians(angle_deg)
+            dx = abs(dist * math.cos(angle_rad))
+            dy = abs(dist * math.sin(angle_rad))
+            blur_tail = self._config.get('shadow_blur_radius', 0.0) * 2.0
+            shadow_margin = max(dx, dy) + blur_tail
+
+        total_margin = max(max_stroke_extent, shadow_margin)
+        exact_margin = math.ceil(total_margin) + 1.0
+
+        self._cached_rect = base_rect.adjusted(
+            -exact_margin, -exact_margin, exact_margin, exact_margin
+        )
 
     # ------------------------------------------------------------------
     # Minimize / Maximize Animation
