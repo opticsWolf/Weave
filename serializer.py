@@ -11,10 +11,9 @@ serializer.py - Comprehensive Graph Serializer v3
 Handles full application state serialization/deserialization for the Node Canvas.
 
 Captures:
-- Canvas settings (grid, background, snapping, shake-to-disconnect)
+- Canvas settings (grid type/spacing, snapping, shake-to-disconnect)
 - View state (center position, zoom/transform)
 - Minimap state (corner, pinned, minimized, dimensions)
-- Style/theme state (current theme + any overrides)
 - Node state via clean ownership boundary:
     Serializer adds: id, class (graph metadata)
     QtNode.get_state(): pos, size, colors, port defs, minimized, node_state
@@ -27,7 +26,6 @@ Format v3:
     "canvas": { ... },
     "view": { ... },
     "minimap": { ... },
-    "style": { ... },
     "nodes": [
         {
             "id": "...", "class": "FloatNode",           # serializer
@@ -204,16 +202,20 @@ class GraphSerializer:
         canvas,
         view=None,
         minimap=None,
-        include_style: bool = True,
     ) -> str:
         """
         Serialize the entire application state to a JSON string.
+
+        The active theme is a user-level preference managed by
+        StyleManager / QSettings and is intentionally NOT saved into graph
+        files.  Theme-driven visual properties (bg_color, grid_color,
+        grid_line_width) are excluded from the canvas section so that a
+        loaded graph always inherits the currently active theme's colours.
 
         Args:
             canvas:  The QtNodeCanvas (QGraphicsScene subclass).
             view:    Optional QGraphicsView (QtCanvasView) for viewport state.
             minimap: Optional QtNodeMinimap for minimap state.
-            include_style: Whether to embed full style/theme data.
 
         Returns:
             A JSON string representing the complete application state.
@@ -231,9 +233,6 @@ class GraphSerializer:
 
         if minimap is not None:
             data["minimap"] = self._serialize_minimap(minimap)
-
-        if include_style:
-            data["style"] = self._serialize_style(canvas)
 
         # Nodes & Connections
         node_id_map: Dict[Any, str] = {}  # object -> unique_id
@@ -276,19 +275,21 @@ class GraphSerializer:
     # -- Canvas Settings ----------------------------------------------------
 
     def _serialize_canvas(self, canvas) -> Dict[str, Any]:
-        """Capture grid, background, snapping, and layout settings."""
+        """Capture grid, snapping, and layout settings.
+
+        Theme-driven visual properties (bg_color, grid_color, grid_line_width)
+        are intentionally NOT saved.  These are managed by StyleManager and the
+        active theme, and must not be overridden when loading a graph file.
+        """
         scene_rect = canvas.sceneRect()
         result: Dict[str, Any] = {
             "scene_rect": [scene_rect.x(), scene_rect.y(),
                            scene_rect.width(), scene_rect.height()],
         }
 
-        # Cached canvas properties (available as attributes or properties)
+        # Behavioral / workspace settings only — no theme colors
         _safe = _safe_attr
-        result["bg_color"] = _color_to_list(_safe(canvas, "bg_color", "_cached_bg_color"))
-        result["grid_color"] = _color_to_list(_safe(canvas, "grid_color", "_cached_grid_color"))
         result["grid_spacing"] = _safe(canvas, "grid_spacing", "_cached_grid_spacing", default=20)
-        result["grid_line_width"] = _safe(canvas, "grid_line_width", "_cached_grid_line_width", default=2.0)
         result["snapping_enabled"] = _safe(canvas, "snapping_enabled", "_cached_snapping_enabled", default=True)
         result["connection_snap_radius"] = _safe(canvas, "connection_snap_radius", "_cached_connection_snap_radius", default=25.0)
         result["shake_to_disconnect"] = _safe(canvas, "shake_to_disconnect", "_cached_shake_to_disconnect", default=False)
@@ -338,25 +339,13 @@ class GraphSerializer:
         return result
 
     # -- Style/Theme State --------------------------------------------------
-
-    def _serialize_style(self, canvas) -> Dict[str, Any]:
-        """Capture the current theme name and full style export."""
-        result: Dict[str, Any] = {}
-
-        sm = getattr(canvas, "_style_manager", None)
-        if sm is None:
-            return result
-
-        result["theme"] = getattr(sm, "_current_theme", "dark")
-
-        # Use StyleManager's own export for a complete, portable snapshot
-        if hasattr(sm, "export_current"):
-            try:
-                result["full_state"] = sm.export_current()
-            except Exception as e:
-                log.error(f"Style export failed: {e}")
-
-        return result
+    # NOTE: Theme state is intentionally NOT serialized.  The active theme
+    # is a user-level preference persisted via StyleManager / QSettings.
+    # Theme-driven visual properties (bg_color, grid_color, grid_line_width)
+    # are excluded from the canvas section for the same reason — they must
+    # reflect the currently active theme, not a previously saved one.
+    # Per-node header colour overrides are stored on each node as a palette
+    # index and are always saved/restored as part of the node's own state.
 
     # -- Single Node --------------------------------------------------------
 
@@ -433,15 +422,11 @@ class GraphSerializer:
         """Serialize all NodeTrace connections in the scene."""
         connections: List[Dict[str, Any]] = []
 
-        # Fix: Use the correct import path for the weave package
         try:
             from weave.node.node_trace import NodeTrace
         except ImportError:
-            try:
-                from qt_nodetrace import NodeTrace # Fallback for legacy
-            except ImportError:
-                log.warning("Could not import NodeTrace. Connections will not be saved.")
-                return connections
+            log.warning("Could not import NodeTrace. Connections will not be saved.")
+            return connections
 
         for item in canvas.items():
             if not isinstance(item, NodeTrace):
@@ -471,10 +456,8 @@ class GraphSerializer:
                 connections.append({
                     "source_id": node_id_map[src_node],
                     "source_port": src_idx,
-                    "source_port_name": getattr(src, "name", None),
                     "target_id": node_id_map[dst_node],
                     "target_port": dst_idx,
-                    "target_port_name": getattr(dst, "name", None),
                 })
             except (ValueError, AttributeError) as e:
                 log.debug(f"Skipping connection on non-indexed port: {e}")
@@ -491,7 +474,6 @@ class GraphSerializer:
         json_str: str,
         view=None,
         minimap=None,
-        restore_style: bool = True,
         clear_first: bool = True,
     ) -> bool:
         """
@@ -499,20 +481,25 @@ class GraphSerializer:
 
         Restore order:
             1. Clear canvas
-            2. Style/theme (so nodes get correct colors)
-            3. Canvas settings (grid, bg, snapping)
-            4. ALL nodes (instantiate, restore_state, add_node)
-            5. View (zoom, center)
-            6. Minimap (corner, pin, minimize)
-            7. Connections (LAST — all nodes and ports guaranteed to exist)
-            8. Mark nodes dirty (trigger evaluation with connections in place)
+            2. Canvas settings (grid, bg, snapping)
+            3. ALL nodes (instantiate, restore_state, add_node)
+            4. View (zoom, center)
+            5. Minimap (corner, pin, minimize)
+            6. Connections (LAST — all nodes and ports guaranteed to exist)
+            7. Mark nodes dirty (trigger evaluation with connections in place)
+
+        NOTE: Theme/style state is NOT restored from graph files.  The active
+        theme is a user-level preference managed by StyleManager / QSettings.
+        Theme-driven visual properties (bg_color, grid_color, grid_line_width)
+        are not present in the canvas section and will not override the current
+        theme.  Per-node header colour overrides (palette indices) are restored
+        as part of each node's own state.
 
         Args:
             canvas:        The QtNodeCanvas to restore into.
             json_str:      The JSON string produced by serialize().
             view:          Optional QGraphicsView to restore viewport state.
             minimap:       Optional QtNodeMinimap to restore minimap state.
-            restore_style: Whether to restore the saved theme/styles.
             clear_first:   Whether to clear the scene before restoring.
 
         Returns:
@@ -529,9 +516,6 @@ class GraphSerializer:
             _debug_print(f"ABORT: Invalid JSON: {e}")
             return False
 
-        version = data.get("meta", {}).get("version", "1.0")
-        _debug_print(f"Format version: {version}")
-
         # ---------------------------------------------------------------
         # 1. Clear
         # ---------------------------------------------------------------
@@ -544,22 +528,10 @@ class GraphSerializer:
                 _debug_print(f"  FAILED: {e}")
 
         # ---------------------------------------------------------------
-        # 2. Style (restore BEFORE nodes so colors/settings are correct)
-        # ---------------------------------------------------------------
-        if restore_style and "style" in data:
-            _debug_print("Phase 2: Restoring style/theme")
-            try:
-                self._restore_style(canvas, data["style"])
-                _debug_print(f"  Theme: {data['style'].get('theme', '?')}")
-            except Exception as e:
-                log.error(f"Exception in _restore_style: {type(e).__name__}: {e}")
-                _debug_print(f"  FAILED: {e}")
-
-        # ---------------------------------------------------------------
-        # 3. Canvas settings
+        # 2. Canvas settings
         # ---------------------------------------------------------------
         if "canvas" in data:
-            _debug_print("Phase 3: Restoring canvas settings")
+            _debug_print("Phase 2: Restoring canvas settings")
             try:
                 self._restore_canvas(canvas, data["canvas"])
             except Exception as e:
@@ -567,11 +539,11 @@ class GraphSerializer:
                 _debug_print(f"  FAILED: {e}")
 
         # ---------------------------------------------------------------
-        # 4. ALL nodes — create every node before any connections
+        # 3. ALL nodes — create every node before any connections
         # ---------------------------------------------------------------
         uuid_map: Dict[str, Any] = {}  # id string -> node instance
         node_list = data.get("nodes", [])
-        _debug_print(f"Phase 4: Restoring {len(node_list)} nodes")
+        _debug_print(f"Phase 3: Restoring {len(node_list)} nodes")
 
         for i, n_data in enumerate(node_list):
             cls_name = n_data.get("class", "???")
@@ -604,10 +576,10 @@ class GraphSerializer:
         _debug_print(f"  Node restore complete: {len(uuid_map)}/{len(node_list)} nodes in uuid_map")
 
         # ---------------------------------------------------------------
-        # 5. View
+        # 4. View
         # ---------------------------------------------------------------
         if view is not None and "view" in data:
-            _debug_print("Phase 5: Restoring view state")
+            _debug_print("Phase 4: Restoring view state")
             try:
                 self._restore_view(view, data["view"])
             except Exception as e:
@@ -615,10 +587,10 @@ class GraphSerializer:
                 _debug_print(f"  FAILED: {e}")
 
         # ---------------------------------------------------------------
-        # 6. Minimap
+        # 5. Minimap
         # ---------------------------------------------------------------
         if minimap is not None and "minimap" in data:
-            _debug_print("Phase 6: Restoring minimap state")
+            _debug_print("Phase 5: Restoring minimap state")
             try:
                 self._restore_minimap(minimap, data["minimap"])
             except Exception as e:
@@ -626,11 +598,11 @@ class GraphSerializer:
                 _debug_print(f"  FAILED: {e}")
 
         # ---------------------------------------------------------------
-        # 7. Connections — LAST, after all nodes and ports are guaranteed
+        # 6. Connections — LAST, after all nodes and ports are guaranteed
         #    to exist and be added to the scene
         # ---------------------------------------------------------------
         conn_list = data.get("connections", [])
-        _debug_print(f"Phase 7: Restoring {len(conn_list)} connections")
+        _debug_print(f"Phase 6: Restoring {len(conn_list)} connections")
         conn_success = 0
         conn_failed = 0
 
@@ -649,10 +621,10 @@ class GraphSerializer:
         _debug_print(f"  Connection restore complete: {conn_success} OK, {conn_failed} failed")
 
         # ---------------------------------------------------------------
-        # 8. Post-restore: mark all nodes dirty so they evaluate with
+        # 7. Post-restore: mark all nodes dirty so they evaluate with
         #    connections in place
         # ---------------------------------------------------------------
-        _debug_print(f"Phase 8: Marking {len(uuid_map)} nodes dirty")
+        _debug_print(f"Phase 7: Marking {len(uuid_map)} nodes dirty")
         for node in uuid_map.values():
             try:
                 if hasattr(node, "set_dirty"):
@@ -680,26 +652,20 @@ class GraphSerializer:
     # -- Restore Canvas Settings --------------------------------------------
 
     def _restore_canvas(self, canvas, canvas_data: Dict[str, Any]) -> None:
-        """Apply grid, background, and snapping settings."""
+        """Apply grid, snapping, and behavioral settings.
+
+        Theme-driven visual properties (bg_color, grid_color, grid_line_width)
+        are intentionally skipped — they belong to the active theme managed by
+        StyleManager and should never be overridden by a graph file.
+        """
         config_updates: Dict[str, Any] = {}
 
-        # Color fields need conversion from list → QColor
-        _COLOR_KEYS = {"bg_color", "grid_color"}
-        # Everything else passes through as-is
+        # Behavioral / workspace keys only — no theme colors
         _PASSTHROUGH_KEYS = {
-            "grid_spacing", "grid_type", "grid_line_width",
+            "grid_spacing", "grid_type",
             "snapping_enabled", "connection_snap_radius",
             "shake_to_disconnect", "max_visible_grid_lines",
         }
-
-        for key in _COLOR_KEYS:
-            if key in canvas_data:
-                val = canvas_data[key]
-                # Handle both list (normal) and QColor (from object_hook)
-                if isinstance(val, QColor):
-                    config_updates[key] = val
-                else:
-                    config_updates[key] = _list_to_color(val)
 
         for key in _PASSTHROUGH_KEYS:
             if key in canvas_data:
@@ -773,26 +739,10 @@ class GraphSerializer:
             minimap.update_position()
 
     # -- Restore Style/Theme ------------------------------------------------
-
-    def _restore_style(self, canvas, style_data: Dict[str, Any]) -> None:
-        """Restore the theme and/or full style state."""
-        sm = getattr(canvas, "_style_manager", None)
-        if sm is None:
-            return
-
-        # Full state takes priority
-        if "full_state" in style_data and hasattr(sm, "import_theme"):
-            try:
-                sm.import_theme("_restored", style_data["full_state"], apply=True)
-                return
-            except Exception as e:
-                log.error(f"Full style restore failed, falling back to theme: {e}")
-
-        # Fallback: apply named theme
-        if "theme" in style_data:
-            theme_name = style_data["theme"]
-            if hasattr(sm, "apply_theme"):
-                sm.apply_theme(theme_name)
+    # NOTE: Theme state is intentionally NOT restored from graph files.
+    # The active theme is managed by StyleManager / QSettings.  Canvas
+    # colour properties (bg_color, grid_color, grid_line_width) are not
+    # saved so they cannot override the user's current theme.
 
     # -- Restore Single Node ------------------------------------------------
 
@@ -875,36 +825,14 @@ class GraphSerializer:
         """
         source_id = c_data.get("source_id")
         target_id = c_data.get("target_id")
-        src_port_name = c_data.get("source_port_name", "?")
-        dst_port_name = c_data.get("target_port_name", "?")
 
         _debug_print(
-            f"  Connection: {src_port_name}→{dst_port_name} "
-            f"(src_id={str(source_id)[:12]}, dst_id={str(target_id)[:12]})"
+            f"  Connection: src_id={str(source_id)[:12]}, dst_id={str(target_id)[:12]}"
         )
 
         # --- Resolve nodes ---
         src_node = uuid_map.get(source_id)
         dst_node = uuid_map.get(target_id)
-
-        # --- Fallback: if ID lookup fails, try to find nodes by class + port name ---
-        # This recovers connections from save files with the double-UUID bug
-        # (where node IDs and connection IDs were generated independently).
-        if src_node is None or dst_node is None:
-            _debug_print(
-                f"    ID lookup missed "
-                f"(src={'OK' if src_node else 'MISSING'}, dst={'OK' if dst_node else 'MISSING'}). "
-                f"Trying fallback by port name..."
-            )
-            src_node_fb, dst_node_fb = self._find_nodes_by_port_name(
-                uuid_map, src_port_name, dst_port_name, is_output_src=True
-            )
-            if src_node is None and src_node_fb is not None:
-                src_node = src_node_fb
-                _debug_print(f"    Fallback: src_node → {src_node.__class__.__name__}")
-            if dst_node is None and dst_node_fb is not None:
-                dst_node = dst_node_fb
-                _debug_print(f"    Fallback: dst_node → {dst_node.__class__.__name__}")
 
         if src_node is None:
             _debug_print(f"    FAILED: source node not found (id={source_id})")
@@ -960,21 +888,6 @@ class GraphSerializer:
                     f"list_len={len(dst_inputs_list)}"
                 )
 
-            # --- Fallback: name-based lookup ---
-            if src_port is None and src_port_name and src_port_name != "?":
-                src_port = self._find_port_by_name(src_outputs_list, src_port_name)
-                if src_port:
-                    _debug_print(f"    src_port by name '{src_port_name}': FOUND")
-                else:
-                    _debug_print(f"    src_port by name '{src_port_name}': NOT FOUND")
-
-            if dst_port is None and dst_port_name and dst_port_name != "?":
-                dst_port = self._find_port_by_name(dst_inputs_list, dst_port_name)
-                if dst_port:
-                    _debug_print(f"    dst_port by name '{dst_port_name}': FOUND")
-                else:
-                    _debug_print(f"    dst_port by name '{dst_port_name}': NOT FOUND")
-
             # --- Create connection ---
             if src_port and dst_port:
                 trace = ConnectionFactory.create(
@@ -1000,55 +913,6 @@ class GraphSerializer:
             _debug_print(f"    EXCEPTION: {type(e).__name__}: {e}")
             return False
             
-    @staticmethod
-    def _find_port_by_name(ports, name: str):
-        """Find a port in a list by its name attribute."""
-        if not name:
-            return None
-        for port in ports:
-            if getattr(port, "name", None) == name:
-                return port
-        return None
-
-    @staticmethod
-    def _find_nodes_by_port_name(
-        uuid_map: Dict[str, Any],
-        src_port_name: str,
-        dst_port_name: str,
-        is_output_src: bool = True,
-    ):
-        """
-        Fallback: find source and target nodes by scanning all nodes for
-        matching port names. Used to recover connections from save files
-        where node IDs in connections don't match node IDs in the nodes array.
-        
-        Returns (src_node_or_None, dst_node_or_None).
-        """
-        src_node = None
-        dst_node = None
-
-        for node in uuid_map.values():
-            if src_node is None and src_port_name:
-                outputs = getattr(node, "outputs", [])
-                outputs_list = list(outputs.values()) if isinstance(outputs, dict) else list(outputs)
-                for port in outputs_list:
-                    if getattr(port, "name", None) == src_port_name:
-                        src_node = node
-                        break
-
-            if dst_node is None and dst_port_name:
-                inputs = getattr(node, "inputs", [])
-                inputs_list = list(inputs.values()) if isinstance(inputs, dict) else list(inputs)
-                for port in inputs_list:
-                    if getattr(port, "name", None) == dst_port_name:
-                        dst_node = node
-                        break
-
-            if src_node and dst_node:
-                break
-
-        return src_node, dst_node
-
     # =======================================================================
     # CONVENIENCE: File I/O
     # =======================================================================
@@ -1059,12 +923,11 @@ class GraphSerializer:
         canvas,
         view=None,
         minimap=None,
-        include_style: bool = True,
     ) -> bool:
         """Serialize and write to a file."""
         try:
             json_str = self.serialize(
-                canvas, view=view, minimap=minimap, include_style=include_style
+                canvas, view=view, minimap=minimap
             )
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(json_str)
@@ -1080,7 +943,6 @@ class GraphSerializer:
         canvas,
         view=None,
         minimap=None,
-        restore_style: bool = True,
     ) -> bool:
         """Read from a file and deserialize."""
         try:
@@ -1088,7 +950,7 @@ class GraphSerializer:
                 json_str = f.read()
             result = self.deserialize(
                 canvas, json_str,
-                view=view, minimap=minimap, restore_style=restore_style
+                view=view, minimap=minimap
             )
             return result
         except FileNotFoundError:
