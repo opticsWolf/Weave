@@ -310,7 +310,6 @@ class CanvasCommandsMixin:
             self._canvas,
             view=self._get_view(),
             minimap=self._get_minimap(),
-            include_style=True,
         )
 
         if success:
@@ -331,7 +330,6 @@ class CanvasCommandsMixin:
             self._canvas,
             view=self._get_view(),
             minimap=self._get_minimap(),
-            restore_style=True,
         )
 
         if success:

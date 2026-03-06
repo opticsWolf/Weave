@@ -20,9 +20,14 @@ from PySide6.QtGui import QAction, QKeySequence, QColor, QPixmap, QIcon
 
 from weave.stylemanager import StyleManager, StyleCategory
 from weave.canvas.commands_mixin import CanvasCommandsMixin, HAS_NODE_COMPONENTS, HAS_SERIALIZER
+from weave.node.node_trace import NodeTrace, DragTrace
 
 from weave.logger import get_logger
 log = get_logger("ContextMenu")
+
+# ============================================================================
+# THEME DISCOVERY
+# ============================================================================
 
 # Node registry import
 try:
@@ -423,9 +428,13 @@ class ContextMenuProvider(CanvasCommandsMixin):
                 pix.fill(color)
                 action.setIcon(QIcon(pix))
                 
-                # Use partial to pass the target nodes and specific color
+                # Use partial to pass the target nodes and palette INDEX.
+                # This ensures _header_color_index is stored on each node,
+                # which enables correct theme switching (colors map to the
+                # equivalent palette slot in the new theme) and correct
+                # serialization (the index is saved/restored, not a raw colour).
                 action.triggered.connect(
-                    partial(self._on_change_header_color, targets, color)
+                    partial(self._on_change_header_color_by_index, targets, i)
                 )
                 color_menu.addAction(action)
             
@@ -441,6 +450,11 @@ class ContextMenuProvider(CanvasCommandsMixin):
         front_action = QAction("Bring to Front", menu)
         front_action.triggered.connect(lambda: self.cmd_bring_to_front(target_item))
         menu.addAction(front_action)
+
+        menu.addSeparator()
+
+        # --- Themes submenu ---
+        self._build_themes_submenu(menu)
     
     def _build_registry_actions(self, menu: QMenu, scene_pos: QPointF) -> None:
         """
@@ -509,6 +523,11 @@ class ContextMenuProvider(CanvasCommandsMixin):
             menu.addAction(no_reg)
             return
         
+        # --- Themes submenu ---
+        self._build_themes_submenu(menu)
+
+        menu.addSeparator()
+
         # --- Browse Nodes submenu (always present) ---
         tree = NODE_REGISTRY.get_tree()
         if tree and isinstance(tree, dict):
@@ -585,7 +604,108 @@ class ContextMenuProvider(CanvasCommandsMixin):
         if HAS_REGISTRY and NODE_REGISTRY is not None:
             return NODE_REGISTRY.get_node_display_name(node_cls)
         return getattr(node_cls, 'node_name', None) or getattr(node_cls, '__name__', 'Unknown Node')
+
+    # ==========================================================================
+    # THEME SUBMENU
+    # ==========================================================================
+
+    def _build_themes_submenu(self, parent_menu: QMenu) -> None:
+        """
+        Append a "Themes" submenu to *parent_menu*.
+
+        Theme discovery and initial restore are handled by StyleManager at
+        first instantiation, so the list is always fully populated here.
+        The currently active theme is shown with a checkmark (✓).
+        """
+        manager = StyleManager.instance()
+        current = manager.current_theme
+        available = manager.available_themes
+
+        theme_menu = parent_menu.addMenu("Themes")
+
+        if not available:
+            no_themes = QAction("No themes available", theme_menu)
+            no_themes.setEnabled(False)
+            theme_menu.addAction(no_themes)
+            return
+
+        for name in available:
+            # Pretty-print: "midnight" → "Midnight"
+            label = name.replace("_", " ").title()
+            action = QAction(label, theme_menu)
+            action.setCheckable(True)
+            action.setChecked(name == current)
+            action.triggered.connect(partial(self._on_apply_theme, name))
+            theme_menu.addAction(action)
+
+        theme_menu.addSeparator()
+
+        load_action = QAction("Load Theme from File…", theme_menu)
+        load_action.triggered.connect(self._on_load_theme_file)
+        theme_menu.addAction(load_action)
+
+    def _on_apply_theme(self, theme_name: str) -> None:
+        """
+        Apply *theme_name* via the StyleManager.
+
+        StyleManager.apply_theme() handles:
+          1. Resetting schemas to defaults and applying overrides.
+          2. Notifying all registered subscribers (canvas, minimap, etc.).
+          3. Emitting theme_changed, which the Canvas uses to force-refresh
+             every managed node, port and trace via NodeManager.
+
+        All we need here is a viewport repaint so new visuals are flushed.
+        """
+        manager = StyleManager.instance()
+        if not manager.apply_theme(theme_name):
+            log.warning(f"apply_theme('{theme_name}') returned False – theme may be unknown.")
+            return
+
+        # Flush the viewport so new colours appear on screen immediately.
+        try:
+            for view in self._canvas.views():
+                view.viewport().update()
+        except Exception:
+            pass
+
+    def _on_load_theme_file(self) -> None:
+        """Open a file dialog to load a JSON theme, register, and apply it."""
+        view = self._canvas.views()[0] if self._canvas.views() else None
+        filepath, _ = QFileDialog.getOpenFileName(
+            view,
+            "Load Theme File",
+            "",
+            "Theme Files (*.json);;All Files (*)",
+        )
+        if not filepath:
+            return
+        manager = StyleManager.instance()
+        if manager.load_from_file(filepath, apply=True):
+            log.debug(f"Theme loaded and applied from '{filepath}'")
+        else:
+            log.warning(f"Failed to load theme from '{filepath}'")
     
+    # ==========================================================================
+    # HEADER COLOR HANDLER
+    # ==========================================================================
+
+    def _on_change_header_color_by_index(self, targets, palette_index: int) -> None:
+        """
+        Set the header colour of *targets* via a palette index.
+
+        Using the index-based API (``set_header_color_by_index``) rather than
+        an absolute QColor ensures that:
+        1. The index is persisted in the node's serialized state, so the
+           colour survives save/load correctly.
+        2. When the active theme changes, ``_reapply_header_color_from_index``
+           maps the index to the equivalent colour in the new palette.
+        3. Duplicating a node copies the index, so the clone gets the
+           correct palette colour — not the raw QColor from the old theme.
+        """
+        for node in targets:
+            if hasattr(node, 'set_header_color_by_index'):
+                node.set_header_color_by_index(palette_index)
+
     # ==========================================================================
     # ACTION HANDLERS
     # All command logic lives in CanvasCommandsMixin.  The _on_* aliases
