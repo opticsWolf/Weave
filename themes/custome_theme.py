@@ -22,7 +22,13 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
             "shake_time_window_ms": 100,
         },
         StyleCategory.NODE: {
-            "header_bg": [70, 130, 200, 255],
+            "header_bg": [54, 81, 217, 255],
+            "header_color_palette": [
+                [54, 81, 217, 255], [54, 163, 217, 255], [54, 217, 190, 255], 
+                [54, 217, 108, 255], [81, 217, 54, 255], [163, 217, 54, 255], 
+                [217, 190, 54, 255], [217, 108, 54, 255], [217, 54, 81, 255], 
+                [217, 54, 163, 255], [190, 54, 217, 255], [108, 54, 217, 255]
+                ],
             "body_bg": [250, 252, 255, 255],
             "outline_color": [180, 185, 190, 255],
             "title_text_color": [255, 255, 255, 255],
@@ -33,6 +39,7 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
         StyleCategory.PORT: {
             "inner_color": [240, 242, 245, 255],
             "label_color": [60, 65, 70, 255],
+            "label_connected_color_shift": -40
         },
         StyleCategory.TRACE: {
             "outline_color": [0, 0, 0, 32],
@@ -55,7 +62,13 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
             "grid_color": [35, 40, 50, 255],
         },
         StyleCategory.NODE: {
-            "header_bg": [45, 85, 160, 255],
+            "header_bg": [54, 81, 217, 255],
+            "header_color_palette": [
+                [54, 81, 217, 255], [54, 163, 217, 255], [54, 217, 190, 255], 
+                [54, 217, 108, 255], [81, 217, 54, 255], [163, 217, 54, 255], 
+                [217, 190, 54, 255], [217, 108, 54, 255], [217, 54, 81, 255], 
+                [217, 54, 163, 255], [190, 54, 217, 255], [108, 54, 217, 255]
+                ],
             "body_bg": [22, 25, 32, 255],
             "outline_color": [10, 12, 18, 255],
         },
@@ -74,11 +87,28 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
         },
         StyleCategory.NODE: {
             "header_bg": [160, 90, 50, 255],
+            "header_color_palette": [
+                [160, 90, 50, 255], [161, 127, 50, 255], [157, 161, 50, 255], 
+                [120, 161, 50, 255], [50, 161, 53, 255], [50, 161, 127, 255], 
+                [50, 120, 161, 255], [54, 50, 161, 255], [127, 50, 161, 255], 
+                [161, 50, 120, 255], [161, 50, 83, 255], [161, 54, 50, 255]
+                ],
             "body_bg": [55, 48, 44, 255],
             "title_text_color": [255, 245, 230, 255],
             "sel_border_color": [200, 140, 80, 255],
             "hover_glow_color": [180, 130, 100, 255],
             "font_weight": "bold",
+        },
+        StyleCategory.MINIMAP: {
+            "bg_color": [55, 48, 45, 128],
+            "border_color": [80, 70, 65, 180],
+            "lens_fill_color": [250, 220, 210, 32],
+            "lens_border_color": [245, 220, 200, 64],
+            "node_color": [85, 80, 75, 255],
+            "icon_hover_color": [255, 248, 245, 30],
+            "active_icon_color": [173, 166, 163, 255],
+            "text_color": [173, 166, 163, 255],
+            "snap_color": [134, 126, 123, 128],
         },
     },
 }
