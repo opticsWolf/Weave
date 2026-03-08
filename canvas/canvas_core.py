@@ -35,8 +35,8 @@ from enum import IntEnum
 
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal
 from PySide6.QtWidgets import (
-    QGraphicsScene, QGraphicsItem, QGraphicsSceneContextMenuEvent, 
-    QGraphicsSceneMouseEvent
+    QGraphicsScene, QGraphicsItem, QGraphicsProxyWidget,
+    QGraphicsSceneContextMenuEvent, QGraphicsSceneMouseEvent
 )
 from PySide6.QtGui import QPainter, QTransform, QColor, QPen, QKeyEvent
 
@@ -157,6 +157,11 @@ class Canvas(QGraphicsScene):
         # NOW that all subsystems are initialized, register for style updates
         self._style_manager.register(self, StyleCategory.CANVAS)
         
+        # Listen for full theme switches so we can force-refresh every node,
+        # port and trace via the NodeManager (safety net for items that are
+        # not individually registered as StyleManager subscribers).
+        self._style_manager.theme_changed.connect(self._on_theme_changed)
+        
         # Apply provided config (will trigger on_style_changed safely)
         if config:
             self._style_manager.update(StyleCategory.CANVAS, **config)
@@ -245,6 +250,21 @@ class Canvas(QGraphicsScene):
         """Helper to switch themes globally from the canvas."""
         self._style_manager.apply_theme(theme_name)
 
+    def _on_theme_changed(self, theme_name: str) -> None:
+        """
+        Slot connected to StyleManager.theme_changed.
+
+        Forces every managed node, port and trace to re-read the active
+        style — regardless of whether they registered as subscribers.
+        The StyleManager's own subscriber notifications handle items that
+        *are* registered; this is the safety net for everything else.
+        """
+        self._node_manager.refresh_all_styles(self._style_manager)
+
+        # Schedule a full scene repaint so the new visuals are
+        # composited immediately.
+        self.update()
+
     def set_state(self, state: CanvasInteractionState) -> None:
         """Transition to a new interaction state."""
         if hasattr(self._current_state, 'on_exit'):
@@ -304,22 +324,12 @@ class Canvas(QGraphicsScene):
         """
         Update configuration through StyleManager.
         
-        This triggers on_style_changed which updates the cache automatically.
+        Calling update() triggers on_style_changed via the subscriber
+        mechanism, which refreshes the cache, updates the background,
+        grid pen, orchestrator bounds, and schedules a repaint.
+        No manual post-processing is needed here.
         """
-        changed_keys = self._style_manager.update(StyleCategory.CANVAS, **kwargs)
-        
-        # Note: on_style_changed will handle most updates automatically
-        # We keep these immediate updates for backwards compatibility
-        if 'bg_color' in changed_keys:
-            self.setBackgroundBrush(self._cached_bg_color)
-
-        if any(k in changed_keys for k in ('margin', 'min_width', 'min_height')):
-            self._orchestrator.recalculate_bounds()
-            
-        if 'connection_snap_radius' in changed_keys:
-            self._orchestrator.snap_radius = self._cached_connection_snap_radius
-
-        self.update()
+        self._style_manager.update(StyleCategory.CANVAS, **kwargs)
 
     # ==========================================================================
     # NODE MANAGEMENT
@@ -399,12 +409,24 @@ class Canvas(QGraphicsScene):
     # ==========================================================================
 
     def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        """Delegate to state machine."""
+        """
+        Delegate to state machine.
+
+        After Qt's default ``mousePressEvent`` runs, re-assert proxy focus
+        if the user clicked into an embedded widget.  The default handler
+        may shift scene focus to the **parent node** (it is the topmost
+        selectable item), which steals focus from the proxy and makes the
+        embedded widget's cursor disappear.
+        """
         if self._current_state.on_mouse_press(event):
             event.accept()
             return
-        
+
         super().mousePressEvent(event)
+
+        # Re-assert proxy focus after super()'s default handling.
+        if self._is_widget_editing():
+            self._ensure_proxy_focus()
 
     def mouseDoubleClickEvent(self, event: QGraphicsSceneMouseEvent) -> None:
         """Handle double-click - delegate to state machine for all logic."""
@@ -414,12 +436,23 @@ class Canvas(QGraphicsScene):
         
         super().mouseDoubleClickEvent(event)
 
+        if self._is_widget_editing():
+            self._ensure_proxy_focus()
+
     def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        """Delegate to state machine."""
+        """
+        Delegate to state machine.
+
+        After release, force a proxy repaint so that a completed text
+        selection highlight is shown immediately.
+        """
         if self._current_state.on_mouse_release(event):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+        if self._is_widget_editing():
+            self._update_editing_proxy()
 
     def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent) -> None:
         """
@@ -427,14 +460,33 @@ class Canvas(QGraphicsScene):
         
         Grid snapping must be applied AFTER Qt's default move behavior
         so that items have been repositioned first.
+        
+        Widget-editing:
+            When the user is interacting with an embedded widget (e.g.
+            click-dragging to select text), the move is routed through
+            the proxy via ``super()`` and the proxy is repainted so that
+            the text selection highlight updates in real time.
+
+        Popup fix:
+            When a widget interaction has suppressed node dragging
+            (_suppressed_movable_node is set), grid snapping is skipped
+            entirely.  Repositioning a node while a combo-box popup is
+            open would detach the popup from the widget visually.
         """
         # Let state handle the move first (ConnectionDragState consumes this)
         if self._current_state.on_mouse_move(event):
             event.accept()
             return
         
-        # Default behavior - Qt handles item dragging
+        # Default behavior - Qt handles item dragging / proxy delivery
         super().mouseMoveEvent(event)
+        
+        # Skip snapping while a widget has suppressed node movement
+        if getattr(self._current_state, '_suppressed_movable_node', None) is not None:
+            # Force proxy repaint so text-selection highlight updates
+            # in real time during click-drag inside a text field.
+            self._update_editing_proxy()
+            return
         
         # Apply grid snapping AFTER default behavior moved the items
         if hasattr(self._current_state, 'apply_grid_snapping'):
@@ -447,30 +499,173 @@ class Canvas(QGraphicsScene):
     def keyPressEvent(self, event: QKeyEvent) -> None:
         """
         Handle keyboard shortcuts for canvas operations.
-        
-        Delegates to the active state's keyPressEvent method first,
-        then handles fallback behaviors if no state consumes the event.
-        
-        Shortcuts (handled by IdleState):
+
+        Widget-editing guard
+        --------------------
+        When the user is interacting with an embedded widget inside a
+        node (``QLineEdit``, ``QTextEdit``, editable ``QComboBox``
+        line-edit, ``QSpinBox``, etc.), **all** canvas shortcuts and
+        ``QGraphicsScene`` default key behaviour (arrow-key item
+        movement, Tab focus cycling, etc.) are suppressed.
+
+        Keys are routed to the focused ``QGraphicsProxyWidget`` via
+        ``super().keyPressEvent(event)`` and then **unconditionally
+        accepted** so the scene does not act on them a second time.
+        The proxy is then repainted so that cursor position and
+        selection changes are shown immediately.
+
+        Pressing **Escape** exits widget-editing mode: the proxy loses
+        focus, the node's ``ItemIsMovable`` flag is restored (if it was
+        suppressed), and canvas shortcuts become active again.
+
+        Shortcuts (handled by IdleState, only when NOT editing a widget):
         - Delete / Backspace: Remove selected nodes
         - Ctrl+D: Duplicate selected nodes (with internal traces)
         - Ctrl+A: Select all nodes
         - Ctrl+N: New canvas
-        - Ctrl+O: Open file  
+        - Ctrl+O: Open file
         - Ctrl+S: Save file
         - Ctrl+Shift+S: Save As
         - Ctrl+Shift+C: Clear canvas
         - Alt+[1-9]: Open recent file by index
-        
+
         Other keys are passed to the parent implementation.
         """
+        # ── Widget-editing guard ──────────────────────────────────────
+        if self._is_widget_editing():
+            if event.key() == Qt.Key.Key_Escape:
+                self._exit_widget_editing()
+                event.accept()
+                return
+
+            # Route to the focused proxy via standard QGraphicsScene
+            # delivery so the embedded widget receives the key.
+            # Accept unconditionally afterward so the scene's own
+            # default key handling (arrow-key moves, Tab focus cycling,
+            # etc.) is fully suppressed.
+            super().keyPressEvent(event)
+            event.accept()
+
+            # Force the proxy to repaint so the cursor position /
+            # selection / blink state is shown immediately.
+            self._update_editing_proxy()
+            return
+        # ── End widget-editing guard ──────────────────────────────────
+
         # Delegate keyboard handling to current interaction state first
         if self._current_state.keyPressEvent(event):
             event.accept()
             return
-        
+
         # Allow default handling for other keys
         super().keyPressEvent(event)
+
+    # ==========================================================================
+    # WIDGET-EDITING HELPERS
+    # ==========================================================================
+
+    def _is_widget_editing(self) -> bool:
+        """
+        Return ``True`` when the user is interacting with an embedded
+        widget inside a node.
+
+        Detection uses two independent signals (either is sufficient):
+
+        1. The current state's ``_suppressed_movable_node`` is set,
+           meaning ``_yield_to_proxy()`` has temporarily disabled node
+           dragging so the widget can receive mouse events.
+        2. A ``QGraphicsProxyWidget`` is the scene's current focus item,
+           meaning the user has clicked into a widget and is typing.
+        """
+        # Signal 1: state machine flagged a widget interaction
+        if getattr(self._current_state, '_suppressed_movable_node', None) is not None:
+            return True
+        # Signal 2: a proxy widget currently holds keyboard focus
+        if isinstance(self.focusItem(), QGraphicsProxyWidget):
+            return True
+        return False
+
+    def _get_editing_proxy(self) -> Optional[QGraphicsProxyWidget]:
+        """
+        Return the ``QGraphicsProxyWidget`` the user is currently
+        interacting with, or ``None``.
+
+        Checks the suppressed-node path first (the proxy is obtained
+        via the node's ``_widget_core``), then falls back to the scene's
+        current focus item.
+        """
+        # Path 1: via the node whose movability was suppressed
+        node = getattr(self._current_state, '_suppressed_movable_node', None)
+        if node is not None:
+            core = getattr(node, '_widget_core', None)
+            if core is not None:
+                proxy = core.get_proxy()
+                if proxy is not None:
+                    return proxy
+
+        # Path 2: the scene's current focus item
+        focus_item = self.focusItem()
+        if isinstance(focus_item, QGraphicsProxyWidget):
+            return focus_item
+
+        return None
+
+    def _ensure_proxy_focus(self) -> None:
+        """
+        Make sure the ``QGraphicsProxyWidget`` has scene focus.
+
+        ``QGraphicsScene.mousePressEvent()`` may give focus to the
+        *parent node* (which is the topmost selectable item at the
+        click position), stealing it from the proxy.  When the proxy
+        loses scene focus, the embedded widget's ``hasFocus()`` becomes
+        ``False``, the cursor blink timer stops, and the text cursor
+        disappears.
+
+        This method re-asserts focus on the proxy after the scene's
+        default handling has run.
+        """
+        proxy = self._get_editing_proxy()
+        if proxy is not None and not proxy.hasFocus():
+            proxy.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _update_editing_proxy(self) -> None:
+        """
+        Force the editing proxy to repaint.
+
+        Called after key events, mouse moves, and mouse releases so that
+        cursor position changes, selection highlights, and blink-state
+        toggles are reflected on screen immediately.  Without this,
+        ``QGraphicsProxyWidget`` may defer repainting until the next
+        idle cycle, making the cursor appear to "jump" or stay invisible
+        while the user is actively editing.
+        """
+        proxy = self._get_editing_proxy()
+        if proxy is not None:
+            proxy.update()
+
+    def _exit_widget_editing(self) -> None:
+        """
+        Leave widget-editing mode.
+
+        * Restores the ``ItemIsMovable`` flag on the node whose movability
+          was suppressed by ``_yield_to_proxy()``.
+        * Clears keyboard focus from the ``QGraphicsProxyWidget`` so that
+          subsequent key events reach the canvas shortcut handler again.
+        """
+        # Restore movable flag
+        state = self._current_state
+        node = getattr(state, '_suppressed_movable_node', None)
+        if node is not None:
+            try:
+                node.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+            except RuntimeError:
+                pass  # node already deleted
+            state._suppressed_movable_node = None
+
+        # Clear proxy focus
+        focus_item = self.focusItem()
+        if isinstance(focus_item, QGraphicsProxyWidget):
+            focus_item.clearFocus()
     
     def _duplicate_selected_nodes(self) -> None:
         """

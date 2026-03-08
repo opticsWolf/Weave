@@ -300,6 +300,14 @@ class IdleState(CanvasInteractionState):
         self._drag_started_pos: Optional[QPointF] = None
         self._last_mouse_pos: Optional[QPointF] = None  # For delta calculation
         
+        # ===== PROXY WIDGET INTERACTION =====
+        # When a click targets an interactive widget (QComboBox, QSpinBox …),
+        # _yield_to_proxy() temporarily clears ItemIsMovable on the parent
+        # node so that QGraphicsScene's default mousePressEvent does not
+        # initiate a drag — which would steal focus from the popup and
+        # close it immediately.  The flag is restored on mouse release.
+        self._suppressed_movable_node: Optional[QGraphicsItem] = None
+        
         # ===== SUBSCRIBE TO STYLE UPDATES =====
         # When StyleManager emits style_changed for CANVAS category, update cache
         if STYLEMANAGER_AVAILABLE:
@@ -387,31 +395,66 @@ class IdleState(CanvasInteractionState):
         if node is None:
             return False
 
-        core = getattr(node, '_weave_core', None)
+        core = getattr(node, '_widget_core', None)
         if core is None:
+            logging.warning(f"No weave core found on node {node}")
             return False
 
         return core.is_interactive_at(scene_pos)
 
     def _yield_to_proxy(self, scene_pos: QPointF) -> bool:
         """
-        Set focus on the proxy and return False so that Canvas falls
-        through to ``super().mousePressEvent()`` which handles the
-        coordinate translation natively — mapping scene coordinates to
-        local widget coordinates — while bypassing the state machine's
-        drag / selection logic.
+        Handle a click that landed on an interactive widget inside a node.
+
+        Two strategies are tried in order:
+
+        1. **Direct activation** (popup widgets like ProxySafeComboBox):
+           Calls ``WidgetCore.activate_at(scene_pos)`` which finds the
+           widget, computes the correct global screen position through
+           the proxy → scene → view → screen coordinate chain, and
+           calls ``widget.show_popup(global_pos)`` directly.
+           Returns **True** — the event is fully consumed.
+
+           This is necessary because ``QGraphicsScene.mousePressEvent``
+           delivers mouse events to the topmost *parent* item (the node),
+           whose ``QGraphicsItem.mousePressEvent`` accepts the event and
+           becomes the mouse grabber.  The proxy and its embedded
+           QPushButton never receive the press or the subsequent release,
+           so ``QPushButton.clicked`` never fires through normal routing.
+
+        2. **Proxy focus path** (non-popup widgets like QSpinBox, QLineEdit):
+           Sets focus on the proxy, suppresses ``ItemIsMovable`` on the
+           parent node, and returns **False** so that ``Canvas`` calls
+           ``super().mousePressEvent(event)`` which lets Qt route the
+           event through the proxy to the embedded widget.  These widgets
+           don't spawn popups so the proxy routing works for them.
         """
         node = ItemResolver.resolve_node_at(self.canvas, scene_pos)
         if node is None:
             return False
 
-        core = getattr(node, '_weave_core', None)
+        core = getattr(node, '_widget_core', None)
         if core is None:
+            logging.warning(f"No weave core found on node {node}")
             return False
 
+        # ── Strategy 1: Direct activation for popup widgets ──────────
+        # Bypasses Qt event delivery entirely.  activate_at() returns
+        # True only for widgets that expose a show_popup() method.
+        if core.activate_at(scene_pos):
+            return True   # event fully consumed — popup is open
+
+        # ── Strategy 2: Proxy focus path for normal widgets ──────────
         proxy = core.get_proxy()
         if proxy is not None:
             proxy.setFocus(Qt.FocusReason.MouseFocusReason)
+
+        # Temporarily suppress node dragging so QGraphicsScene's default
+        # mousePressEvent doesn't start a move operation on the node.
+        # The flag is restored on the next mouse release.
+        if node.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable:
+            node.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+            self._suppressed_movable_node = node
 
         return False   # let Qt's native event router handle delivery
 
@@ -428,6 +471,25 @@ class IdleState(CanvasInteractionState):
         if self._is_interactive_widget_click(event.scenePos()):
             return self._yield_to_proxy(event.scenePos())
         # ──── END proxy detection ──────────────────────────────────
+
+        # ── Exiting widget-editing mode ───────────────────────────
+        # The user clicked somewhere that is NOT an interactive widget
+        # (empty canvas, node header, port, etc.).  If a previous
+        # interaction left us in widget-editing mode, clean it up now
+        # so normal canvas behaviour resumes immediately.
+        if self._suppressed_movable_node is not None:
+            try:
+                self._suppressed_movable_node.setFlag(
+                    QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True
+                )
+            except RuntimeError:
+                pass  # node already deleted
+            self._suppressed_movable_node = None
+
+        # Clear proxy focus so canvas shortcuts become active again
+        focus_item = self.canvas.focusItem()
+        if isinstance(focus_item, QGraphicsProxyWidget):
+            focus_item.clearFocus()
 
         logging.debug("IdleState.on_mouse_press: Initializing drag state")
         
@@ -600,6 +662,14 @@ class IdleState(CanvasInteractionState):
         
         Performance: O(1) - All operations are constant time
         """
+        # ── Widget-editing mode ───────────────────────────────────────
+        # When the user is interacting with an embedded widget (e.g.
+        # click-dragging to select text in a QLineEdit / QTextEdit),
+        # return False immediately so that Canvas.mouseMoveEvent calls
+        # super() which routes the move through the proxy to the widget.
+        if self._suppressed_movable_node is not None:
+            return False
+
         # Only process shake during active left-button drag
         if not (self._is_dragging and (event.buttons() & Qt.MouseButton.LeftButton)):
             # Reset state if not dragging
@@ -677,6 +747,16 @@ class IdleState(CanvasInteractionState):
     def on_mouse_release(self, event: QGraphicsSceneMouseEvent) -> bool:
         """Handle mouse release - reset drag and shake state."""
         logging.debug("IdleState.on_mouse_release: Resetting all states")
+        
+        # Restore movable flag if we suppressed it for a widget click
+        node = self._suppressed_movable_node
+        if node is not None:
+            try:
+                node.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+            except RuntimeError:
+                pass  # node may have been deleted
+            self._suppressed_movable_node = None
+        
         self._shake_recognizer.reset()
         self._is_dragging = False
         self._drag_started_pos = None
@@ -748,6 +828,18 @@ class IdleState(CanvasInteractionState):
         All command logic is delegated to :class:`CanvasCommandsMixin` via
         ``canvas._context_menu_provider``.
 
+        Focus guard
+        -----------
+        When a ``QGraphicsProxyWidget`` holds focus (i.e. the user is
+        interacting with an embedded widget such as a ``QLineEdit``,
+        ``QTextEdit``, ``QComboBox``, or ``QSpinBox``), **all** shortcut
+        processing is skipped and the method returns ``False`` so that
+        Qt's normal event routing delivers the key to the widget.
+
+        Without this guard, keys like Backspace and Delete are consumed
+        by the state machine before the proxy can forward them, causing
+        the scene to delete nodes / connections instead of editing text.
+
         Shortcuts:
         - Delete / Backspace: Delete selected nodes
         - Ctrl+D:             Duplicate selected nodes
@@ -759,6 +851,22 @@ class IdleState(CanvasInteractionState):
         - Ctrl+Shift+C:       Clear canvas
         - Alt+[1-9]:          Open recent file by index
         """
+        # ── Focus guard: yield to embedded widgets ─────────────────────
+        # When the user is interacting with an embedded widget inside a
+        # node, all shortcut processing is skipped.  The primary guard
+        # lives in Canvas.keyPressEvent (which also force-accepts the
+        # event); this is a defence-in-depth layer.
+        #
+        # Two independent signals are checked:
+        # 1. _suppressed_movable_node is set (widget interaction active)
+        # 2. A QGraphicsProxyWidget holds keyboard focus
+        if self._suppressed_movable_node is not None:
+            return False
+        focus_item = self.canvas.focusItem()
+        if isinstance(focus_item, QGraphicsProxyWidget):
+            return False
+        # ── End focus guard ────────────────────────────────────────────
+
         modifiers = event.modifiers()
         key = event.key()
         ctrl  = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
