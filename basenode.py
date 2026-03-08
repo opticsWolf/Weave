@@ -619,8 +619,8 @@ class BaseControlNode(Node, NodeDataFlow):
         state = super().get_state()
         
         # Widget state — exclusively via WeaveWidgetCore
-        if hasattr(self, '_weave_core') and self._weave_core is not None:
-            state["widget_data"] = self._weave_core.get_state()
+        if hasattr(self, '_widget_core') and self._widget_core is not None:
+            state["widget_data"] = self._widget_core.get_state()
         else:
             state["widget_data"] = {}
         
@@ -646,8 +646,8 @@ class BaseControlNode(Node, NodeDataFlow):
         # 2. Restore widget state — exclusively via WeaveWidgetCore
         _t("Restoring widget_data ...")
         widget_data = state.get("widget_data")
-        if widget_data and hasattr(self, '_weave_core') and self._weave_core is not None:
-            self._weave_core.set_state(widget_data)
+        if widget_data and hasattr(self, '_widget_core') and self._widget_core is not None:
+            self._widget_core.set_state(widget_data)
         _t("widget_data OK")
         
         # 3. Restore dataflow metadata

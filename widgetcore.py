@@ -112,9 +112,10 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import (
     Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING,
+    Union
 )
 
-from PySide6.QtCore import Qt, Signal, Slot, QObject, QEvent, QTimer
+from PySide6.QtCore import Qt, Signal, Slot, QObject, QEvent, QTimer, QPointF
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QLayout, QGraphicsProxyWidget, QGraphicsItem,
@@ -128,6 +129,7 @@ from PySide6.QtWidgets import (
 if TYPE_CHECKING:
     from weave.node.node_core import Node
 from weave.logger import get_logger
+
 log = get_logger("WeaveWidgetCore")
 
 
@@ -211,7 +213,7 @@ class WidgetCore(QWidget):
         self._bindings: Dict[str, WidgetBinding] = {}   # port_name → binding
         self._widget_to_port: Dict[int, str] = {}       # id(widget) → port_name
         self._suppress_signals: bool = False             # bulk-update guard
-        self._node_ref: Optional[QtNode] = None          # back-reference
+        self._node_ref: Optional["Node"] = None          # back-reference
 
         # ── Layout ───────────────────────────────────────────────────────
         if layout is None:
@@ -236,9 +238,20 @@ class WidgetCore(QWidget):
         Walk up the QWidget parent chain to find the QGraphicsProxyWidget
         that hosts us and ensure it has the right flags for interactive
         child widgets (combo-box popups, context menus, tooltips …).
+
+        Retry logic:
+            ``_patch_parent_proxy`` is called via ``QTimer.singleShot(0)``
+            from ``__init__``.  If the proxy has not been set up yet by
+            ``NodeBody`` at that point, ``_find_proxy()`` returns None.
+            We retry once after a short delay to handle deferred
+            construction sequences.
         """
         proxy = self._find_proxy()
         if proxy is None:
+            # Proxy not ready yet — retry once after a short delay
+            if not getattr(self, '_proxy_patch_retried', False):
+                self._proxy_patch_retried = True
+                QTimer.singleShot(50, self._patch_parent_proxy)
             return
 
         proxy.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, True)
@@ -250,15 +263,15 @@ class WidgetCore(QWidget):
 
     def _find_proxy(self) -> Optional[QGraphicsProxyWidget]:
         """Find the nearest QGraphicsProxyWidget ancestor."""
-        w: Optional[QWidget] = self
-        while w is not None:
-            proxy = w.graphicsProxyWidget()
+        widget: Optional[QWidget] = self
+        while widget is not None:
+            proxy = widget.graphicsProxyWidget()
             if proxy is not None:
                 return proxy
-            w = w.parentWidget()
+            widget = widget.parentWidget()
         return None
 
-    def is_interactive_at(self, scene_pos) -> bool:
+    def is_interactive_at(self, scene_pos: QPointF) -> bool:
         """
         Returns True if *scene_pos* (QPointF in scene coordinates) lands
         on an interactive child widget (spin box, combo, line-edit …).
@@ -276,6 +289,7 @@ class WidgetCore(QWidget):
         root = proxy.widget()
         if root is None:
             return False
+        
         local = proxy.mapFromScene(scene_pos).toPoint()
 
         # Find the deepest child in the entire embedded widget tree
@@ -293,6 +307,88 @@ class WidgetCore(QWidget):
         return self._find_proxy()
 
     # ══════════════════════════════════════════════════════════════════════
+    # Direct widget activation (bypasses proxy event delivery)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def activate_at(self, scene_pos: QPointF) -> bool:
+        """
+        Directly activate the widget under *scene_pos*.
+
+        If the widget (or one of its ancestors inside the WidgetCore)
+        exposes a ``show_popup(global_pos)`` method, the popup is opened
+        immediately with correctly mapped global coordinates.
+
+        This **bypasses Qt's event delivery chain entirely**, which is
+        necessary because ``QGraphicsScene.mousePressEvent`` delivers to
+        the parent node — not the proxy — so the embedded widget never
+        receives the click through normal routing.
+
+        Returns True if a widget was activated, False otherwise.
+        Non-popup widgets (QSpinBox, QLineEdit …) return False so that
+        the caller can fall back to the proxy focus path.
+        """
+        proxy = self._find_proxy()
+        if proxy is None:
+            return False
+
+        root = proxy.widget()
+        if root is None:
+            return False
+
+        local = proxy.mapFromScene(scene_pos).toPoint()
+        child = root.childAt(local.x(), local.y())
+        if child is None:
+            return False
+
+        # childAt() returns the deepest widget — which may be an internal
+        # sub-widget of the button (e.g. a styled QFrame).  Walk up until
+        # we find a widget with show_popup or we hit the WidgetCore.
+        target = child
+        while target is not None and target is not self:
+            if hasattr(target, 'show_popup') and callable(target.show_popup):
+                global_pos = self._widget_to_global(
+                    target, target.rect().bottomLeft(), proxy
+                )
+                target.show_popup(global_pos)
+                return True
+            target = target.parentWidget()
+
+        return False
+
+    def _widget_to_global(self, widget: QWidget, local_pos: QPointF, 
+                         proxy: QGraphicsProxyWidget) -> QPoint:
+        """
+        Map *local_pos* (QPoint in *widget*'s coordinate system) to
+        global screen coordinates by walking the full coordinate chain::
+
+            widget-local → proxy root → scene → view viewport → screen
+
+        This avoids ``QWidget.mapToGlobal`` which is broken for widgets
+        embedded inside ``QGraphicsProxyWidget`` (it ignores the view's
+        pan and zoom transforms).
+        """
+        scene = proxy.scene()
+        if scene is None or not scene.views():
+            return widget.mapToGlobal(local_pos.toPoint())
+
+        view = scene.views()[0]
+        proxy_root = proxy.widget()
+        if proxy_root is None:
+            return widget.mapToGlobal(local_pos.toPoint())
+
+        # widget-local → proxy root widget local (QPoint → QPoint)
+        proxy_pos = widget.mapTo(proxy_root, local_pos)
+
+        # proxy root local → scene (QPoint → QPointF)
+        scene_pos = proxy.mapToScene(QPointF(proxy_pos))
+
+        # scene → view viewport (QPointF → QPoint)
+        view_pos = view.mapFromScene(scene_pos)
+
+        # view viewport → global screen (QPoint → QPoint)
+        return view.viewport().mapToGlobal(view_pos)
+
+    # ══════════════════════════════════════════════════════════════════════
     # Widget Registration
     # ══════════════════════════════════════════════════════════════════════
 
@@ -301,7 +397,7 @@ class WidgetCore(QWidget):
         port_name: str,
         widget: QWidget,
         *,
-        role: str | PortRole = PortRole.OUTPUT,
+        role: Union[str, PortRole] = PortRole.OUTPUT,
         datatype: str = "any",
         default: Any = None,
         description: str = "",
@@ -320,9 +416,9 @@ class WidgetCore(QWidget):
             the parent node.
         widget : QWidget
             The Qt widget (QSpinBox, QComboBox, QLineEdit, …).
-        role : str or PortRole
-            ``"input"`` / ``"output"`` / ``"bidirectional"`` / ``"display"``
-            / ``"internal"``.  Determines whether and how a port is created.
+        role : Union[str, PortRole]
+            ``"input"``, ``"output"``, ``"bidirectional"``, ``"display"``
+            or ``"internal"``.  Determines whether and how a port is created.
         datatype : str
             Port datatype string (``"float"``, ``"int"``, ``"string"`` …).
         default : Any
@@ -341,9 +437,18 @@ class WidgetCore(QWidget):
         add_to_layout : bool
             If True (default), ``widget`` is appended to this core's layout.
             Set False if you placed it manually in a nested sub-layout.
+
+        Raises
+        ------
+        ValueError
+            When port_name already registered.
         """
+        # Ensure role is converted to enum value
         if isinstance(role, str):
-            role = PortRole[role.upper()]
+            try:
+                role = PortRole[role.upper()]
+            except KeyError as e:
+                raise ValueError(f"Invalid role '{role}'") from e
 
         if port_name in self._bindings:
             raise ValueError(
@@ -376,6 +481,16 @@ class WidgetCore(QWidget):
         """
         Remove a widget binding.  Returns the widget (still alive, not
         deleted) or None if the name was not registered.
+
+        Parameters
+        ----------
+        port_name : str
+            Port name to remove.
+
+        Returns
+        -------
+        QWidget or None
+            The unregistered widget or None if not found.
         """
         binding = self._bindings.pop(port_name, None)
         if binding is None:
@@ -383,7 +498,10 @@ class WidgetCore(QWidget):
 
         self._widget_to_port.pop(id(binding.widget), None)
         self._disconnect_change_signal(binding)
-        binding.widget.removeEventFilter(self)
+        try:
+            binding.widget.removeEventFilter(self)
+        except RuntimeError:
+            pass
         return binding.widget
 
     # ══════════════════════════════════════════════════════════════════════
@@ -402,17 +520,22 @@ class WidgetCore(QWidget):
                     self.add_output(pd.name, pd.datatype, pd.description)
                 if pd.role in (PortRole.INPUT, PortRole.BIDIRECTIONAL):
                     self.add_input(pd.name, pd.datatype, pd.description)
+
+        Returns
+        -------
+        List[PortDefinition]
+            Definitions of ports to be created.
         """
         defs: List[PortDefinition] = []
-        for b in self._bindings.values():
-            if b.role in (PortRole.DISPLAY, PortRole.INTERNAL):
+        for binding in self._bindings.values():
+            if binding.role in (PortRole.DISPLAY, PortRole.INTERNAL):
                 continue
             defs.append(PortDefinition(
-                name=b.port_name,
-                datatype=b.datatype,
-                role=b.role,
-                default=b.default,
-                description=b.description,
+                name=binding.port_name,
+                datatype=binding.datatype,
+                role=binding.role,
+                default=binding.default,
+                description=binding.description,
             ))
         return defs
 
@@ -426,6 +549,16 @@ class WidgetCore(QWidget):
 
         Falls back to the binding's ``default`` if the widget is empty or
         the port name is unknown.
+
+        Parameters
+        ----------
+        port_name : str
+            Port name to read from.
+
+        Returns
+        -------
+        Any
+            Current widget value, or default if not found.
         """
         binding = self._bindings.get(port_name)
         if binding is None:
@@ -435,18 +568,42 @@ class WidgetCore(QWidget):
             if binding.getter is not None:
                 return binding.getter()
             return self._generic_get(binding.widget, binding.default)
-        except (RuntimeError, AttributeError):
+        except (RuntimeError, AttributeError) as e:
+            log.warning(f"Failed to get value for port '{port_name}': {e}")
             return binding.default
 
     def get_all_values(self) -> Dict[str, Any]:
-        """Read all registered widget values at once."""
-        return {name: self.get_port_value(name) for name in self._bindings}
+        """
+        Read all registered widget values at once.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Port name mapped to current value.
+        """
+        result = {}
+        for port_name in self._bindings:
+            try:
+                result[port_name] = self.get_port_value(port_name)
+            except Exception as e:
+                log.warning(f"Failed to get value for port '{port_name}': {e}")
+                # Use default value
+                binding = self._bindings[port_name]
+                result[port_name] = binding.default
+        return result
 
     def set_port_value(self, port_name: str, value: Any) -> None:
         """
         Push a value *into* the widget (e.g. when upstream data arrives).
 
         Signals are blocked during the write to prevent feedback loops.
+
+        Parameters
+        ----------
+        port_name : str
+            Port name to set.
+        value : Any
+            Value to assign to the widget.
         """
         binding = self._bindings.get(port_name)
         if binding is None:
@@ -458,8 +615,8 @@ class WidgetCore(QWidget):
                 binding.setter(value)
             else:
                 self._generic_set(binding.widget, value)
-        except (RuntimeError, AttributeError):
-            pass
+        except (RuntimeError, AttributeError) as e:
+            log.warning(f"Failed to set value for port '{port_name}': {e}")
         finally:
             self._suppress_signals = False
 
@@ -473,6 +630,13 @@ class WidgetCore(QWidget):
 
         Called by the node when a trace connects / disconnects to the
         corresponding input port.
+
+        Parameters
+        ----------
+        port_name : str
+            Port name whose widget should be enabled/disabled.
+        enabled : bool
+            True to enable, False to disable.
         """
         binding = self._bindings.get(port_name)
         if binding is None:
@@ -480,7 +644,14 @@ class WidgetCore(QWidget):
         binding.widget.setEnabled(enabled)
 
     def set_all_enabled(self, enabled: bool) -> None:
-        """Bulk enable / disable every registered widget."""
+        """
+        Bulk enable / disable every registered widget.
+
+        Parameters
+        ----------
+        enabled : bool
+            True to enable all widgets, False to disable.
+        """
         for binding in self._bindings.values():
             binding.widget.setEnabled(enabled)
 
@@ -496,16 +667,25 @@ class WidgetCore(QWidget):
         This is the ONLY mechanism for widget state persistence.
         ``BaseControlNode.get_state()`` calls this and stores the result
         under the ``"widget_data"`` key.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Serialised widget states as port_name → value mapping.
         """
         state: Dict[str, Any] = {}
         for name, binding in self._bindings.items():
             try:
                 val = self.get_port_value(name)
-                if isinstance(val, (int, float, str, bool, list, dict, type(None))):
+                if isinstance(val, (int, float, str, bool, list, dict)):
                     state[name] = val
+                elif val is None:
+                    state[name] = None
                 else:
+                    # Convert non-JSON types to string representations
                     state[name] = str(val)
-            except Exception:
+            except Exception as e:
+                log.warning(f"Failed to serialize widget state for '{name}': {e}")
                 state[name] = binding.default
         return state
 
@@ -516,6 +696,11 @@ class WidgetCore(QWidget):
         Signals are suppressed during the entire restore pass.
         ``BaseControlNode.restore_state()`` calls this with the dict
         stored under the ``"widget_data"`` key.
+
+        Parameters
+        ----------
+        data : Dict[str, Any]
+            State dictionary to restore widget values from.
         """
         self._suppress_signals = True
         try:
@@ -528,9 +713,9 @@ class WidgetCore(QWidget):
                         binding.setter(value)
                     else:
                         self._generic_set(binding.widget, value)
-                except Exception as exc:
+                except Exception as e:
                     log.warning(
-                        f"Failed to restore widget state for '{name}': {exc}"
+                        f"Failed to restore widget state for '{name}': {e}"
                     )
         finally:
             self._suppress_signals = False
@@ -539,12 +724,20 @@ class WidgetCore(QWidget):
     # Node back-reference
     # ══════════════════════════════════════════════════════════════════════
 
-    def set_node(self, node: "QtNode") -> None:
-        """Stores a back-reference to the owning node."""
+    def set_node(self, node: "Node") -> None:
+        """
+        Stores a back-reference to the owning node.
+
+        Parameters
+        ----------
+        node : Node
+            The node that owns this widget core.
+        """
         self._node_ref = node
 
     @property
-    def node(self) -> Optional["QtNode"]:
+    def node(self) -> Optional["Node"]:
+        """Return the reference to the parent node."""
         return self._node_ref
 
     # ══════════════════════════════════════════════════════════════════════
@@ -558,15 +751,30 @@ class WidgetCore(QWidget):
         On ``FocusIn``: ensures the QGraphicsProxyWidget also claims
         scene focus so the canvas state machine does not steal
         subsequent key / mouse events.
+
+        Parameters
+        ----------
+        obj : QObject
+            The object that received the event.
+        event : QEvent
+            The Qt event to process.
+
+        Returns
+        -------
+        bool
+            False always (let events propagate).
         """
         if event.type() == QEvent.Type.FocusIn:
             proxy = self._find_proxy()
             if proxy is not None:
-                proxy.setFocus(Qt.FocusReason.MouseFocusReason)
-                scene = proxy.scene()
-                if scene is not None:
-                    scene.setFocusItem(proxy, Qt.FocusReason.MouseFocusReason)
-
+                try:
+                    proxy.setFocus(Qt.FocusReason.MouseFocusReason)
+                    scene = proxy.scene()
+                    if scene is not None:
+                        scene.setFocusItem(proxy, Qt.FocusReason.MouseFocusReason)
+                except Exception as e:
+                    log.warning(f"Failed to set focus on proxy: {e}")
+        
         return False  # never block — let events propagate
 
     # ══════════════════════════════════════════════════════════════════════
@@ -661,31 +869,37 @@ class WidgetCore(QWidget):
         if sig_name is None:
             return
 
-        sig = getattr(binding.widget, sig_name, None)
-        if sig is None:
-            return
+        try:
+            sig = getattr(binding.widget, sig_name)
+            if not callable(sig):
+                return
+                
+            binding._connected_signal = sig_name
+            port_name = binding.port_name
 
-        binding._connected_signal = sig_name
-        port_name = binding.port_name
+            def _on_change(*_args, _pn=port_name):
+                if not self._suppress_signals:
+                    self.value_changed.emit(_pn)
 
-        def _on_change(*_args, _pn=port_name):
-            if not self._suppress_signals:
-                self.value_changed.emit(_pn)
-
-        binding._slot_ref = _on_change  # prevent GC
-        sig.connect(_on_change)
+            binding._slot_ref = _on_change  # prevent GC
+            sig.connect(_on_change)
+        except Exception as e:
+            log.warning(f"Failed to connect signal for widget {binding.port_name}: {e}")
 
     def _disconnect_change_signal(self, binding: WidgetBinding) -> None:
         """Disconnect the previously connected change signal."""
         if binding._connected_signal is None:
             return
-        sig = getattr(binding.widget, binding._connected_signal, None)
-        slot = getattr(binding, '_slot_ref', None)
-        if sig is not None and slot is not None:
-            try:
-                sig.disconnect(slot)
-            except (RuntimeError, TypeError):
-                pass
+        try:
+            sig = getattr(binding.widget, binding._connected_signal)
+            slot = getattr(binding, '_slot_ref', None)
+            if slot is not None:
+                try:
+                    sig.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass  # Already disconnected or doesn't exist
+        except Exception as e:
+            log.warning(f"Failed to disconnect signal for widget {binding.port_name}: {e}")
         binding._connected_signal = None
 
     # ══════════════════════════════════════════════════════════════════════
@@ -697,15 +911,53 @@ class WidgetCore(QWidget):
         return dict(self._bindings)
 
     def has_binding(self, port_name: str) -> bool:
+        """
+        Check if a binding exists for the given port name.
+
+        Parameters
+        ----------
+        port_name : str
+            Port name to check.
+
+        Returns
+        -------
+        bool
+            True if bound, False otherwise.
+        """
         return port_name in self._bindings
 
     def get_binding(self, port_name: str) -> Optional[WidgetBinding]:
+        """
+        Get a binding by port name.
+
+        Parameters
+        ----------
+        port_name : str
+            Port name to retrieve.
+
+        Returns
+        -------
+        WidgetBinding or None
+            The binding if found.
+        """
         return self._bindings.get(port_name)
 
     def get_widget(self, port_name: str) -> Optional[QWidget]:
-        """Shortcut to retrieve the QWidget for a port name."""
-        b = self._bindings.get(port_name)
-        return b.widget if b is not None else None
+        """
+        Shortcut to retrieve the QWidget for a port name.
+
+        Parameters
+        ----------
+        port_name : str
+            Port name whose widget to retrieve.
+
+        Returns
+        -------
+        QWidget or None
+            The widget if found.
+        """
+        binding = self._bindings.get(port_name)
+        return binding.widget if binding is not None else None
 
     # ══════════════════════════════════════════════════════════════════════
     # Cleanup
@@ -720,8 +972,8 @@ class WidgetCore(QWidget):
             self._disconnect_change_signal(binding)
             try:
                 binding.widget.removeEventFilter(self)
-            except RuntimeError:
-                pass
+            except Exception as e:
+                log.warning(f"Failed to remove event filter: {e}")
 
         self._bindings.clear()
         self._widget_to_port.clear()
