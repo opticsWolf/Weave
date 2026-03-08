@@ -26,7 +26,8 @@ import numpy as np
 from typing import Any, Dict, Optional, ClassVar, List
 from PySide6.QtCore import Signal, Slot, QObject
 from PySide6.QtWidgets import (
-    QSpinBox, QLineEdit, QLabel, QWidget, QVBoxLayout, QComboBox, QDoubleSpinBox, QPushButton, QTextEdit
+    QSpinBox, QLineEdit, QLabel, QWidget, QVBoxLayout, QFormLayout,
+    QComboBox, QDoubleSpinBox, QPushButton
 )
 
 # Import the WidgetCore for new node implementations
@@ -38,12 +39,6 @@ from weave.noderegistry import register_node
 
 from weave.logger import get_logger
 log = get_logger("SimpleNodes")
-
-# ------------------------------------------------------------------------------
-# Mock Registry & Base Imports (Adapt if your file structure differs)
-# ------------------------------------------------------------------------------
-
-# Simple decorator if qt_noderegistry is missing
 
 
 # ------------------------------------------------------------------------------
@@ -77,29 +72,31 @@ class FloatNode(ActiveNode):
             title=title, **kwargs
         )
         
-        self.add_input("factor", "float") # Optional modifier
+        self.add_input("factor", "float")  # Optional modifier
         
-        # Build core with WidgetCore 
-        self._core = WidgetCore()
+        # Build core with WidgetCore
+        # NOTE: Must be stored as _widget_core so BaseControlNode.get_state() /
+        #       restore_state() can find it for serialisation.
+        self._widget_core = WidgetCore()
         
         spin = QDoubleSpinBox()
         spin.setRange(-9999.0, 9999.0)
         spin.setValue(val)
         
         # Register the widget with the core
-        self._core.register_widget(
+        self._widget_core.register_widget(
             "value", spin,
             role="output", datatype="float", default=0.0,
         )
         
-        # Auto-create ports from registered widgets 
-        for pd in self._core.get_port_definitions():
+        # Auto-create ports from registered widgets
+        for pd in self._widget_core.get_port_definitions():
             if pd.role in (PortRole.OUTPUT, PortRole.BIDIRECTIONAL):
                 self.add_output(pd.name, pd.datatype, pd.description)
         
-        # Connect the core's signal to our handler
-        self._core.value_changed.connect(self._on_core_changed)
-        self.set_content_widget(self._core)
+        # Connect the core's value_changed signal to our handler
+        self._widget_core.value_changed.connect(self._on_core_changed)
+        self.set_content_widget(self._widget_core)
         
         self._cached_values["value"] = val
 
@@ -107,10 +104,9 @@ class FloatNode(ActiveNode):
     def _on_core_changed(self, port_name: str) -> None:
         """Propagates UI changes to the graph logic."""
         try:
-            # Only handle value changes (since that's our only registered widget)
             if port_name == "value":
                 self.on_ui_change()
-                self.value_changed.emit(self._core.get_port_value("value"))
+                self.value_changed.emit(self._widget_core.get_port_value("value"))
         except Exception as e:
             log.error(f"Exception in FloatNode._on_core_changed: {e}")
 
@@ -118,11 +114,8 @@ class FloatNode(ActiveNode):
         """Calculates output based on spinner value and optional upstream factor."""
         try:
             factor = inputs.get("factor", 1.0)
+            base_val = self._widget_core.get_port_value("value")
             
-            # SAFETY CHECK: Widget existence
-            base_val = self._core.get_port_value("value")
-            
-            # Safe float conversion
             try:
                 result = base_val * float(factor)
             except (ValueError, TypeError):
@@ -135,10 +128,7 @@ class FloatNode(ActiveNode):
 
     def cleanup(self) -> None:
         """Safe teardown of widgets and signals."""
-        # Cleanup the WidgetCore
-        self._core.cleanup()
-        
-        # Call parent cleanup  
+        self._widget_core.cleanup()
         super().cleanup()
 
 
@@ -163,19 +153,19 @@ class DisplayNode(ActiveNode):
         self.add_input("data", "any")
         
         # Create core with a display widget
-        self._core = WidgetCore()
+        self._widget_core = WidgetCore()
         
-        self.label = QLabel("Waiting...")
-        self.label.setStyleSheet("QLabel { color: #ddd; font-weight: bold; }")
-        self.label.setMinimumWidth(80)
+        label = QLabel("Waiting...")
+        label.setStyleSheet("QLabel { color: #ddd; font-weight: bold; }")
+        label.setMinimumWidth(80)
         
-        # Register the label as a DISPLAY role (no port created, but state persistence)
-        self._core.register_widget(
-            "display", self.label,
+        # Register the label as DISPLAY role (no port created, but state is persisted)
+        self._widget_core.register_widget(
+            "display", label,
             role="display", datatype="string", default="No Data",
         )
         
-        self.set_content_widget(self._core)
+        self.set_content_widget(self._widget_core)
             
         self._temp_display_data: str = "No Data"
 
@@ -194,20 +184,17 @@ class DisplayNode(ActiveNode):
         """Safe place to update UI after graph evaluation."""
         try:
             super().on_evaluate_finished()
-            
-            # SAFETY CHECK: Ensure widget is alive before setText
-            if hasattr(self, 'label') and self.label:
-                try:
-                    self._core.set_port_value("display", f"RX: {self._temp_display_data}")
-                except RuntimeError:
-                    # Wrapped C/C++ object has been deleted
-                    pass
+            try:
+                self._widget_core.set_port_value("display", f"RX: {self._temp_display_data}")
+            except RuntimeError:
+                # Wrapped C/C++ object has been deleted
+                pass
         except Exception as e:
             log.error(f"Exception in DisplayNode.on_evaluate_finished: {e}")
 
     def cleanup(self) -> None:
         """Teardown."""
-        self._core.cleanup()
+        self._widget_core.cleanup()
         super().cleanup()
 
 
@@ -232,28 +219,24 @@ class ActionNode(ManualNode):
         self.add_input("data", "any")
         self.add_output("status", "string")
 
-        # Create core with button widget  
-        self._core = WidgetCore()
+        # Create core with button widget
+        self._widget_core = WidgetCore()
         
         btn = QPushButton("Execute")
         btn.clicked.connect(self.execute)
         
-        # Register the button (but don't create port since it's an action)
-        self._core.register_widget(
+        # Register the button as INTERNAL — it's an action trigger, not a port value
+        self._widget_core.register_widget(
             "trigger", btn,
             role="internal", datatype="string", default="",
         )
         
-        self.set_content_widget(self._core)
+        self.set_content_widget(self._widget_core)
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Performs the side effect."""
         try:
             data_val = inputs.get("data", "No Data")
-            
-            # Use getattr to avoid crash if 'title' attribute missing (edge case)
-            title = getattr(self, 'title', 'ActionNode')
-            
             log.info(f"ACTION TRIGGERED | Payload: {data_val}")
             return {"status": "Success"}
         except Exception as e:
@@ -262,96 +245,7 @@ class ActionNode(ManualNode):
 
     def cleanup(self) -> None:
         """Teardown."""
-        self._core.cleanup()
-        super().cleanup()
-
-
-@register_node
-class TextEditNode(ActiveNode):
-    """
-    Real-time logging node using efficient O(1) appends.
-    """
-    node_class: ClassVar[str] = "Basic"
-    node_subclass: ClassVar[str] = "Output"
-    node_name: ClassVar[Optional[str]] = "Text Logger"
-    node_description: ClassVar[Optional[str]] = "Logs text to editor"
-    node_tags: ClassVar[Optional[List[str]]] = ["log", "text", "editor", "output"]
-
-    def __init__(self, title: str = "Logger", **kwargs: Any) -> None:
-        super().__init__(
-            title=title, **kwargs
-        )
-        self.add_input("append", "string")
-        
-        # Create core with text editor
-        self._core = WidgetCore()
-        
-        self.editor = QTextEdit()
-        self.editor.setReadOnly(True)
-        self.editor.setMinimumSize(150, 100)
-        
-        # Register the editor widget
-        self._core.register_widget(
-            "text", self.editor,
-            role="bidirectional", datatype="string", default="",
-        )
-        
-        # Auto-create ports from registered widgets
-        for pd in self._core.get_port_definitions():
-            if pd.role in (PortRole.OUTPUT, PortRole.BIDIRECTIONAL):
-                self.add_output(pd.name, pd.datatype, pd.description)
-            if pd.role in (PortRole.INPUT, PortRole.BIDIRECTIONAL):
-                self.add_input(pd.name, pd.datatype, pd.description)
-        
-        # Connect core signal
-        self._core.value_changed.connect(self.on_ui_change)
-        
-        self.set_content_widget(self._core)
-            
-        self._pending_append: Optional[str] = None
-
-    def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Captures input string for the next UI update cycle."""
-        try:
-            # Get current text from core
-            if hasattr(self, 'editor') and self.editor:
-                try:
-                    # Return current state for downstream nodes - get from core  
-                    return {"text": self._core.get_port_value("text")}
-                except RuntimeError:
-                    return {"text": ""}
-            else:
-                return {"text": ""}
-        except Exception as e:
-            log.error(f"Exception in TextEditNode.compute: {e}")
-            return {"text": ""}
-
-    def on_evaluate_finished(self) -> None:
-        """Updates the text editor efficiently."""
-        try:
-            super().on_evaluate_finished()
-            
-            # Check conditions:
-            # 1. We have data to append
-            # 2. The editor widget still exists
-            # 3. The C++ object underlying the widget is valid
-            if self._pending_append is not None:
-                try:
-                    self.editor.append(str(self._pending_append))
-                    self._pending_append = None # Clear buffer
-                    
-                    # Update core with new text value 
-                    self._core.set_port_value("text", self.editor.toPlainText())
-                except RuntimeError:
-                    pass # Object deleted
-        except Exception as e:
-            log.error(f"Exception in TextEditNode.on_evaluate_finished: {e}")
-
-    def cleanup(self) -> None:
-        """Teardown."""
-        self._pending_append = None
-        
-        self._core.cleanup()
+        self._widget_core.cleanup()
         super().cleanup()
 
 
@@ -381,27 +275,27 @@ class IntNode(ActiveNode):
         
         self.add_input("factor", "int")  # Optional modifier
         
-        # Build core with WidgetCore 
-        self._core = WidgetCore()
+        # Build core with WidgetCore
+        self._widget_core = WidgetCore()
         
         spin = QSpinBox()
         spin.setRange(-9999, 9999)
         spin.setValue(val)
         
         # Register the widget with the core
-        self._core.register_widget(
+        self._widget_core.register_widget(
             "value", spin,
             role="output", datatype="int", default=0,
         )
         
-        # Auto-create ports from registered widgets 
-        for pd in self._core.get_port_definitions():
+        # Auto-create ports from registered widgets
+        for pd in self._widget_core.get_port_definitions():
             if pd.role in (PortRole.OUTPUT, PortRole.BIDIRECTIONAL):
                 self.add_output(pd.name, pd.datatype, pd.description)
         
-        # Connect the core's signal to our handler
-        self._core.value_changed.connect(self._on_core_changed)
-        self.set_content_widget(self._core)
+        # Connect the core's value_changed signal to our handler
+        self._widget_core.value_changed.connect(self._on_core_changed)
+        self.set_content_widget(self._widget_core)
         
         self._cached_values["value"] = val
 
@@ -409,10 +303,9 @@ class IntNode(ActiveNode):
     def _on_core_changed(self, port_name: str) -> None:
         """Propagates UI changes to the graph logic."""
         try:
-            # Only handle value changes (since that's our only registered widget)
             if port_name == "value":
                 self.on_ui_change()
-                self.value_changed.emit(self._core.get_port_value("value"))
+                self.value_changed.emit(self._widget_core.get_port_value("value"))
         except Exception as e:
             log.error(f"Exception in IntNode._on_core_changed: {e}")
 
@@ -420,10 +313,8 @@ class IntNode(ActiveNode):
         """Calculates output based on spinner value and optional upstream factor."""
         try:
             factor = inputs.get("factor", 1)
+            base_val = self._widget_core.get_port_value("value")
             
-            base_val = self._core.get_port_value("value")
-            
-            # Safe int conversion
             try:
                 result = base_val * int(factor)
             except (ValueError, TypeError):
@@ -436,10 +327,7 @@ class IntNode(ActiveNode):
 
     def cleanup(self) -> None:
         """Safe teardown of widgets and signals."""
-        # Cleanup the WidgetCore
-        self._core.cleanup()
-        
-        # Call parent cleanup  
+        self._widget_core.cleanup()
         super().cleanup()
 
 
@@ -466,8 +354,8 @@ class TextInputNode(ActiveNode):
         """
         super().__init__(title=title, **kwargs)
         
-        # Build core with WidgetCore 
-        self._core = WidgetCore()
+        # Build core with WidgetCore
+        self._widget_core = WidgetCore()
         
         line_edit = QLineEdit()
         line_edit.setText(initial_text)
@@ -475,19 +363,19 @@ class TextInputNode(ActiveNode):
         line_edit.setMinimumWidth(120)
         
         # Register the widget with the core
-        self._core.register_widget(
+        self._widget_core.register_widget(
             "text", line_edit,
             role="output", datatype="string", default="",
         )
         
-        # Auto-create ports from registered widgets 
-        for pd in self._core.get_port_definitions():
+        # Auto-create ports from registered widgets
+        for pd in self._widget_core.get_port_definitions():
             if pd.role in (PortRole.OUTPUT, PortRole.BIDIRECTIONAL):
                 self.add_output(pd.name, pd.datatype, pd.description)
         
-        # Connect the core's signal to our handler
-        self._core.value_changed.connect(self._on_core_changed)
-        self.set_content_widget(self._core)
+        # Connect the core's value_changed signal to our handler
+        self._widget_core.value_changed.connect(self._on_core_changed)
+        self.set_content_widget(self._widget_core)
             
         self._cached_values["text"] = initial_text
 
@@ -495,28 +383,23 @@ class TextInputNode(ActiveNode):
     def _on_core_changed(self, port_name: str) -> None:
         """Propagates text changes to the graph logic."""
         try:
-            # Only handle text changes (since that's our only registered widget)
             if port_name == "text":
                 self.on_ui_change()
-                self.text_changed.emit(self._core.get_port_value("text"))
+                self.text_changed.emit(self._widget_core.get_port_value("text"))
         except Exception as e:
             log.error(f"Exception in TextInputNode._on_core_changed: {e}")
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Returns the current text value."""
         try:
-            text = self._core.get_port_value("text")
-            return {"text": text}
+            return {"text": self._widget_core.get_port_value("text")}
         except Exception as e:
             log.error(f"Exception in TextInputNode.compute: {e}")
             return {"text": ""}
 
     def cleanup(self) -> None:
         """Safe teardown of widgets and signals."""
-        # Cleanup the WidgetCore
-        self._core.cleanup()
-        
-        # Call parent cleanup  
+        self._widget_core.cleanup()
         super().cleanup()
 
 
@@ -537,9 +420,7 @@ class RangeListNode(ActiveNode):
     node_tags: ClassVar[Optional[List[str]]] = ["list", "range", "generator"]
 
     def __init__(self, title: str = "Range List", **kwargs: Any) -> None:
-        """
-        Creates a list generator with start, stop, and step parameters.
-        """
+        """Creates a list generator with start, stop, and step parameters."""
         super().__init__(title=title, **kwargs)
         
         self.add_input("start", "float")
@@ -547,106 +428,86 @@ class RangeListNode(ActiveNode):
         self.add_input("step", "float")
         self.add_output("list", "list")
         
-        # Build core with WidgetCore 
-        self._core = WidgetCore()
+        # Use a QFormLayout so labels and spinboxes sit on the same row, keeping
+        # the node body compact.  Pass it directly to the WidgetCore constructor.
+        form = QFormLayout()
+        form.setContentsMargins(5, 5, 5, 5)
+        form.setSpacing(4)
+        self._widget_core = WidgetCore(layout=form)
         
-        # Container widget for layout
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(5)
-        
-        # Start value spinbox
-        label_start = QLabel("Start:")
         spin_start = QSpinBox()
         spin_start.setRange(-9999, 9999)
         spin_start.setValue(0)
         
-        # Stop value spinbox  
-        label_stop = QLabel("Stop:")
         spin_stop = QSpinBox()
         spin_stop.setRange(-9999, 9999)
         spin_stop.setValue(10)
         
-        # Step value spinbox
-        label_step = QLabel("Step:")
         spin_step = QSpinBox()
-        spin_step.setRange(-9999, 9999)
+        spin_step.setRange(1, 9999)   # Step must be ≥ 1; prevents zero-step infinite loops
         spin_step.setValue(1)
-        spin_step.setMinimum(1)  # Prevent zero step
         
-        # Add widgets to layout
-        layout.addWidget(label_start)
-        layout.addWidget(spin_start)
-        layout.addWidget(label_stop)
-        layout.addWidget(spin_stop)
-        layout.addWidget(label_step)
-        layout.addWidget(spin_step)
+        # Add labelled rows directly to the form layout before registration so
+        # the WidgetCore doesn't try to add them a second time.
+        form.addRow("Start:", spin_start)
+        form.addRow("Stop:", spin_stop)
+        form.addRow("Step:", spin_step)
         
-        # Register the container widget (will handle all spinboxes via core)
-        self._core.register_widget(
-            "range_controls", container,
-            role="internal", datatype="string", default="",
-        )
-        
-        # Also register individual spinbox widgets for direct access
-        self._core.register_widget(
+        # Register each spinbox with add_to_layout=False because we already
+        # placed them in the form layout above.
+        self._widget_core.register_widget(
             "start", spin_start,
             role="bidirectional", datatype="float", default=0.0,
+            add_to_layout=False,
         )
-        self._core.register_widget(
+        self._widget_core.register_widget(
             "stop", spin_stop,
             role="bidirectional", datatype="float", default=10.0,
+            add_to_layout=False,
         )
-        self._core.register_widget(
+        self._widget_core.register_widget(
             "step", spin_step,
             role="bidirectional", datatype="float", default=1.0,
+            add_to_layout=False,
         )
         
-        # Connect signals to our handler
-        spin_start.valueChanged.connect(self._on_spin_changed)
-        spin_stop.valueChanged.connect(self._on_spin_changed)  
-        spin_step.valueChanged.connect(self._on_spin_changed)
+        # A single connection to WidgetCore.value_changed covers all three
+        # spinboxes — no need for individual valueChanged slots.
+        self._widget_core.value_changed.connect(self._on_core_changed)
         
-        self.set_content_widget(self._core)
+        self.set_content_widget(self._widget_core)
 
-    @Slot(int)
-    def _on_spin_changed(self, val: int) -> None:
+    @Slot(str)
+    def _on_core_changed(self, port_name: str) -> None:
         """Propagates UI changes to the graph logic."""
         try:
             self.on_ui_change()
         except Exception as e:
-            log.error(f"Exception in RangeListNode._on_spin_changed: {e}")
+            log.error(f"Exception in RangeListNode._on_core_changed: {e}")
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Generates a list using numpy.arange with input values or UI defaults."""
+        """Generates a list using numpy.arange; prefers connected inputs over UI values."""
         try:
-            # Use input values if connected, otherwise use UI spinboxes
+            # Use upstream value if port is connected, else fall back to the widget
             start = inputs.get("start")
-            stop = inputs.get("stop") 
-            step = inputs.get("step")
+            stop  = inputs.get("stop")
+            step  = inputs.get("step")
             
-            # Fallback to core widget values
             if start is None:
-                start = self._core.get_port_value("start")
-            if stop is None:  
-                stop = self._core.get_port_value("stop")
+                start = self._widget_core.get_port_value("start")
+            if stop is None:
+                stop  = self._widget_core.get_port_value("stop")
             if step is None:
-                step = self._core.get_port_value("step")
+                step  = self._widget_core.get_port_value("step")
             
-            # Safety defaults
             start = float(start) if start is not None else 0.0
-            stop = float(stop) if stop is not None else 10.0
-            step = float(step) if step is not None else 1.0
+            stop  = float(stop)  if stop  is not None else 10.0
+            step  = float(step)  if step  is not None else 1.0
             
-            # Prevent infinite loops
             if step == 0:
                 step = 1.0
             
-            # Generate list using numpy
-            result_array = np.arange(start, stop, step)
-            result_list = result_array.tolist()
-            
+            result_list = np.arange(start, stop, step).tolist()
             self.list_changed.emit(result_list)
             return {"list": result_list}
             
@@ -656,10 +517,7 @@ class RangeListNode(ActiveNode):
 
     def cleanup(self) -> None:
         """Safe teardown of widgets and signals."""
-        # Cleanup the WidgetCore
-        self._core.cleanup()
-        
-        # Call parent cleanup  
+        self._widget_core.cleanup()
         super().cleanup()
 
 
@@ -683,18 +541,18 @@ class ListLengthNode(ActiveNode):
         self.add_output("length", "int")
         
         # Create core with label widget
-        self._core = WidgetCore()
+        self._widget_core = WidgetCore()
         
         label = QLabel("Length: 0")
         label.setStyleSheet("QLabel { color: #ddd; }")
         
         # Register the label as display-only (no port created)
-        self._core.register_widget(
+        self._widget_core.register_widget(
             "length_display", label,
             role="display", datatype="string", default="Length: 0",
         )
         
-        self.set_content_widget(self._core)
+        self.set_content_widget(self._widget_core)
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Computes the length of the input list."""
@@ -716,15 +574,15 @@ class ListLengthNode(ActiveNode):
         try:
             super().on_evaluate_finished()
             
-            length = self._cached_values.get("length", 0)
-            # Update via core
-            self._core.set_port_value("length_display", f"Length: {length}")
+            # Use get_output_value() so we unwrap the CacheEntry correctly
+            length = self.get_output_value("length") or 0
+            self._widget_core.set_port_value("length_display", f"Length: {length}")
         except Exception as e:
             log.error(f"Exception in ListLengthNode.on_evaluate_finished: {e}")
 
     def cleanup(self) -> None:
         """Teardown."""
-        self._core.cleanup()
+        self._widget_core.cleanup()
         super().cleanup()
 
 
@@ -746,67 +604,56 @@ class ListIndexNode(ActiveNode):
         
         self.add_input("list", "list")
         self.add_input("index", "int")
-        # Enable auto-disable on the index input port
+        # Enable auto-disable on the index input port so that when an upstream
+        # node drives it, the spinbox is greyed out automatically.
         self.inputs[-1]._auto_disable = True
         
         self.add_output("element", "any")
         
-        # Build core with WidgetCore 
-        self._core = WidgetCore()
+        # Use a QFormLayout for a compact label + spinbox row
+        form = QFormLayout()
+        form.setContentsMargins(5, 5, 5, 5)
+        form.setSpacing(4)
+        self._widget_core = WidgetCore(layout=form)
         
-        # Container widget for layout  
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(5, 5, 5, 5)
-        
-        label_index = QLabel("Index:")
         spin_index = QSpinBox()
         spin_index.setRange(-9999, 9999)
         spin_index.setValue(0)
         
-        # Add widgets to layout
-        layout.addWidget(label_index)
-        layout.addWidget(spin_index)
+        form.addRow("Index:", spin_index)
         
-        # Register the container widget (will handle the spinbox via core)
-        self._core.register_widget(
-            "index_control", container,
-            role="internal", datatype="string", default="",
-        )
-        
-        # Also register the spinbox for direct access
-        self._core.register_widget(
+        # Register with add_to_layout=False — already in the form above
+        self._widget_core.register_widget(
             "index", spin_index,
             role="bidirectional", datatype="int", default=0,
+            add_to_layout=False,
         )
         
-        # Connect signal to handler  
-        spin_index.valueChanged.connect(self._on_spin_changed)
-        self.set_content_widget(self._core)
+        # WidgetCore.value_changed handles the signal; no manual connection needed
+        self._widget_core.value_changed.connect(self._on_core_changed)
+        self.set_content_widget(self._widget_core)
 
-    @Slot(int)
-    def _on_spin_changed(self, val: int) -> None:
+    @Slot(str)
+    def _on_core_changed(self, port_name: str) -> None:
         """Propagates UI changes to the graph logic."""
         try:
             self.on_ui_change()
         except Exception as e:
-            log.error(f"Exception in ListIndexNode._on_spin_changed: {e}")
+            log.error(f"Exception in ListIndexNode._on_core_changed: {e}")
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Extracts element at specified index."""
         try:
             input_list = inputs.get("list", [])
             
-            # Get the index - use connected value if available
+            # Prefer a connected upstream index; fall back to the spinbox
             index = inputs.get("index")
             if index is None:
-                index = self._core.get_port_value("index") 
+                index = self._widget_core.get_port_value("index")
                 
             index = int(index) if index is not None else 0
             
-            # Safe indexing  
             if isinstance(input_list, (list, tuple, np.ndarray)) and len(input_list) > 0:
-                # Handle negative indices
                 if -len(input_list) <= index < len(input_list):
                     element = input_list[index]
                 else:
@@ -821,10 +668,7 @@ class ListIndexNode(ActiveNode):
 
     def cleanup(self) -> None:
         """Safe teardown of widgets and signals."""
-        # Cleanup the WidgetCore
-        self._core.cleanup()
-        
-        # Call parent cleanup  
+        self._widget_core.cleanup()
         super().cleanup()
 
 
@@ -854,35 +698,34 @@ class AutoDisableDemoNode(ActiveNode):
         
         # This input port has auto-disable enabled
         self.add_input("auto_disable_source", "float")
-        self.inputs[-1]._auto_disable = True  # Enable auto-disabling
+        self.inputs[-1]._auto_disable = True
         
         # Regular input (no auto-disable)
-        self.add_input("regular_input", "int")  
+        self.add_input("regular_input", "int")
         
         self.add_output("result", "float")
         
         # Create core with label widget
-        self._core = WidgetCore()
+        self._widget_core = WidgetCore()
         
         label = QLabel("Auto-Disable Demo Node")
         label.setStyleSheet("QLabel { color: #ddd; font-weight: bold; }")
         
         # Register the label as display-only (no port created)
-        self._core.register_widget(
+        self._widget_core.register_widget(
             "demo_label", label,
             role="display", datatype="string", default="Auto-Disable Demo Node",
         )
         
-        self.set_content_widget(self._core)
+        self.set_content_widget(self._widget_core)
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Example computation that uses both input types."""
         try:
-            auto_input = inputs.get("auto_disable_source", 0.0)
+            auto_input    = inputs.get("auto_disable_source", 0.0)
             regular_input = inputs.get("regular_input", 1)
             
-            result = auto_input * regular_input
-            
+            result = (auto_input or 0.0) * (regular_input or 1)
             return {"result": result}
         except Exception as e:
             log.error(f"Exception in AutoDisableDemoNode.compute: {e}")
@@ -890,11 +733,10 @@ class AutoDisableDemoNode(ActiveNode):
 
     def cleanup(self) -> None:
         """Teardown."""
-        self._core.cleanup()
+        self._widget_core.cleanup()
         super().cleanup()
 
 
-# Additional helper classes for demonstration purposes
 class SimpleInputNode(ActiveNode):
     """
     Simple node that demonstrates the auto-disabling behavior.
@@ -911,29 +753,28 @@ class SimpleInputNode(ActiveNode):
     def __init__(self, title: str = "Demo Input Node", value: float = 5.0, **kwargs: Any) -> None:
         super().__init__(title=title, **kwargs)
         
-        # Build core with WidgetCore 
-        self._core = WidgetCore()
+        # Build core with WidgetCore
+        self._widget_core = WidgetCore()
         
         spin = QDoubleSpinBox()
         spin.setValue(value)
         spin.setRange(-100.0, 100.0)
         
         # Register the widget with the core
-        self._core.register_widget(
+        self._widget_core.register_widget(
             "output_value", spin,
             role="output", datatype="float", default=5.0,
         )
         
-        # Auto-create ports from registered widgets 
-        for pd in self._core.get_port_definitions():
+        # Auto-create ports from registered widgets
+        for pd in self._widget_core.get_port_definitions():
             if pd.role in (PortRole.OUTPUT, PortRole.BIDIRECTIONAL):
                 self.add_output(pd.name, pd.datatype, pd.description)
         
-        # Connect the core's signal to our handler
-        self._core.value_changed.connect(self._on_core_changed)
-        self.set_content_widget(self._core)
+        # Connect the core's value_changed signal to our handler
+        self._widget_core.value_changed.connect(self._on_core_changed)
+        self.set_content_widget(self._widget_core)
             
-        # Store the initial value
         self._cached_values["output_value"] = value
 
     @Slot(str)
@@ -948,15 +789,12 @@ class SimpleInputNode(ActiveNode):
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Simple computation that returns stored value."""
         try:
-            return {"output_value": self._core.get_port_value("output_value")}
+            return {"output_value": self._widget_core.get_port_value("output_value")}
         except Exception as e:
             log.error(f"Exception in SimpleInputNode.compute: {e}")
             return {"output_value": 0.0}
 
     def cleanup(self) -> None:
         """Teardown."""
-        # Cleanup the WidgetCore
-        self._core.cleanup()
-        
-        # Call parent cleanup  
+        self._widget_core.cleanup()
         super().cleanup()
