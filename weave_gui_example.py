@@ -11,6 +11,10 @@ from PySide6.QtCore import Qt
 if __name__ == "__main__":
     import sys
     from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    
+    # Set Fusion style for full QPalette compliance across all platforms.
+    #app.setStyle("Fusion")
     
     try:
         #from weave.node import Node
@@ -22,23 +26,31 @@ if __name__ == "__main__":
         HAS_UI_COMPONENTS = False
         print("[Warning] UI components missing.")
     
+    # Instantiate the AppThemeBridge so all standard Qt widgets (sidebars,
+    # dock panels, toolbars) automatically track the active Weave theme.
+    try:
+        from weave.app_theme_bridge import AppThemeBridge
+        theme_bridge = AppThemeBridge()   # skins the whole QApplication
+    except ImportError:
+        theme_bridge = None
+        print("[Warning] AppThemeBridge not available; external widgets unstyled.")
+    
     from weave.example_nodes import *
     #from numpynodes import *
     #from dropdownnode import *
-    
-    app = QApplication.instance() or QApplication(sys.argv)
-    
-    scene = Canvas(config={
-        "snapping_enabled": True,
-        "connection_snap_radius": 25.0,
-    })
+
+    #scene = Canvas(config={
+    #    "snapping_enabled": True,
+    #    "connection_snap_radius": 25.0,
+    #})
+    scene = Canvas()
     
     if HAS_UI_COMPONENTS:
         view = CanvasView(scene)
         view.setWindowTitle("Enhanced Node Canvas v12 (Performance Optimized)")
         view.resize(1200, 800)
         view.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
-
+        
         minimap = CanvasMinimap(view, parent=view)
         minimap.set_config(width=220, height=160)
         minimap.show()
@@ -66,6 +78,11 @@ if __name__ == "__main__":
         print("  • Right double-click on port to clear connections")
         print("  • Context menu with node registry")
         print("  • Grid snapping and infinite canvas")
+        print("")
+        if theme_bridge is not None:
+            print("Theme Bridge:")
+            print("  • AppThemeBridge active — external Qt widgets track Weave theme")
+            print("  • WidgetCore palette sync — node widgets follow theme changes")
         
         sys.exit(app.exec())
     else:
