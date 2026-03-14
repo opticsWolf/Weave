@@ -493,44 +493,68 @@ class EditableTitle(QGraphicsTextItem):
             return
         super().keyPressEvent(event)
         
-class ResizeHandle(QGraphicsItem):
-    """
-    Handle for resizing the node - unchanged.
-    """
-    __slots__ = (
-        '_node', '_callback', '_hovered', '_resizing',
-        '_drag_start_screen_pos', '_drag_start_size', '_path', '_rect'
-    )
-
-    def __init__(self, parent: 'Node', callback: Callable[[float, float, bool], None]):
-        super().__init__(parent)
-        self._node = parent
+class ResizeHandle(QGraphicsObject):
+    def __init__(self, node: 'Node', callback: Callable[[float, float, bool], None]):
+        super().__init__(node)
+        self._node = node
         self._callback = callback
         self._hovered = False
         self._resizing = False
-        self._drag_start_screen_pos = QPointF()
-        self._drag_start_size = (0.0, 0.0)
         
         self._path = QPainterPath()
         self._rect = QRectF()
-        self._recalculate_geometry()
+        
+        self._drag_start_screen_pos = QPointF()
+        self._drag_start_size = (0, 0)
         
         self.setAcceptHoverEvents(True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
         self.setZValue(10)
+
+        # Initialize geometry
+        self.update_config()
 
     def _recalculate_geometry(self) -> None:
         cfg = self._node._config
         shift = cfg['resize_handle_offset'] / math.sqrt(2)
         r = cfg['resize_handle_radius']
         
+        # New property: defines length of straight extensions
+        extend = cfg.get('resize_handle_extend', 0.0)
+        
         self._path = QPainterPath()
         vis_rect = QRectF(shift - r, shift - r, 2*r, 2*r)
-        self._path.arcMoveTo(vis_rect, 0)
+        
+        # 1. Move to the top of the upward extension (X is right-bound, Y goes up)
+        self._path.moveTo(shift + r, shift - extend)
+        
+        # 2. The arcTo command implicitly draws a line from the current position 
+        # (the top of our extension) down to the start angle (0 degrees / 3 o'clock)
+        # and then sweeps the quarter circle to -90 degrees (6 o'clock).
         self._path.arcTo(vis_rect, 0, -90)
+        
+        # 3. Draw the line extending to the left from the end of the arc
+        self._path.lineTo(shift - extend, shift + r)
         
         margin = cfg['resize_handle_hover_width']
         total_r = r + margin
-        self._rect = QRectF(shift - total_r, shift - total_r, 2*total_r, 2*total_r)
+        
+        # 4. Expand the bounding rect to account for the new extensions
+        min_x = min(shift - total_r, shift - extend - margin)
+        min_y = min(shift - total_r, shift - extend - margin)
+        max_x = shift + total_r
+        max_y = shift + total_r
+        
+        self._rect = QRectF(min_x, min_y, max_x - min_x, max_y - min_y)
+
+    def update_config(self) -> None:
+        """
+        Refreshes the handle's geometry from the node's current configuration.
+        """
+        if self.scene():
+            self.prepareGeometryChange()
+        self._recalculate_geometry()
+        self.update()
 
     def boundingRect(self) -> QRectF:
         return self._rect
@@ -541,6 +565,7 @@ class ResizeHandle(QGraphicsItem):
         cfg = self._node._config
         stroker.setWidth(cfg['resize_handle_hover_width'] * 2)
         stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
+        # createStroke works beautifully here because self._path is now continuous!
         return stroker.createStroke(self._path)
 
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget: Optional[QWidget] = None) -> None:
@@ -555,6 +580,7 @@ class ResizeHandle(QGraphicsItem):
             
         pen = QPen(color, width)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)

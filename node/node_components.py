@@ -466,7 +466,18 @@ class NodeBody(QGraphicsItem):
         
         self._proxy = QGraphicsProxyWidget(self)
         self._widget = QWidget()
-        self._widget.setStyleSheet("background-color: transparent; color: white;")
+        # The proxy root container must NOT have a stylesheet.
+        # Stylesheets in Qt override QPalette for the widget and ALL
+        # descendants — the old "background-color: transparent; color:
+        # white;" line was cascading to every widget inside the node,
+        # making WidgetCore's palette work invisible.
+        #
+        # Transparent background: QWidget defaults to autoFillBackground=
+        # False, which means it does not paint a background at all — the
+        # QPainter-drawn node body shows through.  WidgetCore sets
+        # autoFillBackground=True on itself and paints body_bg.
+        #
+        # Text colour: inherited from WidgetCore's palette (body_text_color).
         self._widget.setLayout(QVBoxLayout())
         self._widget.layout().setContentsMargins(0, 0, 0, 0)
         self._proxy.setWidget(self._widget)
