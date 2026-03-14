@@ -19,7 +19,56 @@ from weave.portutils import PortUtils, ConnectionFactory
 from weave.stylemanager import StyleManager, StyleCategory
 
 
-class NodeTrace(QGraphicsPathItem):
+class TracePathMixin:
+    """Mixin providing shared path calculation logic for traces."""
+    
+    def _calculate_path(
+        self, 
+        p_src: QPointF, 
+        p_dst: QPointF, 
+        connection_type: str, 
+        start_sign: float = 1.0, 
+        end_sign: float = -1.0
+    ) -> QPainterPath:
+        path = QPainterPath()
+        path.moveTo(p_src)
+
+        if connection_type == "straight":
+            # Initial 20px horizontal line for both start and end ports
+            p1 = QPointF(p_src.x() + start_sign * 20.0, p_src.y())
+            p2 = QPointF(p_dst.x() + end_sign * 20.0, p_dst.y())
+            
+            path.lineTo(p1)
+            path.lineTo(p2)
+            path.lineTo(p_dst)
+
+        elif connection_type == "angular":
+            # Initial 20px horizontal line for both ends, breaks halfway horizontally, turns vertically
+            p1 = QPointF(p_src.x() + start_sign * 10.0, p_src.y())
+            p2 = QPointF(p_dst.x() + end_sign * 10.0, p_dst.y())
+            mid_x = (p1.x() + p2.x()) / 2.0
+            
+            path.lineTo(p1)
+            path.lineTo(mid_x, p1.y())
+            path.lineTo(mid_x, p2.y())
+            path.lineTo(p2)
+            path.lineTo(p_dst)
+
+        else: # "bezier" (default)
+            dist = math.hypot(p_dst.x() - p_src.x(), p_dst.y() - p_src.y())
+            ctrl_dist = min(dist * 0.5, 150.0)
+            if abs(p_dst.x() - p_src.x()) < 50.0 and abs(p_dst.y() - p_src.y()) > 50.0:
+                ctrl_dist = max(ctrl_dist, 50.0)
+
+            cp1 = QPointF(p_src.x() + start_sign * ctrl_dist, p_src.y())
+            cp2 = QPointF(p_dst.x() + end_sign * ctrl_dist, p_dst.y())
+
+            path.cubicTo(cp1, cp2, p_dst)
+            
+        return path
+
+
+class NodeTrace(TracePathMixin, QGraphicsPathItem):
     """Visual representation of a finalized connection."""
 
     __slots__ = (
@@ -27,7 +76,7 @@ class NodeTrace(QGraphicsPathItem):
         '_last_src_pos', '_last_dst_pos',
         '_local_style', '_style_manager',
         '_main_pen', '_outline_pen', '_shadow_pen', '_shadow_offset',
-        '_source_uuid', '_target_uuid',
+        '_source_uuid', '_target_uuid', '_connection_type'
     )
 
     def __init__(
@@ -58,6 +107,7 @@ class NodeTrace(QGraphicsPathItem):
         self._outline_pen = None
         self._shadow_pen = None
         self._shadow_offset = QPointF(0, 0)
+        self._connection_type = "bezier" # Default type
 
         self.refresh_style()
         self._register_connection()
@@ -82,6 +132,16 @@ class NodeTrace(QGraphicsPathItem):
         config = self._style_manager.get_all(StyleCategory.TRACE)
         config.update(self._local_style)
         self._setup_pens(config)
+        
+        # Determine connection type (bezier, straight, angular)
+        self._connection_type = config.get("connection_type", "bezier")
+
+        # Invalidate the position cache so update_path() always redraws the
+        # path with the new connection type, even when no node has moved.
+        self._last_src_pos = QPointF()
+        self._last_dst_pos = QPointF()
+
+        self.update_path()
         self.update()
 
     def _setup_pens(self, config: Dict[str, Any]) -> None:
@@ -169,7 +229,7 @@ class NodeTrace(QGraphicsPathItem):
         self.update_path()
 
     def update_path(self) -> None:
-        """Recalculate and update the bezier path between source and target."""
+        """Recalculate and update the path between source and target based on connection type."""
         src = self.source
         if hasattr(src, 'get_visual_target'):
             src = src.get_visual_target()
@@ -190,19 +250,13 @@ class NodeTrace(QGraphicsPathItem):
         self._last_src_pos = p_src
         self._last_dst_pos = p_dst
 
-        dx = p_dst.x() - p_src.x()
-        dy = p_dst.y() - p_src.y()
-        dist = math.hypot(dx, dy)
-        ctrl_dist = min(dist * 0.5, 150.0)
-        if abs(dx) < 50 and abs(dy) > 50:
-            ctrl_dist = max(ctrl_dist, 50.0)
+        start_sign = PortUtils.get_direction_sign(self.source)
+        if self.target:
+            end_sign = PortUtils.get_direction_sign(self.target)
+        else:
+            end_sign = -start_sign
 
-        cp1 = QPointF(p_src.x() + ctrl_dist, p_src.y())
-        cp2 = QPointF(p_dst.x() - ctrl_dist, p_dst.y())
-
-        path = QPainterPath()
-        path.moveTo(p_src)
-        path.cubicTo(cp1, cp2, p_dst)
+        path = self._calculate_path(p_src, p_dst, self._connection_type, start_sign, end_sign)
         self.setPath(path)
 
     def remove_from_scene(self, trigger_compute: bool = True) -> None:
@@ -236,12 +290,12 @@ class NodeTrace(QGraphicsPathItem):
         painter.drawPath(path)
 
 
-class DragTrace(QGraphicsPathItem):
+class DragTrace(TracePathMixin, QGraphicsPathItem):
     """Temporary visual trace drawn while the user is dragging a new connection."""
 
     __slots__ = (
         "start_pos", "end_pos", "_start_sign", "_local_style", "_style_manager",
-        "_main_pen", "_outline_pen", "_shadow_pen", "_shadow_offset",
+        "_main_pen", "_outline_pen", "_shadow_pen", "_shadow_offset", "_connection_type"
     )
 
     def __init__(
@@ -271,8 +325,14 @@ class DragTrace(QGraphicsPathItem):
         self._outline_pen = None
         self._shadow_pen = None
         self._shadow_offset = QPointF(0, 0)
+        self._connection_type = "bezier"
 
         self.refresh_style()
+        # refresh_style() resets end_pos to QPointF(-1, -1) as a cache-busting
+        # sentinel. Re-anchor it to start_pos so the trace doesn't draw to the
+        # scene origin before the user moves the mouse.
+        self.end_pos = start_pos
+        self.update_path()
         self._style_manager.register(self, StyleCategory.TRACE)
 
     def on_style_changed(self, category: StyleCategory, changes: Dict[str, Any]) -> None:
@@ -282,6 +342,7 @@ class DragTrace(QGraphicsPathItem):
                 'drag_join_style', 'drag_outline_width', 'drag_outline_color',
                 'drag_shadow_enable', 'drag_shadow_color',
                 'drag_shadow_offset_x', 'drag_shadow_offset_y',
+                'connection_type', 'drag_connection_type'
             }
             if drag_keys.intersection(changes.keys()):
                 self.refresh_style()
@@ -314,7 +375,16 @@ class DragTrace(QGraphicsPathItem):
             "shadow_color":    resolve("shadow_color",   "drag_shadow_color"),
             "shadow_offset_x": resolve("shadow_offset_x", "drag_shadow_offset_x"),
             "shadow_offset_y": resolve("shadow_offset_y", "drag_shadow_offset_y"),
+            "connection_type": resolve("connection_type", "drag_connection_type"),
         })
+
+        self._connection_type = resolve("connection_type", "drag_connection_type") or "bezier"
+
+        # Invalidate the position cache so update_path() always redraws the
+        # path with the new connection type, even when the cursor hasn't moved.
+        self.end_pos = QPointF(-1, -1)
+
+        self.update_path()
 
     def _setup_pens(self, config: Dict[str, Any]) -> None:
         """Builds main, outline, and shadow pens from resolved config."""
@@ -363,21 +433,11 @@ class DragTrace(QGraphicsPathItem):
         self.update_path()
 
     def update_path(self) -> None:
-        """Recalculate and update the bezier path."""
+        """Recalculate and update the trace path based on connection type."""
         p_src = self.start_pos
         p_dst = self.end_pos
 
-        dist = math.hypot(p_dst.x() - p_src.x(), p_dst.y() - p_src.y())
-        ctrl_dist = min(dist * 0.5, 150.0)
-        if abs(p_dst.x() - p_src.x()) < 50.0 and abs(p_dst.y() - p_src.y()) > 50.0:
-            ctrl_dist = max(ctrl_dist, 50.0)
-
-        cp1 = QPointF(p_src.x() + self._start_sign * ctrl_dist, p_src.y())
-        cp2 = QPointF(p_dst.x() - self._start_sign * ctrl_dist, p_dst.y())
-
-        path = QPainterPath()
-        path.moveTo(p_src)
-        path.cubicTo(cp1, cp2, p_dst)
+        path = self._calculate_path(p_src, p_dst, self._connection_type, self._start_sign, -self._start_sign)
         self.setPath(path)
 
     def remove_from_scene(self) -> None:
