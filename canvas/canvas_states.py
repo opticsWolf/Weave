@@ -23,7 +23,7 @@ Performance Impact:
 from abc import ABC, abstractmethod
 from collections import deque
 from typing import Optional, List, Type, TypeVar, Sequence
-from PySide6.QtWidgets import QGraphicsSceneMouseEvent, QGraphicsItem, QGraphicsProxyWidget
+from PySide6.QtWidgets import QGraphicsSceneMouseEvent, QGraphicsItem, QGraphicsProxyWidget, QGraphicsTextItem
 from PySide6.QtCore import Qt, QPointF, QElapsedTimer, QTimer
 from PySide6.QtGui import QTransform, QKeyEvent
 import logging
@@ -460,15 +460,39 @@ class IdleState(CanvasInteractionState):
 
     # ── Event handlers ────────────────────────────────────────────────
 
+    def _ensure_node_selected(self, scene_pos: QPointF, event: QGraphicsSceneMouseEvent) -> None:
+        """
+        Ensure the node under *scene_pos* is selected before a widget
+        interaction begins.
+
+        If the node is already selected, this is a no-op.  Otherwise the
+        node is selected (respecting Ctrl for additive selection) exactly
+        as Qt's default ``mousePressEvent`` would do.  This guarantees
+        that clicking directly on a widget inside an unselected node
+        selects the node *and* activates the widget in a single click.
+        """
+        node = ItemResolver.resolve_node_at(self.canvas, scene_pos)
+        if node is None or node.isSelected():
+            return
+
+        # Ctrl held → additive selection; otherwise exclusive
+        if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self.canvas.clearSelection()
+        node.setSelected(True)
+
     def on_mouse_press(self, event: QGraphicsSceneMouseEvent) -> bool:
         """
         Handle mouse press events.
         
         PATCHED: Added proxy widget detection to allow interactive widgets
                  like dropdowns and spinboxes to receive click events properly.
+        PATCHED: Node is now selected before yielding to the widget so that
+                 clicking a widget inside an unselected node selects the node
+                 and activates the widget in one click.
         """
         # ──── Interactive-widget fast-path ─────────────────────────
         if self._is_interactive_widget_click(event.scenePos()):
+            self._ensure_node_selected(event.scenePos(), event)
             return self._yield_to_proxy(event.scenePos())
         # ──── END proxy detection ──────────────────────────────────
 
@@ -618,6 +642,7 @@ class IdleState(CanvasInteractionState):
         """Handle mouse double click."""
         # ──── Interactive-widget fast-path ─────────────────────────
         if self._is_interactive_widget_click(event.scenePos()):
+            self._ensure_node_selected(event.scenePos(), event)
             return self._yield_to_proxy(event.scenePos())
         # ──── END proxy detection ──────────────────────────────────
 
@@ -857,14 +882,19 @@ class IdleState(CanvasInteractionState):
         # lives in Canvas.keyPressEvent (which also force-accepts the
         # event); this is a defence-in-depth layer.
         #
-        # Two independent signals are checked:
+        # Three independent signals are checked:
         # 1. _suppressed_movable_node is set (widget interaction active)
         # 2. A QGraphicsProxyWidget holds keyboard focus
+        # 3. A QGraphicsTextItem with TextEditorInteraction flags holds
+        #    keyboard focus (e.g. EditableTitle in editing mode)
         if self._suppressed_movable_node is not None:
             return False
         focus_item = self.canvas.focusItem()
         if isinstance(focus_item, QGraphicsProxyWidget):
             return False
+        if isinstance(focus_item, QGraphicsTextItem):
+            if focus_item.textInteractionFlags() & Qt.TextInteractionFlag.TextEditable:
+                return False
         # ── End focus guard ────────────────────────────────────────────
 
         modifiers = event.modifiers()

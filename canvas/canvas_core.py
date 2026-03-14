@@ -35,7 +35,7 @@ from enum import IntEnum
 
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal
 from PySide6.QtWidgets import (
-    QGraphicsScene, QGraphicsItem, QGraphicsProxyWidget,
+    QGraphicsScene, QGraphicsItem, QGraphicsProxyWidget, QGraphicsTextItem,
     QGraphicsSceneContextMenuEvent, QGraphicsSceneMouseEvent
 )
 from PySide6.QtGui import QPainter, QTransform, QColor, QPen, QKeyEvent
@@ -104,6 +104,9 @@ class Canvas(QGraphicsScene):
         self._cached_grid_type = GridType.DOTS
         self._cached_grid_spacing = 20
         self._cached_grid_line_width = 2.0
+        self._cached_grid_line_major_width = 2.0
+        self._cached_grid_dot_width = 2.0
+        self._cached_grid_dot_major_width = 3.0
         self._cached_margin = 500
         self._cached_min_width = 3000
         self._cached_min_height = 2000
@@ -112,8 +115,14 @@ class Canvas(QGraphicsScene):
         self._cached_shake_to_disconnect = False
         self._cached_max_visible_grid_lines = 5000
         
-        # Grid pen caching (updated when grid settings change)
-        self._grid_pen = None
+        # Grid pen caching — four QPens for the four width slots.
+        # _grid_line_pen / _grid_dot_pen    → minor (non-accent) element width
+        # _grid_line_major_pen / _grid_dot_major_pen → major (accent) element width
+        # Plain LINES/DOTS modes use the corresponding minor pen.
+        self._grid_line_pen = None
+        self._grid_line_major_pen = None
+        self._grid_dot_pen = None
+        self._grid_dot_major_pen = None
         
         # Sync cache with current StyleManager values FIRST
         self._sync_style_cache()
@@ -183,7 +192,10 @@ class Canvas(QGraphicsScene):
         self._cached_bg_color = canvas_styles.get('bg_color', QColor(30, 33, 40))
         self._cached_grid_color = canvas_styles.get('grid_color', QColor(50, 55, 62))
         self._cached_grid_spacing = canvas_styles.get('grid_spacing', 20)
-        self._cached_grid_line_width = canvas_styles.get('grid_line_width', 2.0)
+        self._cached_grid_line_width = canvas_styles.get('grid_line_width', 1.0)
+        self._cached_grid_line_major_width = canvas_styles.get('grid_line_major_width', 2.0)
+        self._cached_grid_dot_width = canvas_styles.get('grid_dot_width', 2.0)
+        self._cached_grid_dot_major_width = canvas_styles.get('grid_dot_major_width', 3.0)
         self._cached_margin = canvas_styles.get('margin', 500)
         self._cached_min_width = canvas_styles.get('min_width', 3000)
         self._cached_min_height = canvas_styles.get('min_height', 2000)
@@ -203,10 +215,36 @@ class Canvas(QGraphicsScene):
             self._cached_grid_type = grid_type_value
 
     def _update_grid_pen(self):
-        """Update the cached grid pen when grid settings change."""
-        self._grid_pen = QPen(self._cached_grid_color)
-        self._grid_pen.setWidthF(self._cached_grid_line_width)
-        self._grid_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        """
+        Rebuild all four cached grid pens from the current style cache.
+
+        Four pens are maintained to cover the two element types (lines / dots)
+        and the two accent roles (minor / major) independently:
+
+          _grid_line_pen       — minor lines  (LINES and LINES_ACCENT minor pass)
+          _grid_line_major_pen — major lines  (LINES_ACCENT major pass)
+          _grid_dot_pen        — minor dots   (DOTS and DOTS_ACCENT minor pass)
+          _grid_dot_major_pen  — major dots   (DOTS_ACCENT major pass)
+
+        Plain LINES / DOTS modes use only the minor pen; accent modes use both.
+        """
+        color = self._cached_grid_color
+
+        self._grid_line_pen = QPen(color)
+        self._grid_line_pen.setWidthF(self._cached_grid_line_width)
+        self._grid_line_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+
+        self._grid_line_major_pen = QPen(color)
+        self._grid_line_major_pen.setWidthF(self._cached_grid_line_major_width)
+        self._grid_line_major_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+
+        self._grid_dot_pen = QPen(color)
+        self._grid_dot_pen.setWidthF(self._cached_grid_dot_width)
+        self._grid_dot_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+
+        self._grid_dot_major_pen = QPen(color)
+        self._grid_dot_major_pen.setWidthF(self._cached_grid_dot_major_width)
+        self._grid_dot_major_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
 
     def on_style_changed(self, category, changes):
         """
@@ -232,7 +270,9 @@ class Canvas(QGraphicsScene):
             self.setBackgroundBrush(self._cached_bg_color)
             
         # Handle grid settings that affect pen caching
-        if any(key in changes for key in ('grid_color', 'grid_line_width')):
+        _PEN_KEYS = ('grid_color', 'grid_line_width', 'grid_line_major_width',
+                     'grid_dot_width', 'grid_dot_major_width')
+        if any(key in changes for key in _PEN_KEYS):
             self._update_grid_pen()
             
         # Update orchestrator bounds if layout constants change
@@ -377,8 +417,18 @@ class Canvas(QGraphicsScene):
         max_lines = self._cached_max_visible_grid_lines
         
         if self._grid_renderer.should_render(rect, spacing, max_lines, grid_type):
+            # Select the minor/major pen pair that matches the active grid type.
+            # Plain modes (LINES, DOTS) only use the minor pen; accent modes
+            # use both so the renderer can draw each weight in a single pass.
+            if grid_type in (GridType.DOTS, GridType.DOTS_ACCENT):
+                pen       = self._grid_dot_pen
+                major_pen = self._grid_dot_major_pen
+            else:
+                pen       = self._grid_line_pen
+                major_pen = self._grid_line_major_pen
+
             self._grid_renderer.draw_grid(
-                painter, rect, spacing, self._grid_pen, grid_type
+                painter, rect, spacing, pen, grid_type, major_pen
             )
 
     # ==========================================================================
@@ -569,20 +619,29 @@ class Canvas(QGraphicsScene):
         Return ``True`` when the user is interacting with an embedded
         widget inside a node.
 
-        Detection uses two independent signals (either is sufficient):
+        Detection uses three independent signals (any is sufficient):
 
         1. The current state's ``_suppressed_movable_node`` is set,
            meaning ``_yield_to_proxy()`` has temporarily disabled node
            dragging so the widget can receive mouse events.
         2. A ``QGraphicsProxyWidget`` is the scene's current focus item,
            meaning the user has clicked into a widget and is typing.
+        3. A ``QGraphicsTextItem`` with ``TextEditorInteraction`` flags
+           is the scene's current focus item, meaning the user is
+           editing an inline text item such as the node title.
         """
         # Signal 1: state machine flagged a widget interaction
         if getattr(self._current_state, '_suppressed_movable_node', None) is not None:
             return True
         # Signal 2: a proxy widget currently holds keyboard focus
-        if isinstance(self.focusItem(), QGraphicsProxyWidget):
+        focus = self.focusItem()
+        if isinstance(focus, QGraphicsProxyWidget):
             return True
+        # Signal 3: an inline text item is in editing mode
+        if isinstance(focus, QGraphicsTextItem):
+            flags = focus.textInteractionFlags()
+            if flags & Qt.TextInteractionFlag.TextEditable:
+                return True
         return False
 
     def _get_editing_proxy(self) -> Optional[QGraphicsProxyWidget]:
@@ -649,8 +708,9 @@ class Canvas(QGraphicsScene):
 
         * Restores the ``ItemIsMovable`` flag on the node whose movability
           was suppressed by ``_yield_to_proxy()``.
-        * Clears keyboard focus from the ``QGraphicsProxyWidget`` so that
-          subsequent key events reach the canvas shortcut handler again.
+        * Clears keyboard focus from the ``QGraphicsProxyWidget`` or
+          ``QGraphicsTextItem`` so that subsequent key events reach the
+          canvas shortcut handler again.
         """
         # Restore movable flag
         state = self._current_state
@@ -662,9 +722,9 @@ class Canvas(QGraphicsScene):
                 pass  # node already deleted
             state._suppressed_movable_node = None
 
-        # Clear proxy focus
+        # Clear focus from proxy or inline text item
         focus_item = self.focusItem()
-        if isinstance(focus_item, QGraphicsProxyWidget):
+        if isinstance(focus_item, (QGraphicsProxyWidget, QGraphicsTextItem)):
             focus_item.clearFocus()
     
     def _duplicate_selected_nodes(self) -> None:
@@ -772,5 +832,20 @@ class Canvas(QGraphicsScene):
 
     @property
     def grid_line_width(self) -> float:
-        """Grid line width - cached value."""
+        """Minor grid line width (LINES / LINES_ACCENT minor pass) - cached value."""
         return self._cached_grid_line_width
+
+    @property
+    def grid_line_major_width(self) -> float:
+        """Major grid line width (LINES_ACCENT major pass) - cached value."""
+        return self._cached_grid_line_major_width
+
+    @property
+    def grid_dot_width(self) -> float:
+        """Minor grid dot width (DOTS / DOTS_ACCENT minor pass) - cached value."""
+        return self._cached_grid_dot_width
+
+    @property
+    def grid_dot_major_width(self) -> float:
+        """Major grid dot width (DOTS_ACCENT major pass) - cached value."""
+        return self._cached_grid_dot_major_width
