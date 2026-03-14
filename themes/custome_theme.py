@@ -16,6 +16,7 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
         StyleCategory.CANVAS: {
             "bg_color": [240, 242, 245, 255],
             "grid_color": [200, 205, 210, 255],
+            "grid_type": 3,
             "shake_to_disconnect": True,
             "min_stroke_length": 100,
             "min_direction_changes": 4,
@@ -24,16 +25,20 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
         StyleCategory.NODE: {
             "header_bg": [54, 81, 217, 255],
             "header_color_palette": [
-                [54, 81, 217, 255], [54, 163, 217, 255], [54, 217, 190, 255], 
-                [54, 217, 108, 255], [81, 217, 54, 255], [163, 217, 54, 255], 
-                [217, 190, 54, 255], [217, 108, 54, 255], [217, 54, 81, 255], 
-                [217, 54, 163, 255], [190, 54, 217, 255], [108, 54, 217, 255]
-                ],
+               [59, 86, 222, 255], [59, 168, 222, 255], [59, 222, 195, 255],
+               [59, 222, 113, 255], [86, 222, 59, 255], [168, 222, 59, 255], 
+               [222, 195, 59, 255], [222, 113, 59, 255],[222, 59, 86, 255], 
+               [222, 59, 168, 255], [195, 59, 222, 255], [113, 59, 222, 255]
+               ],
+            'header_gradient_shift': 20,
+            'header_bottom_line_shift': -30,
+            'hl_title_bright': -25,
             "body_bg": [250, 252, 255, 255],
             "outline_color": [180, 185, 190, 255],
-            "title_text_color": [255, 255, 255, 255],
-            "resize_handle_color": [160, 165, 172, 255],
-            "resize_handle_hover_color": [100, 110, 130, 255],
+            "title_text_color": [30, 35, 40, 255],
+            "body_text_color": [50, 55, 65, 255],
+            "resize_handle_color": [120, 123, 128, 255],
+            "resize_handle_hover_color": [160, 163, 168, 255],
             "font_weight": "normal",
         },
         StyleCategory.PORT: {
@@ -44,6 +49,7 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
         StyleCategory.TRACE: {
             "outline_color": [0, 0, 0, 32],
             "shadow_color": [0, 0, 0, 24],
+            "connection_type": "straight",
             "style": "solid",
         },
         StyleCategory.MINIMAP: {
@@ -70,15 +76,35 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
                 [217, 54, 163, 255], [190, 54, 217, 255], [108, 54, 217, 255]
                 ],
             "body_bg": [22, 25, 32, 255],
+            'title_text_color': [30, 35, 45, 255],
+            'body_text_color': [200, 205, 220, 255],
+            'header_gradient_shift': 20,
+            'header_bottom_line_shift': -20,
+            'hl_title_bright': -25,
             "outline_color": [10, 12, 18, 255],
+            'radius': 6,
+            'border_width': 2.5,
+            'resize_handle_radius': 9,
+            'resize_handle_extend': 4,
+            'resize_handle_offset': -6,
+            'resize_handle_width': 2.5,
+            'resize_handle_hover_width': 3.0
         },
         StyleCategory.PORT: {
             "inner_color": [28, 32, 40, 255],
+            "radius": 9,
+            "offset": 4,
+            "inner_radius": 6,
+            "highlight": -35
+        },
+        StyleCategory.TRACE: {
+            "connection_type": "angular",
         },
         StyleCategory.MINIMAP: {
             "bg_color": [20, 24, 32, 180],
             "border_color": [45, 50, 60, 200],
         },
+
     },
     "warm": {
         StyleCategory.CANVAS: {
@@ -95,6 +121,7 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
                 ],
             "body_bg": [55, 48, 44, 255],
             "title_text_color": [255, 245, 230, 255],
+            "body_text_color": [230, 220, 200, 255],
             "sel_border_color": [200, 140, 80, 255],
             "hover_glow_color": [180, 130, 100, 255],
             "font_weight": "bold",

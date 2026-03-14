@@ -31,9 +31,12 @@ class CanvasStyleSchema:
     """Canvas/Grid style purely defines structure. Mutable defaults handled by Manager."""
     bg_color: Optional[List[int]] = None
     grid_color: Optional[List[int]] = None
-    grid_type: int = 1
+    grid_type: int = 2
     grid_spacing: int = 20
-    grid_line_width: float = 2.0
+    grid_line_width: float = 0.75
+    grid_line_major_width: float = 2.0
+    grid_dot_width: float = 2.5
+    grid_dot_major_width: float = 4.0
     margin: int = 500
     min_width: int = 3000
     min_height: int = 2000
@@ -83,7 +86,8 @@ class NodeStyleSchema:
     
     # Resize Handle
     resize_handle_radius: int = 10
-    resize_handle_offset: int = -15
+    resize_handle_extend: int = 0
+    resize_handle_offset: int = -14
     resize_handle_width: int = 3
     resize_handle_hover_width: int = 4
     resize_handle_color: Optional[List[int]] = None
@@ -94,6 +98,7 @@ class NodeStyleSchema:
     body_bg: Optional[List[int]] = None
     outline_color: Optional[List[int]] = None
     title_text_color: Optional[List[int]] = None
+    body_text_color: Optional[List[int]] = None
     
     # Header Color Palette
     header_color_palette: Optional[List[List[int]]] = None
@@ -229,6 +234,7 @@ class TraceStyleSchema:
     """Connection trace style defaults using list-based color and enum string definitions."""
     width: float = 3.0
     color: Optional[List[int]] = None
+    connection_type: str = "bezier"
     style: Union[str, int, Qt.PenStyle] = "solid"
     cap_style: Union[str, int, Qt.PenCapStyle] = "round"
     join_style: Union[str, int, Qt.PenJoinStyle] = "round"
@@ -314,6 +320,7 @@ BASE_DEFAULTS: Dict[StyleCategory, Dict[str, Any]] = {
         "body_bg": [38, 41, 46, 255],
         "outline_color": [20, 20, 20, 255],
         "title_text_color": [224, 236, 255, 255],
+        "body_text_color": [200, 205, 215, 255],
         "header_color_palette": [
                 [32, 64, 128, 255], [32, 112, 128, 255], [32, 128, 96, 255], 
                 [32, 128, 48, 255], [64, 128, 32, 255], [112, 128, 32, 255], 
