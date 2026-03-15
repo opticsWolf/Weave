@@ -263,8 +263,8 @@ class TraceStyleSchema:
 @dataclass
 class MinimapStyleSchema:
     """Minimap widget style defaults using list-based color and enum string definitions."""
-    width: int = 240
-    height: int = 180
+    width: int = 200
+    height: int = 150
     margin: int = 20
     minimized_size: int = 40
     

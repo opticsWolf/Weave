@@ -60,6 +60,7 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
             "node_color": [180, 185, 195, 255],
             "text_color": [80, 85, 95, 255],
             "active_icon_color": [80, 85, 95, 255],
+            "corner_radius": 8,
         },
     },
     "midnight": {
@@ -103,6 +104,10 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
         StyleCategory.MINIMAP: {
             "bg_color": [20, 24, 32, 180],
             "border_color": [45, 50, 60, 200],
+            "snap_color": [65, 70, 80, 164],
+            "corner_radius": 6,
+            "width": 220,
+            "height": 145,
         },
 
     },
