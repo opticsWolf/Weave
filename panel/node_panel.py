@@ -109,12 +109,14 @@ class NodePanel(QWidget):
     node_bound = Signal(object)
     node_unbound = Signal()
     linked_node_lost = Signal()
+    pin_changed = Signal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
 
         self._node: Optional["Node"] = None
         self._static: bool = False
+        self._pinned: bool = False
         # True only while _watch_node_lifetime() connections are live.
         # Guards all _unwatch_node_lifetime() disconnect calls so we never
         # attempt to disconnect signals that were never connected (dynamic
@@ -132,7 +134,7 @@ class NodePanel(QWidget):
 
         # Header
         self._header = PanelHeader(self)
-        self._header.unlink_clicked.connect(self._on_unlink_clicked)
+        self._header.pin_toggled.connect(self._on_pin_toggled)
         root.addWidget(self._header)
 
         # Separator
@@ -174,6 +176,16 @@ class NodePanel(QWidget):
         """``True`` if the panel is statically pinned to a node."""
         return self._static
 
+    @property
+    def is_pinned(self) -> bool:
+        """``True`` if the panel is perma-linked to its current node.
+
+        A pinned panel ignores canvas selection changes until the user
+        unpins it or the node is deleted.  Only meaningful for dynamic
+        panels — static panels are inherently pinned.
+        """
+        return self._pinned
+
     # ──────────────────────────────────────────────────────────────────────
     # Custom factory registration
     # ──────────────────────────────────────────────────────────────────────
@@ -190,6 +202,36 @@ class NodePanel(QWidget):
         class, not a base class).
         """
         self._custom_factories[widget_type] = factory
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Pin toggle (dynamic panels only)
+    # ──────────────────────────────────────────────────────────────────────
+
+    @Slot(bool)
+    def _on_pin_toggled(self, pinned: bool) -> None:
+        """Handle the header pin button toggle.
+
+        When *pinned* is True the panel is perma-linked to its current
+        node: canvas selection changes are ignored, and the node's
+        lifetime is watched so the panel cleans up if the node is
+        deleted.  When *pinned* is False normal dynamic behaviour
+        resumes.
+        """
+        if self._node is None or self._static:
+            return
+
+        self._pinned = pinned
+
+        if pinned:
+            # Start watching the node so deletion unpins automatically.
+            if not self._watching_lifetime:
+                self._watch_node_lifetime(self._node)
+        else:
+            # Stop watching — _unbind_internal or a future bind_node
+            # will handle cleanup.
+            self._unwatch_node_lifetime(self._node)
+
+        self.pin_changed.emit(pinned)
 
     # ──────────────────────────────────────────────────────────────────────
     # Bind / Unbind
@@ -212,11 +254,12 @@ class NodePanel(QWidget):
         if self._node is node:
             return
 
-        # Static panels refuse to be rebound to a different node.
-        if self._static and self._node is not None:
+        # Static and pinned panels refuse to be rebound to a different node.
+        if (self._static or self._pinned) and self._node is not None:
             log.debug(
-                "Static panel already bound — ignoring bind_node() for "
-                f"'{self._node_title(node)}'."
+                "Panel is locked (static=%s, pinned=%s) — ignoring "
+                "bind_node() for '%s'.",
+                self._static, self._pinned, self._node_title(node),
             )
             return
 
@@ -233,17 +276,40 @@ class NodePanel(QWidget):
         self._node = node
         self._static = static
         self._header.set_title(self._node_title(node))
-        self._header.set_unlink_visible(True)
         self._build_mirrors()
 
+        # Show the current node state in the header badge.
+        state = getattr(node, "_state", None)
+        if state is not None:
+            name = state.name if hasattr(state, "name") else str(state)
+            self._header.set_state_text(name)
+
+        # Pin button: visible for dynamic panels, hidden for static.
+        self._header.set_pin_visible(not static)
+        self._header.set_pin_checked(False)
+        self._pinned = False
+
         # Listen for value changes coming FROM the node.
+        # value_changed fires on user edits (not suppressed).
+        # port_value_written fires on every programmatic write via
+        # set_port_value (upstream data, on_evaluate_finished, etc.)
+        # which is suppressed for value_changed.  Between the two,
+        # the mirror sees every change regardless of source.
         if wc is not None:
             wc.value_changed.connect(self._on_node_value_changed)
+            wc.port_value_written.connect(self._on_node_value_changed)
 
         # Listen for node state changes to update the header badge.
         if hasattr(node, "state_changed"):
             try:
                 node.state_changed.connect(self._on_node_state_changed)
+            except (RuntimeError, TypeError):
+                pass
+
+        # Listen for title edits on the node's EditableTitle.
+        if hasattr(node, "title_changed"):
+            try:
+                node.title_changed.connect(self._on_node_title_changed)
             except (RuntimeError, TypeError):
                 pass
 
@@ -275,10 +341,14 @@ class NodePanel(QWidget):
         node = self._node
         wc = getattr(node, "_widget_core", None)
 
-        # Disconnect WidgetCore signal
+        # Disconnect WidgetCore signals
         if wc is not None:
             try:
                 wc.value_changed.disconnect(self._on_node_value_changed)
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                wc.port_value_written.disconnect(self._on_node_value_changed)
             except (RuntimeError, TypeError):
                 pass
 
@@ -289,14 +359,23 @@ class NodePanel(QWidget):
             except (RuntimeError, TypeError):
                 pass
 
+        # Disconnect title_changed
+        if hasattr(node, "title_changed"):
+            try:
+                node.title_changed.disconnect(self._on_node_title_changed)
+            except (RuntimeError, TypeError):
+                pass
+
         # Stop watching lifetime
         self._unwatch_node_lifetime(node)
 
         self._tear_down_mirrors()
         self._node = None
+        self._pinned = False
         self._header.set_title("")
         self._header.set_state_text("")
-        self._header.set_unlink_visible(False)
+        self._header.set_pin_visible(False)
+        self._header.set_pin_checked(False)
 
         # Re-add placeholder
         self._placeholder.setParent(self._body)
@@ -304,15 +383,6 @@ class NodePanel(QWidget):
         self._placeholder.show()
 
         self.node_unbound.emit()
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Unlink button
-    # ──────────────────────────────────────────────────────────────────────
-
-    @Slot()
-    def _on_unlink_clicked(self) -> None:
-        """Handle the header Unlink button."""
-        self.unbind()
 
     # ──────────────────────────────────────────────────────────────────────
     # Node lifetime watching (for static mode)
@@ -439,9 +509,11 @@ class NodePanel(QWidget):
         self._tear_down_mirrors()
         self._node = None
         self._static = False
+        self._pinned = False
         self._header.set_title("[deleted]")
         self._header.set_state_text("")
-        self._header.set_unlink_visible(False)
+        self._header.set_pin_visible(False)
+        self._header.set_pin_checked(False)
 
         self._placeholder.setParent(self._body)
         self._form.addRow(self._placeholder)
@@ -591,7 +663,19 @@ class NodePanel(QWidget):
         def _on_mirror_edited(*_args, _pn=port_name, _m=mirror, _wc=wc):
             from weave.widgetcore import WidgetCore
             value = WidgetCore._generic_get(_m)
+            # Push the value into the node's widget (signals blocked so the
+            # widget's own change signal doesn't fire).
             _wc.set_port_value(_pn, value)
+            # Explicitly notify the node that the value changed.
+            # set_port_value suppresses the widget's change signal to avoid
+            # feedback loops, but this means the node's compute() pipeline
+            # never triggers.  Emitting value_changed here closes the gap:
+            # the node sees the change, reads the (already updated) widget,
+            # and runs compute().
+            # This also triggers _on_node_value_changed on this panel, which
+            # writes the same value back into the mirror with signals blocked
+            # — no infinite loop.
+            _wc.value_changed.emit(_pn)
 
         sig.connect(_on_mirror_edited)
         self._mirror_slots[port_name] = _on_mirror_edited
@@ -653,6 +737,15 @@ class NodePanel(QWidget):
     def _on_node_state_changed(self, _old_state, new_state) -> None:
         name = new_state.name if hasattr(new_state, "name") else str(new_state)
         self._header.set_state_text(name)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Title sync
+    # ──────────────────────────────────────────────────────────────────────
+
+    @Slot(str)
+    def _on_node_title_changed(self, new_title: str) -> None:
+        """The node's EditableTitle was edited — update the panel header."""
+        self._header.set_title(new_title)
 
     # ──────────────────────────────────────────────────────────────────────
     # Helpers
