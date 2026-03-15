@@ -19,6 +19,7 @@ from PySide6.QtCore import QPointF, Qt, QTimer, QEvent, QSettings
 from PySide6.QtGui import QAction, QKeySequence, QColor, QPixmap, QIcon
 
 from weave.stylemanager import StyleManager, StyleCategory
+from weave.canvas.canvas_grid import GridType
 from weave.canvas.commands_mixin import CanvasCommandsMixin, HAS_NODE_COMPONENTS, HAS_SERIALIZER
 from weave.node.node_trace import NodeTrace, DragTrace
 
@@ -402,6 +403,31 @@ class ContextMenuProvider(CanvasCommandsMixin):
         delete_action.triggered.connect(lambda: self.cmd_delete(target_item))
         menu.addAction(delete_action)
         
+        menu.addSeparator()
+
+        # Action: Add Inspector (creates a new dynamic dock)
+        if not is_multi_selection:
+            add_insp = QAction("Add Inspector", menu)
+            add_insp.triggered.connect(self.cmd_add_dynamic_panel)
+            menu.addAction(add_insp)
+
+        # Action: Mirror to Panel (static dock)
+        if not is_multi_selection:
+            if self.has_static_panel(root_node):
+                remove_panel = QAction("Remove Panel", menu)
+                remove_panel.triggered.connect(
+                    lambda: self.cmd_remove_static_panel(root_node)
+                )
+                menu.addAction(remove_panel)
+            else:
+                mirror_action = QAction("Mirror to Panel", menu)
+                mirror_action.triggered.connect(
+                    lambda: self.cmd_mirror_node(root_node)
+                )
+                menu.addAction(mirror_action)
+
+        menu.addSeparator()
+
         # Action: Clear Canvas (only for single node selection or no selection)
         clear_canvas_action = QAction("Clear Canvas", menu)
         clear_canvas_action.setShortcut("Ctrl+Shift+C")  # Using Ctrl+Shift+C to avoid conflicts
@@ -453,8 +479,8 @@ class ContextMenuProvider(CanvasCommandsMixin):
 
         menu.addSeparator()
 
-        # --- Themes submenu ---
-        self._build_themes_submenu(menu)
+        # --- Styles submenu (Themes, Grid Style, Trace Style) ---
+        self._build_styles_submenu(menu)
     
     def _build_registry_actions(self, menu: QMenu, scene_pos: QPointF) -> None:
         """
@@ -517,14 +543,19 @@ class ContextMenuProvider(CanvasCommandsMixin):
         
         menu.addSeparator()
         
+        # --- Panels submenu ---
+        self._build_panels_submenu(menu)
+
+        menu.addSeparator()
+
         if not HAS_REGISTRY or NODE_REGISTRY is None:
             no_reg = QAction("Node Registry Unavailable", menu)
             no_reg.setEnabled(False)
             menu.addAction(no_reg)
             return
         
-        # --- Themes submenu ---
-        self._build_themes_submenu(menu)
+        # --- Styles submenu (Themes, Grid Style, Trace Style) ---
+        self._build_styles_submenu(menu)
 
         menu.addSeparator()
 
@@ -606,6 +637,45 @@ class ContextMenuProvider(CanvasCommandsMixin):
         return getattr(node_cls, 'node_name', None) or getattr(node_cls, '__name__', 'Unknown Node')
 
     # ==========================================================================
+    # GRID TYPE SUBMENU
+    # ==========================================================================
+
+    # Human-readable labels for every GridType variant.
+    _GRID_TYPE_LABELS = {
+        GridType.LINES:        "Lines",
+        GridType.DOTS:         "Dots",
+        GridType.LINES_ACCENT: "Lines (Accented)",
+        GridType.DOTS_ACCENT:  "Dots (Accented)",
+        GridType.NONE:         "None",
+    }
+
+    def _build_grid_type_submenu(self, parent_menu: QMenu) -> None:
+        """
+        Append a "Grid Style" submenu to *parent_menu*.
+
+        The currently active GridType is shown with a checkmark.
+        Selecting an entry delegates to :meth:`cmd_set_grid_type` so the
+        change flows through StyleManager and updates the canvas cache.
+        """
+        # Read the current grid type directly from the cached canvas property
+        # so the checkmark is always accurate even after theme switches.
+        canvas_styles = StyleManager.instance().get_all(StyleCategory.CANVAS)
+        raw = canvas_styles.get('grid_type', GridType.DOTS)
+        try:
+            current_type = GridType(raw) if isinstance(raw, int) else raw
+        except ValueError:
+            current_type = GridType.DOTS
+
+        grid_menu = parent_menu.addMenu("Grid Style")
+
+        for grid_type, label in self._GRID_TYPE_LABELS.items():
+            action = QAction(label, grid_menu)
+            action.setCheckable(True)
+            action.setChecked(grid_type == current_type)
+            action.triggered.connect(partial(self.cmd_set_grid_type, grid_type))
+            grid_menu.addAction(action)
+
+    # ==========================================================================
     # THEME SUBMENU
     # ==========================================================================
 
@@ -685,6 +755,111 @@ class ContextMenuProvider(CanvasCommandsMixin):
         else:
             log.warning(f"Failed to load theme from '{filepath}'")
     
+    # ==========================================================================
+    # TRACE STYLE SUBMENU
+    # ==========================================================================
+
+    # Human-readable labels for every supported trace connection type.
+    _TRACE_STYLE_LABELS = {
+        "bezier":   "Bézier",
+        "straight": "Straight",
+        "angular":  "Angular",
+    }
+
+    def _build_trace_style_submenu(self, parent_menu: QMenu) -> None:
+        """
+        Append a "Trace Style" submenu to *parent_menu*.
+
+        The currently active connection_type is shown with a checkmark.
+        Selecting an entry calls :meth:`cmd_set_trace_style` so the change
+        propagates through StyleManager and every live NodeTrace / DragTrace
+        rebuilds its path automatically.
+        """
+        trace_styles = StyleManager.instance().get_all(StyleCategory.TRACE)
+        current_type = trace_styles.get("connection_type", "bezier")
+
+        trace_menu = parent_menu.addMenu("Trace Style")
+
+        for key, label in self._TRACE_STYLE_LABELS.items():
+            action = QAction(label, trace_menu)
+            action.setCheckable(True)
+            action.setChecked(key == current_type)
+            action.triggered.connect(partial(self.cmd_set_trace_style, key))
+            trace_menu.addAction(action)
+
+    # ==========================================================================
+    # STYLES SUBMENU (groups Themes, Grid Style, Trace Style)
+    # ==========================================================================
+
+    def _build_styles_submenu(self, parent_menu: QMenu) -> None:
+        """
+        Append a "Styles" submenu to *parent_menu* that contains the
+        Themes, Grid Style, and Trace Style submenus.
+        """
+        styles_menu = parent_menu.addMenu("Styles")
+        self._build_themes_submenu(styles_menu)
+        self._build_grid_type_submenu(styles_menu)
+        self._build_trace_style_submenu(styles_menu)
+
+    # ==========================================================================
+    # PANELS SUBMENU
+    # ==========================================================================
+
+    def _build_panels_submenu(self, parent_menu: QMenu) -> None:
+        """
+        Append a "Panels" submenu to *parent_menu*.
+
+        Contains:
+        - Add Inspector        (always — creates a new dynamic dock)
+        - Show All Inspectors  (if any exist)
+        - Hide All Inspectors  (if any exist)
+        - separator
+        - Show All Panels
+        - Hide All Panels
+        - separator
+        - Close All Panels
+        """
+        panels_menu = parent_menu.addMenu("Panels")
+
+        # ── Inspectors ───────────────────────────────────────────────
+        add_insp = QAction("Add Inspector", panels_menu)
+        add_insp.triggered.connect(self.cmd_add_dynamic_panel)
+        panels_menu.addAction(add_insp)
+
+        has_inspectors = bool(self._dynamic_docks)
+
+        show_insp = QAction("Show All Inspectors", panels_menu)
+        show_insp.setEnabled(has_inspectors)
+        show_insp.triggered.connect(self.cmd_show_all_dynamic_panels)
+        panels_menu.addAction(show_insp)
+
+        hide_insp = QAction("Hide All Inspectors", panels_menu)
+        hide_insp.setEnabled(has_inspectors)
+        hide_insp.triggered.connect(self.cmd_hide_all_dynamic_panels)
+        panels_menu.addAction(hide_insp)
+
+        panels_menu.addSeparator()
+
+        # ── Bulk show / hide / close ─────────────────────────────────
+        has_any = has_inspectors or bool(self._static_docks)
+
+        show_all = QAction("Show All Panels", panels_menu)
+        show_all.setEnabled(has_any)
+        show_all.triggered.connect(self.cmd_show_all_panels)
+        panels_menu.addAction(show_all)
+
+        hide_all = QAction("Hide All Panels", panels_menu)
+        hide_all.setEnabled(has_any)
+        hide_all.triggered.connect(self.cmd_hide_all_panels)
+        panels_menu.addAction(hide_all)
+
+        panels_menu.addSeparator()
+
+        close_all = QAction("Close All Panels", panels_menu)
+        close_all.setEnabled(has_any)
+        close_all.triggered.connect(self.cmd_close_all_panels)
+        panels_menu.addAction(close_all)
+
     # ==========================================================================
     # HEADER COLOR HANDLER
     # ==========================================================================

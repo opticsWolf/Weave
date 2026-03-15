@@ -150,8 +150,16 @@ class CanvasView(QGraphicsView):
             QTimer.singleShot(0, self._reapply_theme)
 
     def _reapply_theme(self) -> None:
-        """Reapply the current theme now that geometry is settled."""
-        self._style_manager.apply_theme(self._style_manager.current_theme)
+        """Reapply the current theme + workspace prefs now that geometry is settled.
+
+        Uses ``apply_theme_and_prefs`` so that the user's persisted
+        grid type, trace style, and snapping override the theme defaults
+        — matching exactly what ``_boot()`` established before the
+        view's geometry was ready.
+        """
+        self._style_manager.apply_theme_and_prefs(
+            self._style_manager.current_theme
+        )
 
     def wheelEvent(self, event):
         """Zoom with configurable limits and sensitivity."""
@@ -312,3 +320,16 @@ class CanvasView(QGraphicsView):
         zoom_keys = {'zoom_min', 'zoom_max', 'zoom_factor', 'scrollbar_policy'}
         if zoom_keys & changes.keys():
             self.set_config(**self._get_canvas_config())
+
+    # ==========================================================================
+    # Shutdown
+    # ==========================================================================
+
+    def closeEvent(self, event) -> None:
+        """Persist workspace preferences (grid, trace, snapping) on close.
+
+        The view is typically the last widget destroyed, so this is the
+        safest place to flush preferences to QSettings.
+        """
+        self._style_manager.persist_all()
+        super().closeEvent(event)

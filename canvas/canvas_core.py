@@ -155,6 +155,11 @@ class Canvas(QGraphicsScene):
         # State Machine
         self._current_state: CanvasInteractionState = IdleState(self)
 
+        # Re-entrancy guard: set True while inside super().mousePressEvent()
+        # to prevent re-entrant mouseMoveEvent calls from moving nodes.
+        # See mousePressEvent / mouseMoveEvent for details.
+        self._in_press_dispatch = False
+
         # Setup initial background
         self.setBackgroundBrush(self._cached_bg_color)
         
@@ -462,17 +467,34 @@ class Canvas(QGraphicsScene):
         """
         Delegate to state machine.
 
-        After Qt's default ``mousePressEvent`` runs, re-assert proxy focus
-        if the user clicked into an embedded widget.  The default handler
-        may shift scene focus to the **parent node** (it is the topmost
-        selectable item), which steals focus from the proxy and makes the
-        embedded widget's cursor disappear.
+        Re-entrancy guard
+        -----------------
+        ``super().mousePressEvent()`` may trigger ``selectionChanged``,
+        whose subscribers (e.g. dock adapter, property panel) can do UI
+        work that forces Qt to process pending events.  If a queued
+        ``mouseMoveEvent`` is delivered during that processing, Qt moves
+        the node with an incomplete drag offset — causing a visible jump.
+
+        ``_in_press_dispatch`` blocks ``mouseMoveEvent`` from calling
+        ``super().mouseMoveEvent()`` while we are still inside the press
+        handler, breaking the re-entrant chain.
+
+        Proxy focus
+        -----------
+        After Qt's default handler runs, proxy focus is re-asserted if
+        the user clicked into an embedded widget.  The default handler
+        may shift scene focus to the **parent node** (the topmost
+        selectable item), stealing focus from the proxy.
         """
         if self._current_state.on_mouse_press(event):
             event.accept()
             return
 
-        super().mousePressEvent(event)
+        self._in_press_dispatch = True
+        try:
+            super().mousePressEvent(event)
+        finally:
+            self._in_press_dispatch = False
 
         # Re-assert proxy focus after super()'s default handling.
         if self._is_widget_editing():
@@ -484,7 +506,11 @@ class Canvas(QGraphicsScene):
             event.accept()
             return
         
-        super().mouseDoubleClickEvent(event)
+        self._in_press_dispatch = True
+        try:
+            super().mouseDoubleClickEvent(event)
+        finally:
+            self._in_press_dispatch = False
 
         if self._is_widget_editing():
             self._ensure_proxy_focus()
@@ -508,6 +534,17 @@ class Canvas(QGraphicsScene):
         """
         Delegate to state machine, then apply grid snapping.
         
+        Re-entrancy guard
+        -----------------
+        If this method is called while ``mousePressEvent`` is still on
+        the stack (``_in_press_dispatch is True``), skip all processing.
+        Re-entrant moves happen when a ``selectionChanged`` subscriber
+        does UI work (e.g. ``QWidget.setVisible``) that forces Qt to
+        drain the event queue.  At that point Qt's drag offset is not
+        yet finalized, so ``super().mouseMoveEvent()`` would jump the
+        node to an incorrect position.  Dropping the move is safe — Qt
+        will deliver a proper move event on the next pointer update.
+
         Grid snapping must be applied AFTER Qt's default move behavior
         so that items have been repositioned first.
         
@@ -523,6 +560,11 @@ class Canvas(QGraphicsScene):
             entirely.  Repositioning a node while a combo-box popup is
             open would detach the popup from the widget visually.
         """
+        # ── Re-entrancy guard ─────────────────────────────────────────
+        if self._in_press_dispatch:
+            return
+        # ── End re-entrancy guard ─────────────────────────────────────
+
         # Let state handle the move first (ConnectionDragState consumes this)
         if self._current_state.on_mouse_move(event):
             event.accept()

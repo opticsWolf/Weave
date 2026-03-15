@@ -38,6 +38,9 @@ from weave.canvas.states.connection_drag_state import ConnectionDragState
 from weave.canvas.states.state_utils import OptimizedShakeRecognizer, ItemResolver
 from weave.canvas.commands_mixin import CanvasCommandsMixin
 
+#new import check if it works, added by me
+from weave.node.node_trace import NodeTrace, DragTrace
+
 # Import StyleManager at module level (not in properties)
 try:
     from weave.stylemanager import StyleCategory, StyleManager

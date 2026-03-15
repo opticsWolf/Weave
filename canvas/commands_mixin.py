@@ -20,12 +20,13 @@ IdleState accesses it via ``canvas._context_menu_provider``.
 
 import os
 from functools import partial
-from typing import Optional, List, Any
+from typing import Optional, List, Dict, Any
 
-from PySide6.QtWidgets import QGraphicsItem, QFileDialog
-from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QGraphicsItem, QFileDialog, QMainWindow
+from PySide6.QtCore import QSettings, Qt
 
-from weave.stylemanager import StyleManager
+from weave.canvas.canvas_grid import GridType
+from weave.stylemanager import StyleManager, StyleCategory
 
 from weave.logger import get_logger
 log = get_logger("CanvasCommands")
@@ -79,6 +80,12 @@ class CanvasCommandsMixin:
         self._max_history_items: int = 10
         self._settings = QSettings("opticsWolf", "Weave")
         self._load_file_history()
+
+        # Panel management
+        # Dynamic docks (inspectors that follow selection).  Multiple allowed.
+        self._dynamic_docks: List[Any] = []
+        # Static docks keyed by node UUID string — one per node.
+        self._static_docks: Dict[str, Any] = {}
 
     # =========================================================================
     # PUBLIC COMMAND API
@@ -153,7 +160,8 @@ class CanvasCommandsMixin:
             self.cmd_open_recent(self._file_history[index])
 
     def cmd_clear_canvas(self) -> None:
-        """Remove all managed nodes from the canvas."""
+        """Remove all managed nodes and close all panels."""
+        self.cmd_close_all_panels()
         if hasattr(self._canvas, '_node_manager'):
             self._canvas._node_manager.clear_all()
         self._canvas.clearSelection()
@@ -228,6 +236,404 @@ class CanvasCommandsMixin:
                 node.set_config(header_bg=color)
             else:
                 node.update()
+
+    def cmd_set_grid_type(self, grid_type: GridType) -> None:
+        """
+        Switch the canvas grid to *grid_type* and repaint immediately.
+
+        The new value is pushed through StyleManager so the canvas cache,
+        any serializers, and any other style subscribers all stay in sync.
+        The choice is persisted as a workspace preference.
+        """
+        sm = StyleManager.instance()
+        sm.update(StyleCategory.CANVAS, grid_type=grid_type.value)
+        sm.persist_workspace_prefs()
+
+        # Force an immediate repaint on every attached viewport.
+        try:
+            for view in self._canvas.views():
+                view.viewport().update()
+        except Exception:
+            pass
+
+        log.debug(f"Grid type changed to: {grid_type.name}")
+
+    def cmd_set_trace_style(self, connection_type: str) -> None:
+        """
+        Switch the trace connection style to *connection_type* and repaint.
+
+        Accepted values match the keys understood by NodeTrace / DragTrace:
+        ``"bezier"``, ``"straight"``, ``"angular"``.
+
+        The new value is pushed through StyleManager so all registered
+        NodeTrace and DragTrace instances receive an ``on_style_changed``
+        notification and rebuild their paths automatically.
+        The choice is persisted as a workspace preference.
+        """
+        sm = StyleManager.instance()
+        sm.update(StyleCategory.TRACE, connection_type=connection_type)
+        sm.persist_workspace_prefs()
+
+        # Force an immediate repaint on every attached viewport.
+        try:
+            for view in self._canvas.views():
+                view.viewport().update()
+        except Exception:
+            pass
+
+        log.debug(f"Trace style changed to: {connection_type!r}")
+
+    def cmd_toggle_snapping(self) -> None:
+        """Toggle grid snapping and persist the preference."""
+        sm = StyleManager.instance()
+        current = sm.get(StyleCategory.CANVAS, "snapping_enabled", True)
+        sm.update(StyleCategory.CANVAS, snapping_enabled=not current)
+        sm.persist_workspace_prefs()
+        log.debug(f"Snapping toggled to: {not current}")
+
+    # =========================================================================
+    # PANEL MANAGEMENT
+    # =========================================================================
+
+    def _get_main_window(self) -> Optional[QMainWindow]:
+        """Return the QMainWindow that owns the first view, or None."""
+        view = self._get_view()
+        if view is None:
+            return None
+        widget = view.window()
+        return widget if isinstance(widget, QMainWindow) else None
+
+    def _get_dock_adapter_class(self):
+        """Deferred import to avoid circular dependencies."""
+        from weave.dockadapter import NodeDockAdapter
+        return NodeDockAdapter
+
+    # ── Dynamic (Inspector) panels ───────────────────────────────────────
+
+    def cmd_add_dynamic_panel(self) -> None:
+        """Create and show a new dynamic inspector panel.
+
+        Each call creates a fresh inspector.  The title is numbered
+        automatically ("Inspector", "Inspector (2)", …) using the
+        lowest available number.
+        """
+        DockAdapter = self._get_dock_adapter_class()
+        main_win = self._get_main_window()
+        if main_win is None:
+            log.warning("Cannot add dynamic panel: no QMainWindow found.")
+            return
+
+        title = self._next_dock_title("Inspector")
+        dock = DockAdapter.create_dynamic(
+            title, self._canvas, parent=main_win,
+        )
+        main_win.addDockWidget(
+            Qt.DockWidgetArea.RightDockWidgetArea, dock,
+        )
+        # When the user closes via the title-bar X, remove from the list.
+        dock.destroyed.connect(lambda: self._dynamic_docks_discard(dock))
+        self._dynamic_docks.append(dock)
+
+    # Keep the old name as an alias so existing menu wiring works.
+    cmd_show_dynamic_panel = cmd_add_dynamic_panel
+
+    def cmd_hide_all_dynamic_panels(self) -> None:
+        """Hide all dynamic inspector panels (does not destroy them)."""
+        for dock in self._dynamic_docks:
+            dock.hide()
+
+    def cmd_show_all_dynamic_panels(self) -> None:
+        """Show all existing dynamic inspector panels."""
+        for dock in self._dynamic_docks:
+            dock.show()
+            dock.raise_()
+
+    def cmd_remove_all_dynamic_panels(self) -> None:
+        """Destroy all dynamic inspector panels."""
+        for dock in list(self._dynamic_docks):
+            try:
+                dock.close()
+                dock.deleteLater()
+            except RuntimeError:
+                pass
+        self._dynamic_docks.clear()
+
+    # Backward-compatible alias used by cmd_close_all_panels.
+    cmd_remove_dynamic_panel = cmd_remove_all_dynamic_panels
+
+    def _dynamic_docks_discard(self, dock) -> None:
+        """Remove *dock* from the list if present (no-op otherwise)."""
+        try:
+            self._dynamic_docks.remove(dock)
+        except ValueError:
+            pass
+
+    @property
+    def dynamic_docks(self) -> List[Any]:
+        """All live dynamic inspector docks."""
+        return list(self._dynamic_docks)
+
+    # ── Static (mirrored) panels ─────────────────────────────────────────
+
+    def cmd_mirror_node(self, node: QGraphicsItem) -> None:
+        """Create a static panel for *node*.
+
+        One static panel per node — if a panel already exists for this
+        node it is shown and raised instead of creating a duplicate.
+        The dock title is numbered if another dock with the same base
+        title already exists (e.g. "Float", "Float (2)").
+        """
+        DockAdapter = self._get_dock_adapter_class()
+        main_win = self._get_main_window()
+        if main_win is None:
+            log.warning("Cannot mirror node: no QMainWindow found.")
+            return
+
+        # Resolve node UUID
+        node_id = self._node_uuid_str(node)
+        if node_id is None:
+            log.warning("Cannot mirror node: node has no UUID.")
+            return
+
+        # Already mirrored? — just show it.
+        existing = self._static_docks.get(node_id)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            return
+
+        # Determine a numbered title
+        base_title = self._node_display_title(node)
+        title = self._next_dock_title(base_title)
+
+        dock = DockAdapter.create_static(title, node, parent=main_win)
+        main_win.addDockWidget(
+            Qt.DockWidgetArea.RightDockWidgetArea, dock,
+        )
+
+        # Clean up when the node is deleted.
+        dock.panel.linked_node_lost.connect(
+            lambda _id=node_id: self._unregister_static_dock(_id)
+        )
+        # Clean up when the user clicks the dock's close (X) button.
+        dock.dock_closed.connect(
+            lambda _id=node_id: self._unregister_static_dock(_id, destroy=False)
+        )
+        self._static_docks[node_id] = dock
+
+    def cmd_remove_static_panel(self, node: QGraphicsItem) -> None:
+        """Remove the static panel for *node*, if any."""
+        node_id = self._node_uuid_str(node)
+        if node_id is None:
+            return
+        self._unregister_static_dock(node_id, destroy=True)
+
+    def _unregister_static_dock(
+        self, node_id: str, *, destroy: bool = True
+    ) -> None:
+        """Remove a static dock from the registry.
+
+        Args:
+            node_id:  The node UUID string key.
+            destroy:  If True, call close() + deleteLater() on the dock.
+                      Set to False when called from dock_closed (the dock
+                      is already closing itself — calling close() again
+                      would re-enter closeEvent).
+        """
+        dock = self._static_docks.pop(node_id, None)
+        if dock is not None and destroy:
+            try:
+                dock.close()
+                dock.deleteLater()
+            except RuntimeError:
+                pass
+
+    def has_static_panel(self, node: QGraphicsItem) -> bool:
+        """Return True if a static panel already exists for *node*."""
+        node_id = self._node_uuid_str(node)
+        return node_id is not None and node_id in self._static_docks
+
+    # ── Bulk show / hide / close ─────────────────────────────────────────
+
+    def cmd_show_all_panels(self) -> None:
+        """Show all panels (dynamic + static)."""
+        for dock in self._dynamic_docks:
+            dock.show()
+        for dock in self._static_docks.values():
+            dock.show()
+
+    def cmd_hide_all_panels(self) -> None:
+        """Hide all panels (dynamic + static)."""
+        for dock in self._dynamic_docks:
+            dock.hide()
+        for dock in self._static_docks.values():
+            dock.hide()
+
+    def cmd_close_all_panels(self) -> None:
+        """Close and destroy all panels (dynamic + static)."""
+        self.cmd_remove_all_dynamic_panels()
+        # Iterate over a snapshot — closing modifies _static_docks.
+        for node_id in list(self._static_docks):
+            self._unregister_static_dock(node_id, destroy=True)
+
+    # ── Panel state serialization ────────────────────────────────────────
+
+    def get_panel_state(self) -> Dict[str, Any]:
+        """Capture the current dock panel configuration.
+
+        Returns a JSON-safe dict describing every live dynamic and
+        static panel so that :meth:`restore_panel_state` can recreate
+        them after a file load.
+
+        Node references use the serializer's ``unique_id`` attribute
+        (not the internal ``_node_uuid``) so they align with the
+        ``uuid_map`` that the serializer builds during deserialization.
+        """
+        dynamic: List[Dict[str, Any]] = []
+        for dock in self._dynamic_docks:
+            entry: Dict[str, Any] = {"title": dock.windowTitle()}
+            panel = dock.panel
+            entry["pinned"] = panel.is_pinned
+            # If pinned to a node, record the serializer-assigned ID.
+            if panel.is_pinned and panel.node is not None:
+                ser_id = getattr(panel.node, "unique_id", None)
+                if ser_id is not None:
+                    entry["pinned_node_uuid"] = ser_id
+            dynamic.append(entry)
+
+        static: List[Dict[str, Any]] = []
+        for _internal_id, dock in self._static_docks.items():
+            node = dock.node
+            if node is None:
+                continue
+            # Use the serializer-assigned unique_id, not _node_uuid.
+            ser_id = getattr(node, "unique_id", None)
+            if ser_id is None:
+                continue
+            static.append({
+                "node_uuid": ser_id,
+                "title": dock.windowTitle(),
+            })
+
+        return {
+            "dynamic": dynamic,
+            "static": static,
+        }
+
+    def restore_panel_state(
+        self, data: Dict[str, Any], uuid_map: Dict[str, Any]
+    ) -> None:
+        """Recreate dock panels from a previously saved state.
+
+        Args:
+            data:     The dict produced by :meth:`get_panel_state`.
+            uuid_map: Mapping of serialized node-UUID strings to live
+                      node instances (provided by the serializer after
+                      all nodes have been restored).
+        """
+        # ── Dynamic inspectors ───────────────────────────────────────
+        for entry in data.get("dynamic", []):
+            self.cmd_add_dynamic_panel()
+            dock = self._dynamic_docks[-1]  # the one we just created
+
+            # Override the auto-generated title with the saved one.
+            saved_title = entry.get("title")
+            if saved_title:
+                dock.setWindowTitle(saved_title)
+
+            # Re-pin if the saved panel was pinned to a specific node.
+            if entry.get("pinned") and "pinned_node_uuid" in entry:
+                node = uuid_map.get(entry["pinned_node_uuid"])
+                if node is not None:
+                    # Bind to the node, then toggle the pin on.
+                    dock.panel.bind_node(node, static=False)
+                    dock.panel._header.set_pin_checked(True)
+                    dock.panel._on_pin_toggled(True)
+
+        # ── Static panels ────────────────────────────────────────────
+        for entry in data.get("static", []):
+            ser_node_id = entry.get("node_uuid")
+            if ser_node_id is None:
+                continue
+            node = uuid_map.get(ser_node_id)
+            if node is None:
+                log.debug(
+                    f"restore_panel_state: node {ser_node_id[:12]}… not found "
+                    f"— skipping static panel '{entry.get('title')}'."
+                )
+                continue
+            self.cmd_mirror_node(node)
+            # cmd_mirror_node keys by _node_uuid_str (internal UUID),
+            # not the serializer's unique_id — look up with the right key.
+            internal_id = self._node_uuid_str(node)
+            dock = self._static_docks.get(internal_id) if internal_id else None
+            if dock is not None:
+                saved_title = entry.get("title")
+                if saved_title:
+                    dock.setWindowTitle(saved_title)
+
+    # ── Private helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _node_uuid_str(node: QGraphicsItem) -> Optional[str]:
+        """Extract a string UUID from a node, or None."""
+        if hasattr(node, 'get_uuid_string'):
+            return node.get_uuid_string()
+        if hasattr(node, '_node_uuid'):
+            return str(node._node_uuid)
+        return None
+
+    @staticmethod
+    def _node_display_title(node: QGraphicsItem) -> str:
+        """Best-effort readable title for a node."""
+        try:
+            tip = node.header._title.toolTip()
+            if tip:
+                return tip
+            return node.header._title.toPlainText()
+        except Exception:
+            pass
+        name = getattr(node, 'name', None)
+        if name:
+            return str(name) if not callable(name) else name()
+        return type(node).__name__
+
+    def _next_dock_title(self, base_title: str) -> str:
+        """Return a unique dock title based on *base_title*.
+
+        Collects the titles of all existing static docks and the
+        dynamic dock.  If *base_title* is not in use, returns it
+        unchanged.  Otherwise appends the lowest available number
+        in parentheses, e.g. ``"Float (2)"``.
+        """
+        import re
+
+        existing_titles: set[str] = set()
+        for dock in self._dynamic_docks:
+            existing_titles.add(dock.windowTitle())
+        for dock in self._static_docks.values():
+            existing_titles.add(dock.windowTitle())
+
+        if base_title not in existing_titles:
+            return base_title
+
+        # Collect numbers already in use for this base title.
+        # Matches  "Base Title"  and  "Base Title (N)".
+        used_numbers: set[int] = {1}  # The bare title counts as 1.
+        pattern = re.compile(
+            rf"^{re.escape(base_title)}\s*\((\d+)\)$"
+        )
+        for title in existing_titles:
+            m = pattern.match(title)
+            if m:
+                used_numbers.add(int(m.group(1)))
+
+        # Find the lowest unused number ≥ 2.
+        n = 2
+        while n in used_numbers:
+            n += 1
+
+        return f"{base_title} ({n})"
 
     # =========================================================================
     # BACKWARD-COMPATIBLE ALIASES (used by existing action connections)
@@ -309,7 +715,6 @@ class CanvasCommandsMixin:
             filepath,
             self._canvas,
             view=self._get_view(),
-            minimap=self._get_minimap(),
         )
 
         if success:
@@ -329,7 +734,6 @@ class CanvasCommandsMixin:
             filepath,
             self._canvas,
             view=self._get_view(),
-            minimap=self._get_minimap(),
         )
 
         if success:
@@ -379,27 +783,6 @@ class CanvasCommandsMixin:
         """Return the first QGraphicsView attached to the canvas, or None."""
         views = self._canvas.views()
         return views[0] if views else None
-
-    def _get_minimap(self):
-        """Find the minimap widget, if present."""
-        view = self._get_view()
-        if view is None:
-            return None
-
-        for obj in (self._canvas, view):
-            minimap = getattr(obj, '_minimap', None) or getattr(obj, 'minimap', None)
-            if minimap is not None:
-                return minimap
-
-        try:
-            from qt_minimap import QtNodeMinimap
-            for child in view.children():
-                if isinstance(child, QtNodeMinimap):
-                    return child
-        except ImportError:
-            pass
-
-        return None
 
     def _get_serializer(self) -> Optional[Any]:
         """Lazily create and cache a GraphSerializer."""
