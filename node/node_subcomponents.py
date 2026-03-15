@@ -487,6 +487,10 @@ class EditableTitle(QGraphicsTextItem):
         
         self._header._recalculate_layout()
 
+        # 5. Notify external listeners (dock panel, property editors …)
+        if hasattr(node, 'title_changed'):
+            node.title_changed.emit(new_name)
+
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.clearFocus()  # This triggers focusOutEvent

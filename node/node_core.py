@@ -66,6 +66,9 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
     # Signal emitted when state changes (old_state, new_state)
     state_changed = Signal(object, object)
 
+    # Signal emitted when the title is edited by the user
+    title_changed = Signal(str)
+
     # Signal emitted when geometry changes significantly
     geometry_changed = Signal()
 
