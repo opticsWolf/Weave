@@ -39,6 +39,34 @@ def _get_movable_nodes(items: Sequence[QGraphicsItem]) -> list[QGraphicsItem]:
     ]
 
 
+def delete_selected_nodes(canvas) -> int:
+    """Delete selected movable nodes from the canvas."""
+    selected = canvas.selectedItems()
+    if not selected:
+        return 0
+
+    nodes_to_delete = _get_movable_nodes(selected)
+    if not nodes_to_delete:
+        return 0
+
+    node_manager = getattr(canvas, '_node_manager', None)
+    deleted_count = 0
+
+    for node in nodes_to_delete:
+        try:
+            if node_manager:
+                node_manager.remove_node(node)
+            else:
+                canvas.removeItem(node)
+            deleted_count += 1
+        except RuntimeError as e:
+            logging.debug(f"Node already removed: {e}")
+        except AttributeError as e:
+            logging.warning(f"Unexpected error removing node: {e}")
+
+    return deleted_count
+
+
 class IdleState(CanvasInteractionState):
     """
     Handles selection, movement, grid snapping, and connection dragging.
@@ -135,6 +163,14 @@ class IdleState(CanvasInteractionState):
         elif not hasattr(self.canvas, 'shake_to_disconnect'):
             # Fallback: no StyleManager and no canvas property
             self._shake_enabled = False
+
+        logging.debug(
+            f"Shake cache sync: enabled={self._shake_enabled}, "
+            f"threshold={self._shake_threshold}, min_changes={self._shake_min_changes}, "
+            f"timeout={self._shake_timeout_ms}ms, "
+            f"StyleManager={'yes' if STYLEMANAGER_AVAILABLE else 'NO'}, "
+            f"canvas.shake_to_disconnect={getattr(self.canvas, 'shake_to_disconnect', '<missing>')}"
+        )
     
     def _on_style_changed(self, category, changes: dict):
         """
@@ -293,9 +329,12 @@ class IdleState(CanvasInteractionState):
 
         logging.debug("IdleState.on_mouse_press: Initializing drag state")
         
-        # Reset shake and drag tracking
+        # Reset shake and drag tracking.
+        # _is_dragging stays False until we confirm that no port or button
+        # consumed the press — only then will Qt's default handler start a
+        # node drag, and only then does shake tracking make sense.
         self._shake_recognizer.reset()
-        self._is_dragging = True
+        self._is_dragging = False
         self._drag_started_pos = None
         self._last_mouse_pos = None
         
@@ -311,6 +350,9 @@ class IdleState(CanvasInteractionState):
         if self._handle_node_button_press(event):
             return True
         
+        # No port or button consumed the press — Qt's default handler will
+        # initiate a node drag via ItemIsMovable.  Enable shake tracking.
+        self._is_dragging = True
         return False
     
     def _handle_port_press(self, port: NodePort, event: QGraphicsSceneMouseEvent) -> bool:
