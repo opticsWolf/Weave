@@ -24,7 +24,7 @@ the widget in the source node will be automatically disabled.
 
 import numpy as np
 from typing import Any, Dict, Optional, ClassVar, List
-from PySide6.QtCore import Signal, Slot, QObject
+from PySide6.QtCore import Signal, Slot, QObject, QTimer
 from PySide6.QtWidgets import (
     QSpinBox, QLineEdit, QLabel, QWidget, QVBoxLayout, QFormLayout,
     QComboBox, QDoubleSpinBox, QPushButton
@@ -78,10 +78,9 @@ class FloatNode(ActiveNode):
         # NOTE: Must be stored as _widget_core so BaseControlNode.get_state() /
         #       restore_state() can find it for serialisation.
         self._widget_core = WidgetCore()
+        self._widget_core.set_node(self)
         
         spin = QDoubleSpinBox()
-        spin.setRange(-9999.0, 9999.0)
-        spin.setValue(val)
         
         # Register the widget with the core
         self._widget_core.register_widget(
@@ -97,7 +96,9 @@ class FloatNode(ActiveNode):
         # Connect the core's value_changed signal to our handler
         self._widget_core.value_changed.connect(self._on_core_changed)
         self.set_content_widget(self._widget_core)
-        
+        self._widget_core.patch_proxy()
+        self._widget_core.refresh_widget_palettes()
+
         self._cached_values["value"] = val
 
     @Slot(str)
@@ -154,9 +155,9 @@ class DisplayNode(ActiveNode):
         
         # Create core with a display widget
         self._widget_core = WidgetCore()
+        self._widget_core.set_node(self)
         
         label = QLabel("Waiting...")
-        label.setStyleSheet("QLabel { color: #ddd; font-weight: bold; }")
         label.setMinimumWidth(80)
         
         # Register the label as DISPLAY role (no port created, but state is persisted)
@@ -166,6 +167,10 @@ class DisplayNode(ActiveNode):
         )
         
         self.set_content_widget(self._widget_core)
+        # Ensure all children (including unregistered ones) receive the initial
+        # palette now that the widget tree is fully constructed.
+        self._widget_core.patch_proxy()
+        self._widget_core.refresh_widget_palettes()
             
         self._temp_display_data: str = "No Data"
 
@@ -221,6 +226,7 @@ class ActionNode(ManualNode):
 
         # Create core with button widget
         self._widget_core = WidgetCore()
+        self._widget_core.set_node(self)
         
         btn = QPushButton("Execute")
         btn.clicked.connect(self.execute)
@@ -232,6 +238,8 @@ class ActionNode(ManualNode):
         )
         
         self.set_content_widget(self._widget_core)
+        self._widget_core.patch_proxy()
+        self._widget_core.refresh_widget_palettes()
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Performs the side effect."""
@@ -277,10 +285,9 @@ class IntNode(ActiveNode):
         
         # Build core with WidgetCore
         self._widget_core = WidgetCore()
+        self._widget_core.set_node(self)
         
         spin = QSpinBox()
-        spin.setRange(-9999, 9999)
-        spin.setValue(val)
         
         # Register the widget with the core
         self._widget_core.register_widget(
@@ -296,6 +303,8 @@ class IntNode(ActiveNode):
         # Connect the core's value_changed signal to our handler
         self._widget_core.value_changed.connect(self._on_core_changed)
         self.set_content_widget(self._widget_core)
+        self._widget_core.patch_proxy()
+        self._widget_core.refresh_widget_palettes()
         
         self._cached_values["value"] = val
 
@@ -324,78 +333,6 @@ class IntNode(ActiveNode):
         except Exception as e:
             log.error(f"Exception in IntNode.compute: {e}")
             return {"value": 0}
-
-    def cleanup(self) -> None:
-        """Safe teardown of widgets and signals."""
-        self._widget_core.cleanup()
-        super().cleanup()
-
-
-@register_node
-class TextInputNode(ActiveNode):
-    """
-    Text input node with QLineEdit.
-    
-    Type: Active (Updates downstream on text change or enter press).
-    """
-    text_changed = Signal(str)
-
-    node_class: ClassVar[str] = "Basic"
-    node_subclass: ClassVar[str] = "Input"
-    node_name: ClassVar[Optional[str]] = "Text Input"
-    node_description: ClassVar[Optional[str]] = "Accepts string input"
-    node_tags: ClassVar[Optional[List[str]]] = ["input", "text", "string"]
-
-    def __init__(self, title: str = "Text Input", initial_text: str = "", **kwargs: Any) -> None:
-        """
-        Args:
-            title (str): The node title.
-            initial_text (str): Initial text value.
-        """
-        super().__init__(title=title, **kwargs)
-        
-        # Build core with WidgetCore
-        self._widget_core = WidgetCore()
-        
-        line_edit = QLineEdit()
-        line_edit.setText(initial_text)
-        line_edit.setPlaceholderText("Enter text...")
-        line_edit.setMinimumWidth(120)
-        
-        # Register the widget with the core
-        self._widget_core.register_widget(
-            "text", line_edit,
-            role="output", datatype="string", default="",
-        )
-        
-        # Auto-create ports from registered widgets
-        for pd in self._widget_core.get_port_definitions():
-            if pd.role in (PortRole.OUTPUT, PortRole.BIDIRECTIONAL):
-                self.add_output(pd.name, pd.datatype, pd.description)
-        
-        # Connect the core's value_changed signal to our handler
-        self._widget_core.value_changed.connect(self._on_core_changed)
-        self.set_content_widget(self._widget_core)
-            
-        self._cached_values["text"] = initial_text
-
-    @Slot(str)
-    def _on_core_changed(self, port_name: str) -> None:
-        """Propagates text changes to the graph logic."""
-        try:
-            if port_name == "text":
-                self.on_ui_change()
-                self.text_changed.emit(self._widget_core.get_port_value("text"))
-        except Exception as e:
-            log.error(f"Exception in TextInputNode._on_core_changed: {e}")
-
-    def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Returns the current text value."""
-        try:
-            return {"text": self._widget_core.get_port_value("text")}
-        except Exception as e:
-            log.error(f"Exception in TextInputNode.compute: {e}")
-            return {"text": ""}
 
     def cleanup(self) -> None:
         """Safe teardown of widgets and signals."""
@@ -434,6 +371,7 @@ class RangeListNode(ActiveNode):
         form.setContentsMargins(5, 5, 5, 5)
         form.setSpacing(4)
         self._widget_core = WidgetCore(layout=form)
+        self._widget_core.set_node(self)
         
         spin_start = QSpinBox()
         spin_start.setRange(-9999, 9999)
@@ -476,6 +414,13 @@ class RangeListNode(ActiveNode):
         self._widget_core.value_changed.connect(self._on_core_changed)
         
         self.set_content_widget(self._widget_core)
+        # refresh_widget_palettes() is called explicitly here because the QFormLayout
+        # row labels ("Start:", "Stop:", "Step:") are created by Qt internally when
+        # addRow() is called, after WidgetCore.__init__ has already run its initial
+        # _apply_container_background().  Without this call those labels will not
+        # receive the theme palette until the next StyleManager theme-change event.
+        self._widget_core.patch_proxy()
+        self._widget_core.refresh_widget_palettes()
 
     @Slot(str)
     def _on_core_changed(self, port_name: str) -> None:
@@ -542,9 +487,9 @@ class ListLengthNode(ActiveNode):
         
         # Create core with label widget
         self._widget_core = WidgetCore()
+        self._widget_core.set_node(self)
         
         label = QLabel("Length: 0")
-        label.setStyleSheet("QLabel { color: #ddd; }")
         
         # Register the label as display-only (no port created)
         self._widget_core.register_widget(
@@ -553,6 +498,8 @@ class ListLengthNode(ActiveNode):
         )
         
         self.set_content_widget(self._widget_core)
+        self._widget_core.patch_proxy()
+        self._widget_core.refresh_widget_palettes()
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Computes the length of the input list."""
@@ -615,6 +562,7 @@ class ListIndexNode(ActiveNode):
         form.setContentsMargins(5, 5, 5, 5)
         form.setSpacing(4)
         self._widget_core = WidgetCore(layout=form)
+        self._widget_core.set_node(self)
         
         spin_index = QSpinBox()
         spin_index.setRange(-9999, 9999)
@@ -632,6 +580,10 @@ class ListIndexNode(ActiveNode):
         # WidgetCore.value_changed handles the signal; no manual connection needed
         self._widget_core.value_changed.connect(self._on_core_changed)
         self.set_content_widget(self._widget_core)
+        # QFormLayout row label ("Index:") is an unregistered child created after
+        # WidgetCore.__init__ — refresh ensures it gets the theme palette immediately.
+        self._widget_core.patch_proxy()
+        self._widget_core.refresh_widget_palettes()
 
     @Slot(str)
     def _on_core_changed(self, port_name: str) -> None:
@@ -707,9 +659,9 @@ class AutoDisableDemoNode(ActiveNode):
         
         # Create core with label widget
         self._widget_core = WidgetCore()
+        self._widget_core.set_node(self)
         
         label = QLabel("Auto-Disable Demo Node")
-        label.setStyleSheet("QLabel { color: #ddd; font-weight: bold; }")
         
         # Register the label as display-only (no port created)
         self._widget_core.register_widget(
@@ -718,6 +670,8 @@ class AutoDisableDemoNode(ActiveNode):
         )
         
         self.set_content_widget(self._widget_core)
+        self._widget_core.patch_proxy()
+        self._widget_core.refresh_widget_palettes()
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Example computation that uses both input types."""
@@ -755,10 +709,9 @@ class SimpleInputNode(ActiveNode):
         
         # Build core with WidgetCore
         self._widget_core = WidgetCore()
+        self._widget_core.set_node(self)
         
         spin = QDoubleSpinBox()
-        spin.setValue(value)
-        spin.setRange(-100.0, 100.0)
         
         # Register the widget with the core
         self._widget_core.register_widget(
@@ -774,6 +727,8 @@ class SimpleInputNode(ActiveNode):
         # Connect the core's value_changed signal to our handler
         self._widget_core.value_changed.connect(self._on_core_changed)
         self.set_content_widget(self._widget_core)
+        self._widget_core.patch_proxy()
+        self._widget_core.refresh_widget_palettes()
             
         self._cached_values["output_value"] = value
 
