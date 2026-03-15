@@ -87,7 +87,7 @@ from __future__ import annotations
 from enum import Enum, auto
 from typing import Optional, TYPE_CHECKING
 
-from PySide6.QtCore import Signal, Slot
+from PySide6.QtCore import Signal, Slot, QTimer
 from PySide6.QtWidgets import QWidget, QDockWidget, QGraphicsScene
 
 if TYPE_CHECKING:
@@ -133,6 +133,10 @@ class NodeDockAdapter(QDockWidget):
     node_bound   = Signal(object)
     node_unbound = Signal()
 
+    # Emitted when the dock is actually closing (title-bar X on static,
+    # or programmatic close).  Listeners should clean up references.
+    dock_closed  = Signal()
+
     def __init__(
         self,
         title: str = "Node Properties",
@@ -152,6 +156,9 @@ class NodeDockAdapter(QDockWidget):
 
         # When the static node is lost, close this dock
         self._panel.linked_node_lost.connect(self._on_linked_node_lost)
+
+        # When the user unpins, re-sync to the current canvas selection
+        self._panel.pin_changed.connect(self._on_pin_changed)
 
     # ──────────────────────────────────────────────────────────────────────
     # Factory constructors
@@ -257,20 +264,26 @@ class NodeDockAdapter(QDockWidget):
         """
         Handle the dock being closed by the user or programmatically.
 
+        Both modes unbind from the node / selection, emit ``dock_closed``
+        so external managers can remove their references, and schedule
+        the dock for deletion.
+
         DYNAMIC
-            The dock is merely hidden.  Mirrors are torn down to free
-            resources, but the dock stays alive.  Reopening via the
-            Window menu or ``show()`` resumes selection tracking.
+            Mirrors are torn down, selection tracking is stopped, and
+            the dock is destroyed.  A new inspector can be created via
+            "Add Inspector".
 
         STATIC
-            Unbind (releases the static lock) and fully close.
+            The static lock is released and the dock is destroyed.
         """
         if self._mode == DockMode.STATIC:
             self._panel.unbind()
-            self._unbind_from_selection()
         else:
-            # Dynamic: tear down mirrors but keep the dock alive (hidden).
             self._panel._unbind_internal()
+
+        self._unbind_from_selection()
+        self.dock_closed.emit()
+        self.deleteLater()
 
         super().closeEvent(event)
 
@@ -309,16 +322,38 @@ class NodeDockAdapter(QDockWidget):
 
     @Slot()
     def _on_selection_changed(self) -> None:
-        """Handle canvas ``selectionChanged`` signal."""
+        """Handle canvas ``selectionChanged`` signal.
+
+        The sync is deferred to the next event-loop tick via
+        ``QTimer.singleShot(0, ...)``.  ``selectionChanged`` fires
+        inside ``QGraphicsScene.mousePressEvent``; if ``bind_node``
+        runs synchronously it can call ``QWidget.setVisible`` which
+        forces Qt to process pending events — delivering a queued
+        ``mouseMoveEvent`` while the press handler is still on the
+        stack.  Because the drag offset is not yet finalized at that
+        point, the node jumps to an incorrect position.
+
+        Deferring the sync breaks the re-entrant chain without
+        affecting user-perceived responsiveness (the panel update
+        appears on the very next tick).
+        """
         if self._mode != DockMode.DYNAMIC:
             return
         if not self.isVisible():
             return
-        self._sync_to_current_selection()
+        QTimer.singleShot(0, self._sync_to_current_selection)
 
     def _sync_to_current_selection(self) -> None:
-        """Read the current selection and bind/unbind accordingly."""
+        """Read the current selection and bind/unbind accordingly.
+
+        Skipped entirely when the panel is *pinned* — the user has
+        explicitly locked it to a specific node via the pin toggle.
+        """
         if self._selection_scene is None:
+            return
+
+        # A pinned panel ignores selection until the user unpins.
+        if self._panel.is_pinned:
             return
 
         selected = self._selection_scene.selectedItems()
@@ -332,6 +367,25 @@ class NodeDockAdapter(QDockWidget):
             # Only unbind if not static (dynamic panels follow selection)
             if not self._panel.is_static:
                 self._panel._unbind_internal()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Pin toggle — re-sync on unpin
+    # ──────────────────────────────────────────────────────────────────────
+
+    @Slot(bool)
+    def _on_pin_changed(self, pinned: bool) -> None:
+        """Handle the panel's pin toggle.
+
+        When the user *unpins*, immediately re-sync to whatever node is
+        currently selected on the canvas.  This covers the common case
+        where the user pinned Node A, selected Node B, then unpinned —
+        the panel should switch to Node B without requiring a fresh
+        click.  ``_sync_to_current_selection`` is safe to call here
+        because ``is_pinned`` has already been cleared by the panel
+        before the signal was emitted.
+        """
+        if not pinned and self._mode == DockMode.DYNAMIC:
+            self._sync_to_current_selection()
 
     # ──────────────────────────────────────────────────────────────────────
     # Static-mode: linked node lost

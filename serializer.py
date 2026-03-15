@@ -8,24 +8,30 @@ SPDX-License-Identifier: Apache-2.0
 
 serializer.py - Comprehensive Graph Serializer v3
 -----------------------------------------------------
-Handles full application state serialization/deserialization for the Node Canvas.
+Handles graph state serialization/deserialization for the Node Canvas.
 
-Captures:
-- Canvas settings (grid type/spacing, snapping, shake-to-disconnect)
+Captures (per-graph, saved in .json files):
+- Canvas scene rectangle
 - View state (center position, zoom/transform)
-- Minimap state (corner, pinned, minimized, dimensions)
 - Node state via clean ownership boundary:
     Serializer adds: id, class (graph metadata)
     QtNode.get_state(): pos, size, colors, port defs, minimized, node_state
     BaseControlNode.get_state(): widget_data (via WeaveWidgetCore), dataflow metadata
 - Connections (source/target node IDs and port indices)
+- Dock panel configuration (dynamic inspectors + static mirrors)
+
+NOT saved in graph files (workspace preferences via QSettings):
+- Active theme
+- Grid type / grid spacing
+- Trace connection style
+- Snapping enabled
+- Minimap state (corner, pinned, minimized, dimensions)
 
 Format v3:
 {
     "meta": { "version": "3.0", "timestamp": "...", "app_name": "QtNodeCanvas" },
-    "canvas": { ... },
+    "canvas": { "scene_rect": [...] },
     "view": { ... },
-    "minimap": { ... },
     "nodes": [
         {
             "id": "...", "class": "FloatNode",           # serializer
@@ -37,7 +43,16 @@ Format v3:
         },
         ...
     ],
-    "connections": [ ... ]
+    "connections": [ ... ],
+    "panels": {
+        "dynamic": [
+            { "title": "Inspector", "pinned": false },
+            { "title": "Inspector (2)", "pinned": true, "pinned_node_uuid": "..." }
+        ],
+        "static": [
+            { "node_uuid": "...", "title": "Float Gen" }
+        ]
+    }
 }
 """
 
@@ -201,24 +216,20 @@ class GraphSerializer:
         self,
         canvas,
         view=None,
-        minimap=None,
     ) -> str:
         """
-        Serialize the entire application state to a JSON string.
+        Serialize the graph state to a JSON string.
 
-        The active theme is a user-level preference managed by
-        StyleManager / QSettings and is intentionally NOT saved into graph
-        files.  Theme-driven visual properties (bg_color, grid_color,
-        grid_line_width) are excluded from the canvas section so that a
-        loaded graph always inherits the currently active theme's colours.
+        Per-graph state only — workspace preferences (theme, grid type,
+        trace style, snapping, minimap) are persisted separately via
+        StyleManager / QSettings and are NOT included here.
 
         Args:
             canvas:  The QtNodeCanvas (QGraphicsScene subclass).
             view:    Optional QGraphicsView (QtCanvasView) for viewport state.
-            minimap: Optional QtNodeMinimap for minimap state.
 
         Returns:
-            A JSON string representing the complete application state.
+            A JSON string representing the graph state.
         """
         data: Dict[str, Any] = {
             "meta": self._serialize_meta(),
@@ -230,9 +241,6 @@ class GraphSerializer:
         # Optional sections
         if view is not None:
             data["view"] = self._serialize_view(view)
-
-        if minimap is not None:
-            data["minimap"] = self._serialize_minimap(minimap)
 
         # Nodes & Connections
         node_id_map: Dict[Any, str] = {}  # object -> unique_id
@@ -261,6 +269,9 @@ class GraphSerializer:
 
         data["connections"] = self._serialize_connections(canvas, node_id_map)
 
+        # Panel configuration (dock adapter state)
+        data["panels"] = self._serialize_panels(canvas)
+
         return json.dumps(data, indent=2, ensure_ascii=False, cls=_QtJsonEncoder)
 
     # -- Meta ---------------------------------------------------------------
@@ -275,31 +286,18 @@ class GraphSerializer:
     # -- Canvas Settings ----------------------------------------------------
 
     def _serialize_canvas(self, canvas) -> Dict[str, Any]:
-        """Capture grid, snapping, and layout settings.
+        """Capture the scene rectangle.
 
-        Theme-driven visual properties (bg_color, grid_color, grid_line_width)
-        are intentionally NOT saved.  These are managed by StyleManager and the
-        active theme, and must not be overridden when loading a graph file.
+        Behavioral and visual settings (grid type, snapping, trace style,
+        bg_color, grid_color) are workspace preferences persisted via
+        StyleManager / QSettings.  They are NOT saved in graph files so
+        that loading a graph never overrides the user's current setup.
         """
         scene_rect = canvas.sceneRect()
-        result: Dict[str, Any] = {
+        return {
             "scene_rect": [scene_rect.x(), scene_rect.y(),
                            scene_rect.width(), scene_rect.height()],
         }
-
-        # Behavioral / workspace settings only — no theme colors
-        _safe = _safe_attr
-        result["grid_spacing"] = _safe(canvas, "grid_spacing", "_cached_grid_spacing", default=20)
-        result["snapping_enabled"] = _safe(canvas, "snapping_enabled", "_cached_snapping_enabled", default=True)
-        result["connection_snap_radius"] = _safe(canvas, "connection_snap_radius", "_cached_connection_snap_radius", default=25.0)
-        result["shake_to_disconnect"] = _safe(canvas, "shake_to_disconnect", "_cached_shake_to_disconnect", default=False)
-        result["max_visible_grid_lines"] = _safe(canvas, None, "_cached_max_visible_grid_lines", default=5000)
-
-        # Grid type (enum -> int)
-        grid_type = _safe(canvas, "grid_type", "_cached_grid_type", default=1)
-        result["grid_type"] = grid_type.value if hasattr(grid_type, "value") else int(grid_type)
-
-        return result
 
     # -- View State ---------------------------------------------------------
 
@@ -316,36 +314,6 @@ class GraphSerializer:
             "transform": _transform_to_list(transform),
             "viewport_size": [view.viewport().width(), view.viewport().height()],
         }
-
-    # -- Minimap State ------------------------------------------------------
-
-    def _serialize_minimap(self, minimap) -> Dict[str, Any]:
-        """Capture minimap corner, pin state, minimized state, and dimensions."""
-        result: Dict[str, Any] = {}
-
-        # Corner (enum name)
-        corner = getattr(minimap, "_current_corner", None)
-        result["corner"] = corner.name if hasattr(corner, "name") else "TOP_RIGHT"
-
-        # Pin / Auto-hide
-        result["is_pinned"] = not getattr(minimap, "_auto_hide_enabled", False)
-        result["is_minimized"] = getattr(minimap, "_is_minimized", False)
-
-        # Dimensions from config
-        config = getattr(minimap, "_config", {})
-        result["width"] = config.get("width", 240)
-        result["height"] = config.get("height", 180)
-
-        return result
-
-    # -- Style/Theme State --------------------------------------------------
-    # NOTE: Theme state is intentionally NOT serialized.  The active theme
-    # is a user-level preference persisted via StyleManager / QSettings.
-    # Theme-driven visual properties (bg_color, grid_color, grid_line_width)
-    # are excluded from the canvas section for the same reason — they must
-    # reflect the currently active theme, not a previously saved one.
-    # Per-node header colour overrides are stored on each node as a palette
-    # index and are always saved/restored as part of the node's own state.
 
     # -- Single Node --------------------------------------------------------
 
@@ -464,6 +432,33 @@ class GraphSerializer:
 
         return connections
 
+    # -- Panels ---------------------------------------------------------------
+
+    @staticmethod
+    def _serialize_panels(canvas) -> Dict[str, Any]:
+        """Capture dock panel configuration from the CanvasCommandsMixin.
+
+        The commands mixin (accessed via ``_context_menu_provider``)
+        owns all panel state.  Returns an empty dict if unavailable.
+        """
+        provider = getattr(canvas, "_context_menu_provider", None)
+        if provider is not None and hasattr(provider, "get_panel_state"):
+            return provider.get_panel_state()
+        return {}
+
+    @staticmethod
+    def _restore_panels(
+        canvas, panels_data: Dict[str, Any], uuid_map: Dict[str, Any]
+    ) -> None:
+        """Recreate dock panels from saved state.
+
+        Delegates to ``CanvasCommandsMixin.restore_panel_state()``
+        which handles both dynamic inspectors and static mirrors.
+        """
+        provider = getattr(canvas, "_context_menu_provider", None)
+        if provider is not None and hasattr(provider, "restore_panel_state"):
+            provider.restore_panel_state(panels_data, uuid_map)
+
     # =======================================================================
     # DESERIALIZE (Load)
     # =======================================================================
@@ -473,33 +468,28 @@ class GraphSerializer:
         canvas,
         json_str: str,
         view=None,
-        minimap=None,
         clear_first: bool = True,
     ) -> bool:
         """
-        Restore the full application state from a JSON string.
+        Restore the graph state from a JSON string.
 
         Restore order:
-            1. Clear canvas
-            2. Canvas settings (grid, bg, snapping)
+            1. Clear canvas (including dock panels)
+            2. Canvas settings
             3. ALL nodes (instantiate, restore_state, add_node)
             4. View (zoom, center)
-            5. Minimap (corner, pin, minimize)
-            6. Connections (LAST — all nodes and ports guaranteed to exist)
-            7. Mark nodes dirty (trigger evaluation with connections in place)
+            5. Connections
+            6. Dock panels (inspectors + static mirrors)
+            7. Mark nodes dirty (trigger evaluation)
 
-        NOTE: Theme/style state is NOT restored from graph files.  The active
-        theme is a user-level preference managed by StyleManager / QSettings.
-        Theme-driven visual properties (bg_color, grid_color, grid_line_width)
-        are not present in the canvas section and will not override the current
-        theme.  Per-node header colour overrides (palette indices) are restored
-        as part of each node's own state.
+        Workspace preferences (theme, grid type, trace style, snapping,
+        minimap) are NOT restored from graph files — they are managed
+        by StyleManager / QSettings.
 
         Args:
             canvas:        The QtNodeCanvas to restore into.
             json_str:      The JSON string produced by serialize().
             view:          Optional QGraphicsView to restore viewport state.
-            minimap:       Optional QtNodeMinimap to restore minimap state.
             clear_first:   Whether to clear the scene before restoring.
 
         Returns:
@@ -587,22 +577,11 @@ class GraphSerializer:
                 _debug_print(f"  FAILED: {e}")
 
         # ---------------------------------------------------------------
-        # 5. Minimap
-        # ---------------------------------------------------------------
-        if minimap is not None and "minimap" in data:
-            _debug_print("Phase 5: Restoring minimap state")
-            try:
-                self._restore_minimap(minimap, data["minimap"])
-            except Exception as e:
-                log.error(f"Exception in _restore_minimap: {type(e).__name__}: {e}")
-                _debug_print(f"  FAILED: {e}")
-
-        # ---------------------------------------------------------------
-        # 6. Connections — LAST, after all nodes and ports are guaranteed
+        # 5. Connections — after all nodes and ports are guaranteed
         #    to exist and be added to the scene
         # ---------------------------------------------------------------
         conn_list = data.get("connections", [])
-        _debug_print(f"Phase 6: Restoring {len(conn_list)} connections")
+        _debug_print(f"Phase 5: Restoring {len(conn_list)} connections")
         conn_success = 0
         conn_failed = 0
 
@@ -619,6 +598,17 @@ class GraphSerializer:
                 _debug_print(f"  Connection [{i}] EXCEPTION: {type(e).__name__}: {e}")
 
         _debug_print(f"  Connection restore complete: {conn_success} OK, {conn_failed} failed")
+
+        # ---------------------------------------------------------------
+        # 6. Panels — recreate dock panels (inspectors + static mirrors)
+        # ---------------------------------------------------------------
+        if "panels" in data:
+            _debug_print("Phase 6: Restoring dock panels")
+            try:
+                self._restore_panels(canvas, data["panels"], uuid_map)
+            except Exception as e:
+                log.error(f"Exception in _restore_panels: {type(e).__name__}: {e}")
+                _debug_print(f"  FAILED: {e}")
 
         # ---------------------------------------------------------------
         # 7. Post-restore: mark all nodes dirty so they evaluate with
@@ -641,7 +631,12 @@ class GraphSerializer:
     # -- Clear --------------------------------------------------------------
 
     def _clear_canvas(self, canvas) -> None:
-        """Clear the scene, preferring the canvas's own method."""
+        """Clear the scene and close all dock panels."""
+        # Close dock panels first (before nodes are destroyed).
+        provider = getattr(canvas, "_context_menu_provider", None)
+        if provider is not None and hasattr(provider, "cmd_close_all_panels"):
+            provider.cmd_close_all_panels()
+
         if hasattr(canvas, "clear_scene"):
             canvas.clear_scene()
         elif hasattr(canvas, "_node_manager"):
@@ -652,28 +647,18 @@ class GraphSerializer:
     # -- Restore Canvas Settings --------------------------------------------
 
     def _restore_canvas(self, canvas, canvas_data: Dict[str, Any]) -> None:
-        """Apply grid, snapping, and behavioral settings.
+        """Restore per-graph canvas state.
 
-        Theme-driven visual properties (bg_color, grid_color, grid_line_width)
-        are intentionally skipped — they belong to the active theme managed by
-        StyleManager and should never be overridden by a graph file.
+        Behavioral settings (grid type, snapping, trace style) are
+        workspace preferences managed by StyleManager / QSettings and
+        are NOT restored from graph files.  The scene rect is
+        recalculated automatically by the orchestrator after nodes are
+        placed, so no explicit restore is needed here.
+
+        This method is kept for forward-compatibility: future per-graph
+        settings can be handled here without changing the caller.
         """
-        config_updates: Dict[str, Any] = {}
-
-        # Behavioral / workspace keys only — no theme colors
-        _PASSTHROUGH_KEYS = {
-            "grid_spacing", "grid_type",
-            "snapping_enabled", "connection_snap_radius",
-            "shake_to_disconnect", "max_visible_grid_lines",
-        }
-
-        for key in _PASSTHROUGH_KEYS:
-            if key in canvas_data:
-                config_updates[key] = canvas_data[key]
-
-        # Apply via set_config (which updates StyleManager and triggers cache sync)
-        if config_updates and hasattr(canvas, "set_config"):
-            canvas.set_config(**config_updates)
+        pass  # All canvas settings are now workspace preferences.
 
     # -- Restore View -------------------------------------------------------
 
@@ -698,51 +683,6 @@ class GraphSerializer:
                 view.centerOn(center)
             else:
                 view.centerOn(center[0], center[1])
-
-    # -- Restore Minimap ----------------------------------------------------
-
-    def _restore_minimap(self, minimap, mm_data: Dict[str, Any]) -> None:
-        """Restore minimap corner, pin/hide state, and dimensions."""
-        # Dimensions first (affects positioning)
-        config_updates: Dict[str, Any] = {}
-        if "width" in mm_data:
-            config_updates["width"] = mm_data["width"]
-        if "height" in mm_data:
-            config_updates["height"] = mm_data["height"]
-        if config_updates and hasattr(minimap, "set_config"):
-            minimap.set_config(**config_updates)
-
-        # Corner
-        if "corner" in mm_data:
-            try:
-                from qt_minimap import MinimapCorner
-                corner = MinimapCorner[mm_data["corner"]]
-                minimap._current_corner = corner
-            except (KeyError, ImportError):
-                pass
-
-        # Pin state
-        if "is_pinned" in mm_data:
-            minimap._auto_hide_enabled = not mm_data["is_pinned"]
-
-        # Minimized state
-        if "is_minimized" in mm_data:
-            if mm_data["is_minimized"] and not minimap._is_minimized:
-                if hasattr(minimap, "_perform_minimize"):
-                    minimap._perform_minimize()
-            elif not mm_data["is_minimized"] and minimap._is_minimized:
-                if hasattr(minimap, "_perform_expand"):
-                    minimap._perform_expand()
-
-        # Reposition
-        if hasattr(minimap, "update_position"):
-            minimap.update_position()
-
-    # -- Restore Style/Theme ------------------------------------------------
-    # NOTE: Theme state is intentionally NOT restored from graph files.
-    # The active theme is managed by StyleManager / QSettings.  Canvas
-    # colour properties (bg_color, grid_color, grid_line_width) are not
-    # saved so they cannot override the user's current theme.
 
     # -- Restore Single Node ------------------------------------------------
 
@@ -922,12 +862,11 @@ class GraphSerializer:
         filepath: str,
         canvas,
         view=None,
-        minimap=None,
     ) -> bool:
         """Serialize and write to a file."""
         try:
             json_str = self.serialize(
-                canvas, view=view, minimap=minimap
+                canvas, view=view
             )
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(json_str)
@@ -942,7 +881,6 @@ class GraphSerializer:
         filepath: str,
         canvas,
         view=None,
-        minimap=None,
     ) -> bool:
         """Read from a file and deserialize."""
         try:
@@ -950,7 +888,7 @@ class GraphSerializer:
                 json_str = f.read()
             result = self.deserialize(
                 canvas, json_str,
-                view=view, minimap=minimap
+                view=view,
             )
             return result
         except FileNotFoundError:
@@ -964,28 +902,3 @@ class GraphSerializer:
     # BACKWARD COMPATIBILITY (Removed for clean version)
     # =======================================================================
 
-
-# ===========================================================================
-# Internal helper
-# ===========================================================================
-
-def _safe_attr(obj, prop_name: Optional[str], attr_name: Optional[str], default=None):
-    """
-    Try to read a property first, then fall back to a private attribute.
-    Handles missing attributes gracefully.
-    """
-    if prop_name:
-        try:
-            val = getattr(obj, prop_name, None)
-            if val is not None:
-                return val
-        except Exception:
-            pass
-    if attr_name:
-        try:
-            val = getattr(obj, attr_name, None)
-            if val is not None:
-                return val
-        except Exception:
-            pass
-    return default

@@ -34,6 +34,9 @@ from weave.node.node_subcomponents import NodeState
 from weave.logger import get_logger
 log = get_logger("NodeDataFlow")
 
+#mouse jump diagnostics:
+from weave.node_drag_diagnostic import NodeDragDiagnostic
+
 
 class DisabledBehavior(Enum):
     """Defines what downstream nodes receive when this node is disabled."""
@@ -401,6 +404,7 @@ class DisabledMarker:
         return False  # Evaluates to False in boolean context
 
 
+#class BaseControlNode(NodeDragDiagnostic, Node, NodeDataFlow):
 class BaseControlNode(Node, NodeDataFlow):
     """Hybrid Node: Combines UI (Node) with Logic (NodeDataFlow).
     

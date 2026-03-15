@@ -52,6 +52,13 @@ _SETTINGS_APP  = "Weave"
 _SETTINGS_KEY  = "ui/active_theme"
 _DEFAULT_THEME = "dark"          # Hard fallback when everything else fails
 
+# Workspace preference keys (persisted alongside the theme)
+_WS_GRID_TYPE        = "workspace/grid_type"
+_WS_TRACE_STYLE      = "workspace/trace_style"
+_WS_SNAPPING         = "workspace/snapping_enabled"
+_WS_MINIMAP_MIN      = "workspace/minimap_minimized"
+_WS_MINIMAP_CORNER   = "workspace/minimap_corner"
+
 DEBUG_STYLE_MANAGER = True
 
 def _debug_print(msg: str):
@@ -508,6 +515,10 @@ class StyleManager(QObject):
         if theme_name not in THEMES:
             return False
 
+        # Snapping is a workflow preference that must survive theme
+        # switches.  Read the persisted value before the reset.
+        persisted_snapping = self._read_persisted_snapping()
+
         # Suppress all signals while we reset + apply overrides.
         # We will do a single full broadcast afterwards so there is
         # no need for the incremental batch notifications.
@@ -516,6 +527,11 @@ class StyleManager(QObject):
             self._reset_to_defaults()
             for category, overrides in THEMES[theme_name].items():
                 self.update(category, **overrides)
+
+            # Re-apply snapping (suppressed — broadcast happens below).
+            if persisted_snapping is not None:
+                self.update(StyleCategory.CANVAS,
+                            snapping_enabled=persisted_snapping)
         finally:
             self._suppress_signals = False
             
@@ -542,6 +558,25 @@ class StyleManager(QObject):
 
         return True
 
+    def apply_theme_and_prefs(self, theme_name: str) -> bool:
+        """Apply *theme_name* then layer workspace preferences on top.
+
+        Use this for the one-time deferred re-apply in
+        ``CanvasView.showEvent`` where the geometry has just settled and
+        the full theme + workspace state must be broadcast together.
+
+        For user-initiated theme switches (menu clicks), use
+        ``apply_theme()`` directly — the new theme's grid/trace
+        defaults should take effect, not the user's old overrides.
+        """
+        if not self.apply_theme(theme_name):
+            return False
+        self._apply_workspace_prefs_silent()
+        # Re-broadcast the merged state so all subscribers see it.
+        for category in (StyleCategory.CANVAS, StyleCategory.TRACE):
+            self._notify_subscribers(category, self.get_all(category))
+        return True
+
     # ==========================================================================
     # STARTUP: DISCOVERY + RESTORE
     # ==========================================================================
@@ -549,14 +584,20 @@ class StyleManager(QObject):
     def _boot(self) -> None:
         """
         Called exactly once after the singleton is created (from ``instance()``).
-        Discovers external theme files, then restores the last-used theme.
-        Guarded by ``_initialized`` so re-entrant calls are harmless.
+        Discovers external theme files, restores the last-used theme, then
+        applies workspace preferences on top.
+
+        Workspace prefs (grid type, trace style, snapping) are applied
+        here and in ``apply_theme_and_prefs()`` — but NOT in
+        ``apply_theme()`` itself, so that user-initiated theme switches
+        via the menu get the new theme's grid/trace defaults.
         """
         if self._initialized:
             return
         self._initialized = True
         self._discover_theme_files()
         self.restore_theme()
+        self._apply_workspace_prefs_silent()
 
     def _discover_theme_files(self) -> None:
         """
@@ -639,6 +680,20 @@ class StyleManager(QObject):
             _debug_print(f"_load_persisted_theme_name() failed: {exc}")
             return None
 
+    @staticmethod
+    def _read_persisted_snapping() -> Optional[bool]:
+        """Read persisted snapping_enabled from QSettings, or None."""
+        try:
+            s = StyleManager._settings()
+            val = s.value(_WS_SNAPPING, defaultValue=None)
+            if val is None:
+                return None
+            if isinstance(val, str):
+                return val.lower() == "true"
+            return bool(val)
+        except Exception:
+            return None
+
     def restore_theme(self) -> str:
         """
         Restore the last-used theme from QSettings.
@@ -684,6 +739,133 @@ class StyleManager(QObject):
 
         _debug_print("restore_theme(): no themes available at all!")
         return self._current_theme
+
+    # ── Workspace preferences (grid, trace, snapping, minimap) ───────────
+
+    def _apply_workspace_prefs_silent(self) -> None:
+        """Read workspace prefs from QSettings and apply to schemas.
+
+        Called from ``apply_theme()`` *before* the full broadcast so
+        that subscribers see the merged theme + workspace state in a
+        single notification.  Signals are suppressed during application
+        to avoid redundant per-key notifications.
+        """
+        try:
+            s = self._settings()
+            canvas_updates: Dict[str, Any] = {}
+            trace_updates: Dict[str, Any] = {}
+
+            grid_type = s.value(_WS_GRID_TYPE, defaultValue=None)
+            if grid_type is not None:
+                canvas_updates["grid_type"] = int(grid_type)
+
+            snapping = s.value(_WS_SNAPPING, defaultValue=None)
+            if snapping is not None:
+                if isinstance(snapping, str):
+                    canvas_updates["snapping_enabled"] = snapping.lower() == "true"
+                else:
+                    canvas_updates["snapping_enabled"] = bool(snapping)
+
+            trace_type = s.value(_WS_TRACE_STYLE, defaultValue=None)
+            if trace_type is not None:
+                trace_updates["connection_type"] = str(trace_type)
+
+            # Apply with signals suppressed — the caller (apply_theme)
+            # does a full broadcast afterwards.
+            old_suppress = self._suppress_signals
+            self._suppress_signals = True
+            try:
+                if canvas_updates:
+                    self.update(StyleCategory.CANVAS, **canvas_updates)
+                if trace_updates:
+                    self.update(StyleCategory.TRACE, **trace_updates)
+            finally:
+                self._suppress_signals = old_suppress
+                # Discard pending changes generated by the silent apply —
+                # the full broadcast in apply_theme sends everything.
+                self._pending_changes = {}
+
+            _debug_print(
+                f"Applied workspace prefs (silent): canvas={canvas_updates}, "
+                f"trace={trace_updates}"
+            )
+        except Exception as exc:
+            _debug_print(f"_apply_workspace_prefs_silent() failed: {exc}")
+
+    def persist_workspace_prefs(self) -> None:
+        """Write current workspace preferences to QSettings.
+
+        Called after explicit user changes (grid type, trace style,
+        snapping toggle) and from ``persist_all()`` on app close.
+        """
+        try:
+            s = self._settings()
+            # Grid type (enum → int)
+            grid_type = self.get(StyleCategory.CANVAS, "grid_type")
+            if grid_type is not None:
+                val = grid_type.value if hasattr(grid_type, "value") else int(grid_type)
+                s.setValue(_WS_GRID_TYPE, val)
+            # Trace connection type (string)
+            trace_type = self.get(StyleCategory.TRACE, "connection_type")
+            if trace_type is not None:
+                s.setValue(_WS_TRACE_STYLE, str(trace_type))
+            # Snapping enabled (bool)
+            snapping = self.get(StyleCategory.CANVAS, "snapping_enabled")
+            if snapping is not None:
+                s.setValue(_WS_SNAPPING, bool(snapping))
+            s.sync()
+            _debug_print("Persisted workspace preferences")
+        except Exception as exc:
+            _debug_print(f"persist_workspace_prefs() failed: {exc}")
+
+    def persist_all(self) -> None:
+        """Persist all workspace state.  Call on app close.
+
+        Writes the active theme name and all workspace preferences
+        (grid type, trace style, snapping) to QSettings in one go.
+        Minimap state (minimized, corner) should already be persisted
+        individually when the user toggles them.
+        """
+        self._persist_theme(self._current_theme)
+        self.persist_workspace_prefs()
+
+    # ── Minimap state ────────────────────────────────────────────────────
+
+    def get_minimap_minimized(self) -> bool:
+        """Read the persisted minimap-minimized state."""
+        try:
+            val = self._settings().value(_WS_MINIMAP_MIN, defaultValue=False)
+            if isinstance(val, str):
+                return val.lower() == "true"
+            return bool(val)
+        except Exception:
+            return False
+
+    def set_minimap_minimized(self, minimized: bool) -> None:
+        """Persist the minimap-minimized state."""
+        try:
+            s = self._settings()
+            s.setValue(_WS_MINIMAP_MIN, minimized)
+            s.sync()
+        except Exception as exc:
+            _debug_print(f"set_minimap_minimized() failed: {exc}")
+
+    def get_minimap_corner(self) -> Optional[str]:
+        """Read the persisted minimap corner name (e.g. 'TOP_RIGHT')."""
+        try:
+            val = self._settings().value(_WS_MINIMAP_CORNER, defaultValue=None)
+            return str(val) if val is not None else None
+        except Exception:
+            return None
+
+    def set_minimap_corner(self, corner_name: str) -> None:
+        """Persist the minimap corner name."""
+        try:
+            s = self._settings()
+            s.setValue(_WS_MINIMAP_CORNER, corner_name)
+            s.sync()
+        except Exception as exc:
+            _debug_print(f"set_minimap_corner() failed: {exc}")
     
     def register_theme(self, name: str, overrides: Dict[StyleCategory, Dict[str, Any]]) -> None:
         THEMES[name] = overrides

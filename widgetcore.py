@@ -241,7 +241,8 @@ class WidgetCore(QWidget):
         The argument is the *port_name* that changed.
     """
 
-    value_changed = Signal(str)  # port_name
+    value_changed = Signal(str)  # port_name — user edits (suppressed during set_port_value)
+    port_value_written = Signal(str)  # port_name — every programmatic write via set_port_value
 
     # ── Construction ──────────────────────────────────────────────────────
 
@@ -768,7 +769,12 @@ class WidgetCore(QWidget):
         return {name: self.get_port_value(name) for name in self._bindings}
 
     def set_port_value(self, port_name: str, value: Any) -> None:
-        """Push a value *into* the widget (signals blocked)."""
+        """Push a value *into* the widget (signals blocked).
+
+        After the widget is updated, the hosting ``QGraphicsProxyWidget``
+        is asked to repaint so that the change is visible immediately —
+        even if no other scene event triggers a redraw.
+        """
         binding = self._bindings.get(port_name)
         if binding is None:
             return
@@ -783,6 +789,21 @@ class WidgetCore(QWidget):
             log.warning(f"Failed to set value for port '{port_name}': {e}")
         finally:
             self._suppress_depth -= 1
+
+        # Schedule a repaint on the proxy so the updated widget value is
+        # composited into the scene immediately.  Without this, changes
+        # pushed from upstream or from a mirror panel may only become
+        # visible on the next unrelated scene redraw (hover, scroll …).
+        proxy = self._find_proxy()
+        if proxy is not None:
+            proxy.update()
+
+        # Notify external observers (dock panels, mirrors) that the
+        # widget value was written.  This is emitted *outside* the
+        # suppress guard so it always fires — unlike value_changed
+        # which is suppressed during programmatic writes to prevent
+        # compute feedback loops.
+        self.port_value_written.emit(port_name)
 
     # ══════════════════════════════════════════════════════════════════════
     # Auto-disable (when an input port gets connected)

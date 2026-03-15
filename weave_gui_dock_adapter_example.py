@@ -51,10 +51,10 @@ def main():
     #
     # Click a node to inspect it.  Click empty space to clear.
     # Close the dock → it hides.  Reopen from View > Inspector.
-    inspector = NodeDockAdapter.create_dynamic(
-        "Inspector", scene, parent=win
-    )
-    win.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, inspector)
+    #inspector = NodeDockAdapter.create_dynamic(
+    #    "Inspector", scene, parent=win
+    #)
+    #win.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, inspector)
 
     # ── 2) Static dock — pinned to a specific node (left side) ───────
     #
