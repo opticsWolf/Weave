@@ -101,15 +101,22 @@ class CanvasMinimap(QGraphicsView):
             MinimapButton.SNAP: IconSnap()
         }
 
-        # Interaction State
-        self._current_corner = MinimapCorner.TOP_RIGHT
+        # Interaction State — restore persisted corner, fall back to TOP_RIGHT
+        persisted_corner = self._style_manager.get_minimap_corner()
+        if persisted_corner and hasattr(MinimapCorner, persisted_corner):
+            self._current_corner = MinimapCorner[persisted_corner]
+        else:
+            self._current_corner = MinimapCorner.TOP_RIGHT
+
         self._is_panning_view = False
         self._is_dragging_widget = False
         self._drag_start_pos = QPointF()
         
-        # Auto-Hide State
-        self._auto_hide_enabled = False  # False = Pinned (Always visible)
-        self._is_minimized = False       # Visual state (Icon mode vs Map mode)
+        # Auto-Hide State — restore persisted minimized state.
+        # If it was minimized, auto-hide must also be enabled, otherwise
+        # the expand/minimize hover cycle won't function correctly.
+        self._is_minimized = self._style_manager.get_minimap_minimized()
+        self._auto_hide_enabled = self._is_minimized
         
         # UI State
         self._hovered_button: MinimapButton = MinimapButton.NONE
@@ -352,7 +359,7 @@ class CanvasMinimap(QGraphicsView):
         # Note: resizeEvent automatically calls fitInView because _is_minimized is False
 
     def _on_anim_finished(self):
-        """Finalize state after animation."""
+        """Finalize state after animation and persist."""
         if self._anim_target_is_minimized:
             self._is_minimized = True
             # Force update to redraw as Icon
@@ -361,6 +368,7 @@ class CanvasMinimap(QGraphicsView):
             self._is_minimized = False
             # Ensure precise final geometry
             self.update_position()
+        self._style_manager.set_minimap_minimized(self._is_minimized)
 
     # =========================================================================
     # UI GEOMETRY
@@ -731,6 +739,7 @@ class CanvasMinimap(QGraphicsView):
         if hasattr(self._target_scene, 'set_config') and hasattr(self._target_scene, 'snapping_enabled'):
             new_state = not self._target_scene.snapping_enabled
             self._target_scene.set_config(snapping_enabled=new_state)
+            self._style_manager.persist_workspace_prefs()
             self.viewport().update()
         else:
             log.info("Target scene does not support snapping configuration.")
@@ -785,6 +794,7 @@ class CanvasMinimap(QGraphicsView):
         
         best_corner = min(corners, key=lambda x: (current_pos.x()-x[1][0])**2 + (current_pos.y()-x[1][1])**2)[0]
         self._current_corner = best_corner
+        self._style_manager.set_minimap_corner(best_corner.name)
         self.update_position()
 
     def _update_main_view_from_minimap(self, pos: QPointF) -> None:
