@@ -13,6 +13,16 @@ Provides ``PanelHeader``: a slim ``QWidget`` strip that displays the
 bound node's title, a persistent state badge beneath it, and an
 optional *pin* toggle for dynamic panels.
 
+Static vs Dynamic title
+-----------------------
+**Dynamic** panels display the node name inside the header because
+the dock title bar shows a generic label (e.g. "Inspector").
+
+**Static** panels do *not* display the node name inside the header
+because the dock title bar itself is set to the node name.  Showing
+it in both places would be redundant.  Call
+``set_static_mode(True)`` to hide the title label.
+
 Pin button
 ----------
 The pin button is a small checkable ``QPushButton`` shown only for
@@ -46,12 +56,15 @@ class PanelHeader(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
 
+        self._static_mode: bool = False
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 6, 8, 4)
         outer.setSpacing(2)
 
         # ── Top row: title + pin button ──────────────────────────────
-        top_row = QHBoxLayout()
+        self._top_row_widget = QWidget()
+        top_row = QHBoxLayout(self._top_row_widget)
         top_row.setContentsMargins(0, 0, 0, 0)
         top_row.setSpacing(6)
 
@@ -76,7 +89,7 @@ class PanelHeader(QWidget):
         self._pin_btn.hide()
         top_row.addWidget(self._pin_btn)
 
-        outer.addLayout(top_row)
+        outer.addWidget(self._top_row_widget)
 
         # ── Bottom row: state badge ──────────────────────────────────
         self._state_label = QLabel()
@@ -95,6 +108,16 @@ class PanelHeader(QWidget):
 
     def set_state_text(self, text: str) -> None:
         self._state_label.setText(text)
+
+    def set_static_mode(self, static: bool) -> None:
+        """Enable or disable *static mode*.
+
+        In static mode the title row is hidden because the dock title
+        bar already shows the node name.  The state badge remains
+        visible.
+        """
+        self._static_mode = static
+        self._top_row_widget.setVisible(not static)
 
     # ── Pin button ───────────────────────────────────────────────────────
 

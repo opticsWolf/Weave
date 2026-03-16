@@ -51,6 +51,8 @@ from weave.panel.mirror_factories import (
     MirrorFactory,
     _DEFAULT_FACTORIES,
     _MIRROR_SIGNAL_MAP,
+    get_custom_factory as _get_custom_factory,
+    _CUSTOM_SIGNAL_MAP,
 )
 from weave.panel.panel_header import PanelHeader
 
@@ -110,6 +112,9 @@ class NodePanel(QWidget):
     node_unbound = Signal()
     linked_node_lost = Signal()
     pin_changed = Signal(bool)
+    # Emitted in **static** mode when the node's title changes so the
+    # parent ``NodeDockAdapter`` can update the dock's title bar.
+    dock_title_changed = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -275,7 +280,20 @@ class NodePanel(QWidget):
 
         self._node = node
         self._static = static
-        self._header.set_title(self._node_title(node))
+        self._header.set_static_mode(static)
+
+        title = self._node_title(node)
+        if not static:
+            # Dynamic panels show the node name in the header because the
+            # dock title bar has a generic label (e.g. "Inspector").
+            self._header.set_title(title)
+        else:
+            # Static panels use the dock title bar for the node name, so
+            # the header title row is hidden.  Emit a signal so that the
+            # parent dock adapter can update its QDockWidget title.
+            self._header.set_title("")
+            self.dock_title_changed.emit(title)
+
         self._build_mirrors()
 
         # Show the current node state in the header badge.
@@ -586,15 +604,17 @@ class NodePanel(QWidget):
         Create a mirror widget for *binding*.
 
         Resolution order:
-        1. Custom factory registered via ``register_mirror_factory()``
-           (exact type match).
-        2. Built-in factory list (``isinstance`` check, subclass-first).
-        3. ``None`` if no factory can handle the type.
+        1. Custom factory registered on *this panel* via
+           ``register_mirror_factory()`` (exact type match).
+        2. Global custom factory registered via
+           ``mirror_factories.register_mirror_factory()`` (exact type).
+        3. Built-in factory list (``isinstance`` check, subclass-first).
+        4. ``None`` if no factory can handle the type.
         """
         original = binding.widget
         orig_type = type(original)
 
-        # 1. Custom factory (exact match)
+        # 1. Panel-local custom factory (exact match)
         factory = self._custom_factories.get(orig_type)
         if factory is not None:
             try:
@@ -604,7 +624,17 @@ class NodePanel(QWidget):
                     f"Custom mirror factory for {orig_type.__name__} failed: {exc}"
                 )
 
-        # 2. Built-in factories
+        # 2. Global custom factory (exact match)
+        global_factory = _get_custom_factory(orig_type)
+        if global_factory is not None:
+            try:
+                return global_factory(original, binding)
+            except Exception as exc:
+                log.warning(
+                    f"Global mirror factory for {orig_type.__name__} failed: {exc}"
+                )
+
+        # 3. Built-in factories
         for cls, factory_fn in _DEFAULT_FACTORIES:
             if isinstance(original, cls):
                 try:
@@ -630,10 +660,16 @@ class NodePanel(QWidget):
     ) -> None:
         """Connect the mirror widget's change signal → push value to node."""
         sig_name: Optional[str] = None
+
+        # 1. Built-in signal map
         for cls, name in _MIRROR_SIGNAL_MAP.items():
             if isinstance(mirror, cls):
                 sig_name = name
                 break
+
+        # 2. Global custom signal map (exact type)
+        if sig_name is None:
+            sig_name = _CUSTOM_SIGNAL_MAP.get(type(mirror))
 
         # QPushButton.clicked → forward to the original button
         if sig_name is None and isinstance(mirror, QPushButton):
@@ -686,6 +722,7 @@ class NodePanel(QWidget):
         if slot is None:
             return
 
+        # Try built-in signal map first.
         for cls, sig_name in _MIRROR_SIGNAL_MAP.items():
             if isinstance(mirror, cls):
                 sig = getattr(mirror, sig_name, None)
@@ -695,6 +732,17 @@ class NodePanel(QWidget):
                     except (RuntimeError, TypeError):
                         pass
                 return
+
+        # Try global custom signal map (exact type).
+        custom_sig_name = _CUSTOM_SIGNAL_MAP.get(type(mirror))
+        if custom_sig_name is not None:
+            sig = getattr(mirror, custom_sig_name, None)
+            if sig is not None:
+                try:
+                    sig.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+            return
 
         if isinstance(mirror, QPushButton):
             try:
@@ -744,8 +792,16 @@ class NodePanel(QWidget):
 
     @Slot(str)
     def _on_node_title_changed(self, new_title: str) -> None:
-        """The node's EditableTitle was edited — update the panel header."""
-        self._header.set_title(new_title)
+        """The node's EditableTitle was edited — update accordingly.
+
+        Dynamic panels update the header label.  Static panels emit
+        ``dock_title_changed`` so the parent ``NodeDockAdapter`` can
+        update the ``QDockWidget`` title bar.
+        """
+        if self._static:
+            self.dock_title_changed.emit(new_title)
+        else:
+            self._header.set_title(new_title)
 
     # ──────────────────────────────────────────────────────────────────────
     # Helpers

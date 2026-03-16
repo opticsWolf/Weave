@@ -6,17 +6,43 @@ Copyright (c) 2026 opticsWolf
 
 SPDX-License-Identifier: Apache-2.0
 
-mirror_factories — Built-in widget cloners and signal map
-==========================================================
+mirror_factories — Built-in widget cloners, signal map, and registry
+=====================================================================
 
 Contains the ``MirrorFactory`` type alias, all built-in ``_clone_*``
 functions, the ordered ``_DEFAULT_FACTORIES`` dispatch list, and the
 ``_MIRROR_SIGNAL_MAP`` used for bidirectional sync inside ``NodePanel``.
+
+Custom widget registration
+--------------------------
+Third-party or application-specific widget types can be registered
+globally so that *every* ``NodePanel`` / ``NodeDockAdapter`` instance
+can mirror them without per-panel factory registration::
+
+    from weave.panel.mirror_factories import register_mirror_factory
+
+    def clone_my_widget(src: MyWidget, binding: WidgetBinding) -> MyWidget:
+        w = MyWidget()
+        w.import_config(src.export_config())
+        return w
+
+    register_mirror_factory(
+        MyWidget,
+        clone_my_widget,
+        signal_name="valueChanged",   # optional
+    )
+
+The global registry is consulted by ``NodePanel._create_mirror`` after
+panel-local custom factories but *before* the built-in factories.
+
+``WidgetCore`` also consults the global signal registry when auto-
+detecting change signals for custom widgets (see ``_SIGNAL_MAP``
+extension in ``widgetcore.py``).
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Tuple, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -131,7 +157,7 @@ def _clone_pushbutton(src: QPushButton, _binding) -> QPushButton:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Dispatch tables
+# Dispatch tables (built-in)
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Ordered so subclasses are matched before base classes.
@@ -159,3 +185,77 @@ _MIRROR_SIGNAL_MAP: Dict[type, str] = {
     QTextEdit:      "textChanged",
     QPlainTextEdit: "textChanged",
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Global custom-widget registry
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# These registries are module-level singletons.  Any code that imports
+# ``mirror_factories`` sees the same dict, so registrations made at
+# import time (e.g. inside a plugin's ``__init__.py``) are immediately
+# visible to all ``NodePanel`` instances.
+
+_CUSTOM_FACTORIES: Dict[type, MirrorFactory] = {}
+"""Exact-type → factory mapping for globally registered custom widgets."""
+
+_CUSTOM_SIGNAL_MAP: Dict[type, str] = {}
+"""Exact-type → signal-name mapping for globally registered custom widgets.
+
+``WidgetCore._connect_change_signal`` consults this after its built-in
+``_SIGNAL_MAP`` so that custom widgets fire ``value_changed`` correctly
+even without an explicit ``change_signal_name`` in ``register_widget()``.
+"""
+
+
+def register_mirror_factory(
+    widget_type: type,
+    factory: MirrorFactory,
+    *,
+    signal_name: Optional[str] = None,
+) -> None:
+    """Register a global mirror-widget factory for *widget_type*.
+
+    Parameters
+    ----------
+    widget_type : type
+        The concrete QWidget subclass this factory handles.
+    factory : MirrorFactory
+        ``(original_widget, binding) -> QWidget``.  Must return a new
+        widget whose value is initialised from *original_widget*.
+    signal_name : str, optional
+        The name of the Qt signal on the widget that fires when the
+        user edits the value (e.g. ``"valueChanged"``).  If provided,
+        it is added to the global signal map so that both ``WidgetCore``
+        and ``NodePanel`` can auto-detect the change signal without the
+        node author passing ``change_signal_name`` explicitly.
+
+    Example
+    -------
+    ::
+
+        register_mirror_factory(
+            ColorPickerWidget,
+            lambda src, _b: ColorPickerWidget(src.color()),
+            signal_name="colorChanged",
+        )
+    """
+    _CUSTOM_FACTORIES[widget_type] = factory
+    if signal_name is not None:
+        _CUSTOM_SIGNAL_MAP[widget_type] = signal_name
+
+
+def unregister_mirror_factory(widget_type: type) -> None:
+    """Remove a previously registered global factory."""
+    _CUSTOM_FACTORIES.pop(widget_type, None)
+    _CUSTOM_SIGNAL_MAP.pop(widget_type, None)
+
+
+def get_custom_factory(widget_type: type) -> Optional[MirrorFactory]:
+    """Look up a globally registered factory by exact type."""
+    return _CUSTOM_FACTORIES.get(widget_type)
+
+
+def get_custom_signal_name(widget_type: type) -> Optional[str]:
+    """Look up a globally registered signal name by exact type."""
+    return _CUSTOM_SIGNAL_MAP.get(widget_type)
