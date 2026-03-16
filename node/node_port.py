@@ -56,7 +56,8 @@ class NodePort(QGraphicsItem):
         '_style_manager',
         '_state_overlay_color',  # New attribute for state overlay color
         'is_summary_port',       # True for dummy ports on minimized nodes
-        '_port_uuid'             # Added for unique port identification
+        '_port_uuid',            # Added for unique port identification
+        '_auto_disable'          # When True, disables matching widget on connection
     )
 
     def __init__(self, parent: 'Node', name: str, datatype: str, is_output: bool, 
@@ -73,10 +74,11 @@ class NodePort(QGraphicsItem):
         # Summary ports block connection dragging entirely.
         self.is_summary_port: bool = False
         self._is_highlighted = False
+        self._auto_disable: bool = False
         
-        # 1. Type & Color Lookup
+        # 1. Type & Color Lookup (colour resolved from theme palette)
         self.port_type = PortRegistry.get(datatype)
-        self.color = self.port_type.color
+        self.color = PortRegistry.resolve_color(self.port_type.color_index)
         
         # Connection State (handled in state machine now)
         self._is_connection_active = False
@@ -127,6 +129,8 @@ class NodePort(QGraphicsItem):
 
         # Register for style changes to keep port appearance updated
         self._style_manager.register(self, StyleCategory.PORT)
+        # Also listen for TRACE changes so palette swaps update port colours
+        self._style_manager.register(self, StyleCategory.TRACE)
 
 
     def get_uuid(self) -> uuid.UUID:
@@ -174,11 +178,18 @@ class NodePort(QGraphicsItem):
 
     def on_style_changed(self, category: StyleCategory, changes: dict) -> None:
         """
-        Called by the StyleManager when PORT style values change (e.g. theme switch).
+        Called by the StyleManager when PORT or TRACE style values change.
 
-        Refreshes every cached property that was snapshot at __init__ time:
-        config dict, radius, geometry paths, brushes, and label styling.
+        TRACE changes with 'trace_color_palette' trigger a colour re-resolve
+        so that every port picks up the new themed colour.
+
+        PORT changes refresh geometry, brushes, and label styling.
         """
+        if category == StyleCategory.TRACE:
+            if 'trace_color_palette' in changes:
+                self._refresh_color_from_palette()
+            return
+
         if category != StyleCategory.PORT:
             return
 
@@ -191,9 +202,8 @@ class NodePort(QGraphicsItem):
         # 3. Rebuild geometry paths (half-circle, inner circle, bounding rect)
         self._rebuild_paths()
 
-        # 4. Rebuild brushes — the highlight offset may have changed
-        hl_color = self._highlight_colors(self.color, self.cfg['highlight'], 20)
-        self._brush_highlight = QBrush(hl_color)
+        # 4. Re-resolve colour from palette (config offsets may have changed)
+        self._refresh_color_from_palette()
 
         # 5. Refresh label style and reposition it (font, color, spacing may differ)
         if self._label:
@@ -202,6 +212,31 @@ class NodePort(QGraphicsItem):
             self._position_label()
 
         # 6. Repaint
+        self.update()
+
+    def _refresh_color_from_palette(self) -> None:
+        """Re-resolve port colour from the active theme's trace_color_palette.
+
+        Called on theme switches and whenever the palette changes so that
+        port brushes and connected traces stay in sync with the current theme.
+
+        Connected traces are explicitly refreshed here to guarantee they
+        pick up the new port colour regardless of subscriber notification
+        ordering (WeakSet iteration is non-deterministic).
+        """
+        self.color = PortRegistry.resolve_color(self.port_type.color_index)
+        self._brush_default = QBrush(self.color)
+        hl_color = self._highlight_colors(self.color, self.cfg['highlight'], 20)
+        self._brush_highlight = QBrush(hl_color)
+
+        # Poke connected traces so they re-read self.color for their pen colour
+        for trace in self.connected_traces:
+            if hasattr(trace, 'refresh_style'):
+                try:
+                    trace.refresh_style()
+                except Exception:
+                    pass
+
         self.update()
 
     def _highlight_colors(self, color: QColor, b_offset: int, s_offset: int = 0) -> QColor:
@@ -328,6 +363,8 @@ class NodePort(QGraphicsItem):
         """
         Registers a connection. 
         Enforces: Input ports can only have ONE connection.
+        If _auto_disable is True on this input port, disables the matching
+        widget in the owning node's WidgetCore.
         """
         if not self.is_output and self.connected_traces:
             for existing_trace in list(self.connected_traces):
@@ -338,19 +375,42 @@ class NodePort(QGraphicsItem):
         
         if trace not in self.connected_traces:
             self.connected_traces.append(trace)
-            
+
+        # ── Auto-disable: grey-out the matching widget on connection ──
+        if self._auto_disable and not self.is_output:
+            self._set_widget_enabled(False)
+
         self.refresh_label_style()
         self.update()
 
     def remove_trace(self, trace: 'NodeTrace') -> None:
         if trace in self.connected_traces:
             self.connected_traces.remove(trace)
+
+            # ── Auto-disable: re-enable widget when last connection removed ──
+            if self._auto_disable and not self.is_output and not self.connected_traces:
+                self._set_widget_enabled(True)
+
             self.refresh_label_style()
             self.update()
 
     def get_connections(self) -> List['NodeTrace']:
         """Returns a copy of the connected traces list."""
         return self.connected_traces.copy()
+
+    def _set_widget_enabled(self, enabled: bool) -> None:
+        """Enable or disable the matching widget in the owning node's WidgetCore.
+
+        Looks up this port's *name* in the node's ``_widget_core`` bindings.
+        If a binding exists, the widget is enabled/disabled via
+        ``WidgetCore.set_port_enabled``.  Silently does nothing when no
+        WidgetCore or no matching binding is found.
+        """
+        core = getattr(self.node, '_widget_core', None)
+        if core is None:
+            return
+        if hasattr(core, 'set_port_enabled') and core.has_binding(self.name):
+            core.set_port_enabled(self.name, enabled)
 
     def disconnect_all(self) -> None:
         """
