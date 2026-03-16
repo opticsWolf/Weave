@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Weave: A modular PySide6 framework for the visual synthesis 
+Weave: A modular PySide6 framework for the visual synthesis
 and execution of high-concurrency simulation workflows.
 Copyright (c) 2026 opticsWolf
 
@@ -45,11 +45,21 @@ DYNAMIC
     the panel.  Closing the dock only hides it — reopen from the
     Window menu or ``dock.show()`` and it resumes following selection.
 
+    The dock title bar shows a generic label (e.g. "Inspector").
+    The *panel header* shows the node name.
+
 STATIC
     Permanently bound to one specific node.  If the linked node is
     deleted (removed from the scene or garbage-collected), the dock
     automatically closes and cleans up.  Closing the dock manually
     also unlinks from the node.
+
+    The dock *title bar* shows the **node name** (updated if renamed).
+    The panel header's title row is hidden to avoid redundancy.
+
+    If the node class defines a ``dock_properties`` attribute
+    (``DockProperties``), those hints are applied to the dock widget
+    (allowed areas, size constraints, feature flags).
 
 Usage
 -----
@@ -80,20 +90,35 @@ factory **before** binding the node::
 
     panel.register_mirror_factory(MyFancyWidget, my_factory)
     panel.bind_node(node_with_fancy_widgets)
+
+Or register globally so *all* panels can handle the type::
+
+    from weave.panel.mirror_factories import register_mirror_factory
+    register_mirror_factory(MyFancyWidget, my_factory, signal_name="valueChanged")
+
+Serialisation
+-------------
+``get_dock_state()`` / ``restore_dock_state()`` capture and restore the
+full geometry, position, floating/docked/minimised state, area, and
+visibility so that a workspace serialiser can save and replay the exact
+layout.
 """
 
 from __future__ import annotations
 
 from enum import Enum, auto
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
-from PySide6.QtCore import Signal, Slot, QTimer
-from PySide6.QtWidgets import QWidget, QDockWidget, QGraphicsScene
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QByteArray, QPoint, QSize
+from PySide6.QtWidgets import (
+    QWidget, QDockWidget, QGraphicsScene, QMainWindow,
+)
 
 if TYPE_CHECKING:
     from weave.node.node_core import Node
 
 from weave.logger import get_logger
+from weave.panel.dock_properties import DockProperties
 from weave.panel.mirror_factories import MirrorFactory
 from weave.panel.node_panel import NodePanel
 
@@ -160,6 +185,9 @@ class NodeDockAdapter(QDockWidget):
         # When the user unpins, re-sync to the current canvas selection
         self._panel.pin_changed.connect(self._on_pin_changed)
 
+        # When the node is renamed in static mode, update the dock title.
+        self._panel.dock_title_changed.connect(self._on_dock_title_changed)
+
     # ──────────────────────────────────────────────────────────────────────
     # Factory constructors
     # ──────────────────────────────────────────────────────────────────────
@@ -209,10 +237,18 @@ class NodeDockAdapter(QDockWidget):
         If the node is deleted, the dock closes automatically.
         If the user closes the dock manually, the node is unlinked.
 
+        The dock's title bar is set to the *node name* (and kept in
+        sync if the user renames it).  The *title* parameter is used
+        only as a fallback if the node has no readable name.
+
+        If the node class defines ``dock_properties``
+        (``DockProperties``), those hints (allowed areas, size
+        constraints, feature flags) are applied to the dock widget.
+
         Parameters
         ----------
         title : str
-            Dock title.
+            Fallback dock title (used when node name is unavailable).
         node : Node
             The node to pin.
         parent : QWidget, optional
@@ -220,6 +256,13 @@ class NodeDockAdapter(QDockWidget):
         """
         dock = cls(title, parent)
         dock._mode = DockMode.STATIC
+
+        # Apply node-level dock hints *before* binding so size
+        # constraints are in effect when the panel is first laid out.
+        dock_props = getattr(node, "dock_properties", None)
+        if isinstance(dock_props, DockProperties):
+            dock._apply_dock_properties(dock_props)
+
         dock._panel.bind_node(node, static=True)
         return dock
 
@@ -245,6 +288,9 @@ class NodeDockAdapter(QDockWidget):
         self._panel.bind_node(node, static=static)
         if static:
             self._mode = DockMode.STATIC
+            dock_props = getattr(node, "dock_properties", None)
+            if isinstance(dock_props, DockProperties):
+                self._apply_dock_properties(dock_props)
 
     def unbind(self) -> None:
         """Unbind from the current node."""
@@ -255,6 +301,309 @@ class NodeDockAdapter(QDockWidget):
     ) -> None:
         """Forward to the inner ``NodePanel``."""
         self._panel.register_mirror_factory(widget_type, factory)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # DockProperties application (change #3)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _apply_dock_properties(self, props: DockProperties) -> None:
+        """Apply *props* hints to this QDockWidget."""
+        # Allowed areas
+        if props.allowed_areas is not None:
+            self.setAllowedAreas(props.allowed_areas)
+
+        # Size constraints on the inner panel widget
+        panel = self._panel
+        if props.min_width is not None:
+            panel.setMinimumWidth(props.min_width)
+        if props.max_width is not None:
+            panel.setMaximumWidth(props.max_width)
+        if props.min_height is not None:
+            panel.setMinimumHeight(props.min_height)
+        if props.max_height is not None:
+            panel.setMaximumHeight(props.max_height)
+
+        # Preferred initial size
+        w = props.preferred_width or 0
+        h = props.preferred_height or 0
+        if w or h:
+            self.resize(max(w, self.width()), max(h, self.height()))
+
+        # Feature flags → QDockWidget.DockWidgetFeature flags
+        features = self.features()
+        if props.closable is not None:
+            if props.closable:
+                features |= QDockWidget.DockWidgetFeature.DockWidgetClosable
+            else:
+                features &= ~QDockWidget.DockWidgetFeature.DockWidgetClosable
+        if props.movable is not None:
+            if props.movable:
+                features |= QDockWidget.DockWidgetFeature.DockWidgetMovable
+            else:
+                features &= ~QDockWidget.DockWidgetFeature.DockWidgetMovable
+        if props.floatable is not None:
+            if props.floatable:
+                features |= QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            else:
+                features &= ~QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        self.setFeatures(features)
+
+        # Title bar visibility
+        if props.title_bar_visible is False:
+            self.setTitleBarWidget(QWidget())  # empty widget hides the bar
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Exposed QDockWidget properties (change #4)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def set_allowed_areas(self, areas: Qt.DockWidgetAreas) -> None:
+        """Set the allowed dock areas for this dock widget."""
+        self.setAllowedAreas(areas)
+
+    def set_features(
+        self,
+        *,
+        closable: Optional[bool] = None,
+        movable: Optional[bool] = None,
+        floatable: Optional[bool] = None,
+    ) -> None:
+        """Convenience method to toggle individual dock features.
+
+        Pass only the features you want to change; others stay as-is.
+        """
+        features = self.features()
+        flag = QDockWidget.DockWidgetFeature
+        if closable is not None:
+            if closable:
+                features |= flag.DockWidgetClosable
+            else:
+                features &= ~flag.DockWidgetClosable
+        if movable is not None:
+            if movable:
+                features |= flag.DockWidgetMovable
+            else:
+                features &= ~flag.DockWidgetMovable
+        if floatable is not None:
+            if floatable:
+                features |= flag.DockWidgetFloatable
+            else:
+                features &= ~flag.DockWidgetFloatable
+        self.setFeatures(features)
+
+    def set_floating(self, floating: bool) -> None:
+        """Programmatically float or dock the widget."""
+        self.setFloating(floating)
+
+    def set_title_bar_visible(self, visible: bool) -> None:
+        """Show or hide the dock's title bar.
+
+        Hiding the title bar also prevents moving, floating, and closing
+        by the user (the dock can still be closed programmatically).
+        """
+        if visible:
+            self.setTitleBarWidget(None)   # restore default title bar
+        else:
+            self.setTitleBarWidget(QWidget())
+
+    def set_minimum_size(self, width: int, height: int) -> None:
+        """Set the minimum size of the dock panel."""
+        self._panel.setMinimumSize(width, height)
+
+    def set_maximum_size(self, width: int, height: int) -> None:
+        """Set the maximum size of the dock panel."""
+        self._panel.setMaximumSize(width, height)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Serialisation (change #5)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def get_dock_state(self) -> Dict[str, Any]:
+        """Capture the full dock geometry and state for serialisation.
+
+        The returned dict is JSON-safe and contains everything needed
+        to recreate the dock in exactly the same position, size, and
+        mode when ``restore_dock_state()`` is called after the dock
+        has been re-created and added to a ``QMainWindow``.
+
+        The ``"main_window_state"`` key contains the
+        ``QMainWindow.saveState()`` bytes (hex-encoded) which stores
+        the complete docking layout including tabification and
+        split positions.  This should be saved *once per window*, not
+        per dock — it is included here for convenience when a single
+        dock is serialised in isolation.
+
+        Returns
+        -------
+        dict
+            JSON-safe state dict.
+        """
+        state: Dict[str, Any] = {
+            "mode": self._mode.name,
+            "title": self.windowTitle(),
+            "visible": self.isVisible(),
+            "floating": self.isFloating(),
+            "area": self._current_area_name(),
+            "features": int(self.features()),
+            "allowed_areas": int(self.allowedAreas()),
+        }
+
+        # Geometry
+        geo = self.geometry()
+        state["geometry"] = {
+            "x": geo.x(),
+            "y": geo.y(),
+            "width": geo.width(),
+            "height": geo.height(),
+        }
+
+        # Size constraints
+        state["min_size"] = {
+            "width": self._panel.minimumWidth(),
+            "height": self._panel.minimumHeight(),
+        }
+        state["max_size"] = {
+            "width": self._panel.maximumWidth(),
+            "height": self._panel.maximumHeight(),
+        }
+
+        # Floating window position (only meaningful when floating)
+        if self.isFloating():
+            fgeo = self.frameGeometry()
+            state["floating_geometry"] = {
+                "x": fgeo.x(),
+                "y": fgeo.y(),
+                "width": fgeo.width(),
+                "height": fgeo.height(),
+            }
+
+        # Node UUID (so the deserialiser can rebind static docks)
+        node = self._panel.node
+        if node is not None and hasattr(node, "get_uuid_string"):
+            state["node_uuid"] = node.get_uuid_string()
+        else:
+            state["node_uuid"] = None
+
+        # Pin state (dynamic mode)
+        state["pinned"] = self._panel.is_pinned
+
+        return state
+
+    def restore_dock_state(self, state: Dict[str, Any]) -> None:
+        """Restore dock geometry and state from a previously saved dict.
+
+        This method should be called **after** the dock has been added
+        to a ``QMainWindow`` (via ``addDockWidget``) so that Qt's
+        layout engine is available for area placement.
+
+        Parameters
+        ----------
+        state : dict
+            A dict previously returned by ``get_dock_state()``.
+        """
+        # Features & allowed areas
+        features_int = state.get("features")
+        if features_int is not None:
+            self.setFeatures(QDockWidget.DockWidgetFeature(features_int))
+
+        areas_int = state.get("allowed_areas")
+        if areas_int is not None:
+            self.setAllowedAreas(Qt.DockWidgetArea(areas_int))
+
+        # Size constraints
+        min_s = state.get("min_size", {})
+        if min_s.get("width") or min_s.get("height"):
+            self._panel.setMinimumSize(
+                min_s.get("width", 0), min_s.get("height", 0)
+            )
+        max_s = state.get("max_size", {})
+        if max_s.get("width") or max_s.get("height"):
+            self._panel.setMaximumSize(
+                max_s.get("width", 16777215), max_s.get("height", 16777215)
+            )
+
+        # Title
+        title = state.get("title")
+        if title:
+            self.setWindowTitle(title)
+
+        # Floating state & geometry
+        is_floating = state.get("floating", False)
+        self.setFloating(is_floating)
+
+        if is_floating:
+            fgeo = state.get("floating_geometry") or state.get("geometry")
+            if fgeo:
+                self.setGeometry(
+                    fgeo["x"], fgeo["y"],
+                    fgeo["width"], fgeo["height"],
+                )
+        else:
+            geo = state.get("geometry")
+            if geo:
+                self.resize(geo["width"], geo["height"])
+
+        # Visibility
+        vis = state.get("visible", True)
+        self.setVisible(vis)
+
+    def _current_area_name(self) -> str:
+        """Return the name of the dock area this widget currently occupies."""
+        main_win = self._find_main_window()
+        if main_win is not None:
+            area = main_win.dockWidgetArea(self)
+            return area.name if hasattr(area, "name") else str(int(area))
+        return "unknown"
+
+    def _find_main_window(self) -> Optional[QMainWindow]:
+        """Walk up the parent chain to find the hosting QMainWindow."""
+        parent = self.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QMainWindow):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+    @staticmethod
+    def save_main_window_dock_layout(main_window: QMainWindow) -> str:
+        """Save the full dock layout of *main_window* as a hex string.
+
+        This captures *all* dock widgets' positions, sizes, tabification,
+        and split ratios in a single blob that can be restored with
+        ``restore_main_window_dock_layout()``.
+
+        Usage::
+
+            layout_hex = NodeDockAdapter.save_main_window_dock_layout(win)
+            # persist layout_hex to file / database
+
+        Returns
+        -------
+        str
+            Hex-encoded ``QByteArray`` of ``QMainWindow.saveState()``.
+        """
+        return main_window.saveState().toHex().data().decode("ascii")
+
+    @staticmethod
+    def restore_main_window_dock_layout(
+        main_window: QMainWindow, hex_state: str
+    ) -> bool:
+        """Restore a previously saved dock layout.
+
+        Parameters
+        ----------
+        main_window : QMainWindow
+            The window whose layout to restore.
+        hex_state : str
+            Hex-encoded state previously returned by
+            ``save_main_window_dock_layout()``.
+
+        Returns
+        -------
+        bool
+            True if the state was restored successfully.
+        """
+        ba = QByteArray.fromHex(hex_state.encode("ascii"))
+        return main_window.restoreState(ba)
 
     # ──────────────────────────────────────────────────────────────────────
     # Close event
@@ -386,6 +735,15 @@ class NodeDockAdapter(QDockWidget):
         """
         if not pinned and self._mode == DockMode.DYNAMIC:
             self._sync_to_current_selection()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Title sync — static dock title follows node name (change #1)
+    # ──────────────────────────────────────────────────────────────────────
+
+    @Slot(str)
+    def _on_dock_title_changed(self, new_title: str) -> None:
+        """The node was renamed — update the dock's title bar."""
+        self.setWindowTitle(new_title)
 
     # ──────────────────────────────────────────────────────────────────────
     # Static-mode: linked node lost

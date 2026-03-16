@@ -31,10 +31,15 @@ ValidatorFunc = Callable[[Any], bool]
 class PortType:
     """
     Advanced Port Definition.
-    Integrates Visuals (Color), Logic (Validators), and Casting (Inheritance).
+    Integrates Visuals (Color Index), Logic (Validators), and Casting (Inheritance).
+
+    The ``color_index`` field is a zero-based index into the active theme's
+    ``trace_color_palette`` (managed by the StyleManager under
+    ``StyleCategory.TRACE``).  Call ``PortRegistry.resolve_color(color_index)``
+    to obtain the concrete ``QColor`` for the current theme.
     """
     name: str
-    color: QColor
+    color_index: int
     type_id: int
     python_type: Optional[Type] = field(default=None, compare=False, hash=False)
 
@@ -71,11 +76,23 @@ class PortType:
 class PortRegistry:
     """
     Central Manager for PortTypes.
+
+    Colour resolution
+    -----------------
+    Port types store a ``color_index`` that points into the active theme's
+    ``trace_color_palette``.  Use ``resolve_color(index)`` to obtain a
+    ``QColor`` at render-time so that trace and port colours follow the
+    current theme automatically.
     """
     _by_name: ClassVar[Dict[str, PortType]] = {}
     _by_id: ClassVar[Dict[int, PortType]] = {}
     _cast_registry: ClassVar[Dict[Tuple[int, int], Optional[ConverterFunc]]] = {}
     _next_id: ClassVar[int] = 200  # Auto IDs start above built-in range (0-199)
+
+    # Auto-incrementing colour-palette index for custom types.
+    # The default palette has 256 entries (indices 0-255).
+    # Custom types that do not specify an explicit index get 256+.
+    _next_color_index: ClassVar[int] = 256
 
     @classmethod
     def next_type_id(cls) -> int:
@@ -85,9 +102,41 @@ class PortRegistry:
         return tid
 
     @classmethod
+    def next_color_index(cls) -> int:
+        """Return the next available color_index and increment the counter."""
+        idx = cls._next_color_index
+        cls._next_color_index += 1
+        return idx
+
+    # ------------------------------------------------------------------
+    # Colour resolution  (index -> QColor via the active theme palette)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def resolve_color(cls, color_index: int) -> QColor:
+        """
+        Look up a ``QColor`` from the current theme's ``trace_color_palette``.
+
+        Falls back to a neutral gray when the StyleManager is not yet
+        available (e.g. during early import) or the index is out of range.
+        """
+        try:
+            from weave.stylemanager import StyleManager, StyleCategory
+            palette = StyleManager.instance().get(
+                StyleCategory.TRACE, 'trace_color_palette'
+            )
+            if palette and 0 <= color_index < len(palette):
+                c = palette[color_index]
+                return c if isinstance(c, QColor) else QColor(*c)
+        except Exception:
+            pass
+        # Hard fallback - neutral gray
+        return QColor(128, 128, 128, 255)
+
+    @classmethod
     def register(cls,
                  name: str,
-                 color: QColor,
+                 color_index: Optional[int] = None,
                  type_id: Optional[int] = None,
                  python_type: Optional[Type] = None,
                  base_type_id: int = -1,
@@ -102,6 +151,10 @@ class PortRegistry:
         if type_id is None:
             type_id = cls.next_type_id()
 
+        # Auto-assign colour index if not provided
+        if color_index is None:
+            color_index = cls.next_color_index()
+
         # Collision guards
         if type_id in cls._by_id:
             raise ValueError(f"type_id {type_id} already registered to '{cls._by_id[type_id].name}'")
@@ -113,7 +166,7 @@ class PortRegistry:
 
         new_type = PortType(
             name=name,
-            color=color,
+            color_index=color_index,
             type_id=type_id,
             python_type=python_type,
             base_type_id=base_type_id,
@@ -180,8 +233,8 @@ class PortRegistry:
 # ============================================================================
 #
 #  PRIMITIVES
-#    0  = Generic           (accepts everything — the universal fallback)
-#    1  = Dummy             (visual-only — minimised node summary ports)
+#    0  = Generic           (accepts everything - the universal fallback)
+#    1  = Dummy             (visual-only - minimised node summary ports)
 #   10  = Number            (abstract numeric parent)
 #   11  = Float
 #   12  = Int
@@ -194,23 +247,23 @@ class PortRegistry:
 #   42  = Tuple
 #   43  = Set
 #   50  = Dict
-#   51  = JSON              (serialized interchange — wraps dict/list)
+#   51  = JSON              (serialized interchange - wraps dict/list)
 #
 #  BINARY / RAW
 #   60  = Bytes
 #
 #  FLOW CONTROL
-#   70  = Exec              (execution trigger — carries no data)
+#   70  = Exec              (execution trigger - carries no data)
 #
 #  ARRAYS / DATAFRAMES
-#   80  = NdArray           (numpy — optional)
-#   81  = DataFrame         (polars — optional)
+#   80  = NdArray           (numpy - optional)
+#   81  = DataFrame         (polars - optional)
 #
 #  IMAGE
 #  100  = Image             (abstract parent for all image types)
 #  101  = QImage            (PySide6 QImage)
 #  102  = QPixmap           (PySide6 QPixmap)
-#  103  = PILImage          (Pillow — optional)
+#  103  = PILImage          (Pillow - optional)
 #
 #  UTILITIES
 #  110  = DateTime
@@ -222,6 +275,51 @@ class PortRegistry:
 #
 #  CUSTOM
 #  200+ = Reserved for user-registered custom types
+#
+# ============================================================================
+#
+# BUILT-IN COLOUR INDEX MAP  (into trace_color_palette)
+# ============================================================================
+#
+#  See color_index_mapping.md for the full reference table with
+#  target colours, matched palette entries, and distance metrics.
+#
+#   Palette
+#   Index   Port Type       Palette Colour
+#   ------  ---------       -----------------------
+#      9    Generic         [135, 135, 135, 255]
+#      8    Dummy           [120, 120, 120, 255]
+#      7    Number          [105, 105, 105, 255]
+#    125    Float           [  0, 255, 127, 255]
+#    166    Int             [  0, 127, 255, 255]
+
+
+#    166    Float           [  0, 127, 255, 255]
+#    125    Int             [  0, 255, 127, 255]
+#     24    Bool            [255,  76,  76, 255]
+#     59    String          [255, 191,   0, 255]
+#    221    Collection      [156,  89, 178, 255]
+#    207    List            [165,  76, 255, 255]
+#    204    Tuple           [113,  59, 222, 255]
+#    186    Set             [ 89,  89, 178, 255]
+#    139    Dict            [ 54, 217, 190, 255]
+#    140    JSON            [ 59, 222, 195, 255]
+#    185    Bytes           [ 59,  86, 222, 255]
+#     17    Exec            [255, 255, 255, 255]
+#    135    NdArray         [  0, 255, 191, 255]
+#     36    DataFrame       [222, 113,  59, 255]
+#    223    Image           [190,  54, 217, 255]
+#    222    QImage          [195,  59, 222, 255]
+#    217    QPixmap         [210,  76, 255, 255]
+#    240    PILImage        [217,  54, 163, 255]
+#     58    DateTime        [255, 210,  76, 255]
+#    237    Color           [255,  76, 210, 255]
+#     62    Path            [178, 156,  89, 255]
+#     64    Enum            [217, 190,  54, 255]
+#     35    Regex           [255, 121,  76, 255]
+#     23    Error           [255,   0,   0, 255]
+#
+#   256+   Reserved for user-registered custom types
 #
 # ============================================================================
 
@@ -237,30 +335,30 @@ def setup_default_ports():
     # ========================================================================
 
     GENERIC = _reg(
-        "Generic", QColor(131, 134, 142), 0, object
+        "Generic", color_index=9, type_id=0, python_type=object
     )
 
     # --- Dummy (visual-only port used by minimised node summary slots) ---
     DUMMY = _reg(
-        "Dummy", QColor(124, 124, 124), 1, None,
+        "Dummy", color_index=8, type_id=1, python_type=None,
         base_type_id=-1
     )
 
     # --- Numeric ---
     NUMBER = _reg(
-        "Number", QColor(100, 100, 100), 10, object,
+        "Number", color_index=7, type_id=10, python_type=object,
         base_type_id=0
     )
 
     FLOAT = _reg(
-        "Float", QColor(0, 255, 100), 11, float,
+        "Float", color_index=166, type_id=11, python_type=float,
         base_type_id=10,
         default=0.0,
         formatter=lambda x: f"{float(x):.2f}"
     )
 
     INT = _reg(
-        "Int", QColor(0, 150, 255), 12, int,
+        "Int", color_index=125, type_id=12, python_type=int,
         base_type_id=10,
         default=0,
         casts_to={11: float}  # Int -> Float
@@ -268,7 +366,7 @@ def setup_default_ports():
 
     # --- Boolean ---
     BOOL = _reg(
-        "Bool", QColor(255, 50, 50), 20, bool,
+        "Bool", color_index=24, type_id=20, python_type=bool,
         default=False,
         casts_to={
             12: int,    # Bool -> Int  (True=1)
@@ -279,7 +377,7 @@ def setup_default_ports():
 
     # --- String ---
     STRING = _reg(
-        "String", QColor(255, 165, 0), 30, str,
+        "String", color_index=59, type_id=30, python_type=str,
         default="",
         casts_to={
             41: lambda s: list(s),    # String -> List (chars)
@@ -293,13 +391,13 @@ def setup_default_ports():
     # ========================================================================
 
     COLLECTION = _reg(
-        "Collection", QColor(160, 120, 200), 40, object,
+        "Collection", color_index=221, type_id=40, python_type=object,
         base_type_id=0,
         formatter=lambda x: f"Collection({len(x)} items)" if hasattr(x, '__len__') else str(x)
     )
 
     LIST = _reg(
-        "List", QColor(180, 100, 255), 41, list,
+        "List", color_index=207, type_id=41, python_type=list,
         base_type_id=40,
         default=list,
         formatter=lambda x: f"List[{len(x)}]",
@@ -312,7 +410,7 @@ def setup_default_ports():
     )
 
     TUPLE = _reg(
-        "Tuple", QColor(140, 80, 220), 42, tuple,
+        "Tuple", color_index=204, type_id=42, python_type=tuple,
         base_type_id=40,
         default=tuple,
         formatter=lambda x: f"Tuple({len(x)})",
@@ -324,7 +422,7 @@ def setup_default_ports():
     )
 
     SET = _reg(
-        "Set", QColor(100, 60, 180), 43, set,
+        "Set", color_index=186, type_id=43, python_type=set,
         base_type_id=40,
         default=set,
         formatter=lambda x: f"Set{{{len(x)}}}",
@@ -337,7 +435,7 @@ def setup_default_ports():
 
     # --- Dict ---
     DICT = _reg(
-        "Dict", QColor(50, 200, 200), 50, dict,
+        "Dict", color_index=139, type_id=50, python_type=dict,
         default=dict,
         formatter=lambda x: f"Dict{{{len(x)} keys}}",
         casts_to={
@@ -349,16 +447,16 @@ def setup_default_ports():
         }
     )
 
-    # --- JSON (serialized interchange string — wraps dict/list) ---
+    # --- JSON (serialized interchange string - wraps dict/list) ---
     JSON = _reg(
-        "JSON", QColor(60, 220, 180), 51, str,
+        "JSON", color_index=140, type_id=51, python_type=str,
         default=lambda: "{}",
         validator=lambda x: _is_valid_json(x),
         formatter=lambda x: f"JSON({len(x)} chars)" if isinstance(x, str) else str(x),
         casts_to={
             50: lambda j: json.loads(j),      # JSON -> Dict
             41: lambda j: json.loads(j) if isinstance(json.loads(j), list) else list(json.loads(j).items()),  # JSON -> List
-            30: lambda j: j,                   # JSON -> String (identity — it's already a string)
+            30: lambda j: j,                   # JSON -> String (identity)
         }
     )
 
@@ -367,7 +465,7 @@ def setup_default_ports():
     # ========================================================================
 
     BYTES = _reg(
-        "Bytes", QColor(80, 80, 200), 60, bytes,
+        "Bytes", color_index=185, type_id=60, python_type=bytes,
         default=bytes,
         formatter=lambda x: f"Bytes({len(x)})",
         casts_to={
@@ -381,20 +479,20 @@ def setup_default_ports():
     # ========================================================================
 
     EXEC = _reg(
-        "Exec", QColor(255, 255, 255), 70, type(None),
+        "Exec", color_index=17, type_id=70, python_type=type(None),
         default=None,
         formatter=lambda x: "▶",
     )
 
     # ========================================================================
-    # ARRAYS / DATAFRAMES (optional — guarded imports)
+    # ARRAYS / DATAFRAMES (optional - guarded imports)
     # ========================================================================
 
     # --- Numpy NdArray ---
     try:
         import numpy as np
         NDARRAY = _reg(
-            "NdArray", QColor(0, 200, 180), 80, np.ndarray,
+            "NdArray", color_index=135, type_id=80, python_type=np.ndarray,
             default=lambda: np.empty(0),
             formatter=lambda x: f"NdArray{x.shape} {x.dtype}",
             casts_to={
@@ -415,7 +513,7 @@ def setup_default_ports():
     try:
         import polars as pl
         DATAFRAME = _reg(
-            "DataFrame", QColor(220, 130, 50), 81, pl.DataFrame,
+            "DataFrame", color_index=36, type_id=81, python_type=pl.DataFrame,
             default=lambda: pl.DataFrame(),
             formatter=lambda x: f"DataFrame({x.shape[0]}×{x.shape[1]})",
             casts_to={
@@ -433,8 +531,8 @@ def setup_default_ports():
         # NdArray <-> DataFrame (only if numpy is also available)
         if 80 in PortRegistry._by_id:
             import numpy as np
-            _cast[(80, 81)] = lambda arr: pl.DataFrame({f"col_{i}": arr[:, i] for i in range(arr.shape[1])} if arr.ndim == 2 else {"col_0": arr})  # NdArray -> DataFrame
-            _cast[(81, 80)] = lambda df: df.to_numpy()                             # DataFrame -> NdArray
+            _cast[(80, 81)] = lambda arr: pl.DataFrame({f"col_{i}": arr[:, i] for i in range(arr.shape[1])} if arr.ndim == 2 else {"col_0": arr})
+            _cast[(81, 80)] = lambda df: df.to_numpy()
     except ImportError:
         pass
 
@@ -444,14 +542,14 @@ def setup_default_ports():
 
     # --- Abstract Image Parent ---
     IMAGE = _reg(
-        "Image", QColor(200, 50, 200), 100, object,
+        "Image", color_index=223, type_id=100, python_type=object,
         base_type_id=0,
         formatter=lambda x: "Image"
     )
 
     # --- QImage (PySide6) ---
     QIMAGE = _reg(
-        "QImage", QColor(210, 70, 220), 101, QImage,
+        "QImage", color_index=222, type_id=101, python_type=QImage,
         base_type_id=100,
         default=QImage,
         formatter=lambda x: f"QImage({x.width()}×{x.height()})" if isinstance(x, QImage) else str(x),
@@ -463,13 +561,13 @@ def setup_default_ports():
 
     # --- QPixmap (PySide6) ---
     QPIXMAP = _reg(
-        "QPixmap", QColor(220, 90, 240), 102, QPixmap,
+        "QPixmap", color_index=217, type_id=102, python_type=QPixmap,
         base_type_id=100,
         default=QPixmap,
         formatter=lambda x: f"QPixmap({x.width()}×{x.height()})" if isinstance(x, QPixmap) else str(x),
         casts_to={
             101: lambda px: px.toImage(),              # QPixmap -> QImage
-            60: lambda px: _qimage_to_bytes(px.toImage()),  # QPixmap -> Bytes
+            60: lambda px: _qimage_to_bytes(px.toImage()),
         }
     )
 
@@ -477,24 +575,24 @@ def setup_default_ports():
     try:
         from PIL import Image as PILImageLib
         PILIMAGE = _reg(
-            "PILImage", QColor(190, 40, 180), 103, PILImageLib.Image,
+            "PILImage", color_index=240, type_id=103, python_type=PILImageLib.Image,
             base_type_id=100,
             default=lambda: PILImageLib.new('RGBA', (1, 1)),
             formatter=lambda x: f"PILImage({x.width}×{x.height} {x.mode})" if hasattr(x, 'mode') else str(x),
             casts_to={
-                30: lambda img: f"PILImage({img.width}×{img.height} {img.mode})",  # PIL -> String
+                30: lambda img: f"PILImage({img.width}×{img.height} {img.mode})",
             }
         )
 
         # PIL <-> QImage cross-casts
-        _cast[(103, 101)] = lambda img: _pil_to_qimage(img)     # PIL -> QImage
-        _cast[(101, 103)] = lambda img: _qimage_to_pil(img)     # QImage -> PIL
+        _cast[(103, 101)] = lambda img: _pil_to_qimage(img)
+        _cast[(101, 103)] = lambda img: _qimage_to_pil(img)
 
         # PIL <-> NdArray (if numpy available)
         if 80 in PortRegistry._by_id:
             import numpy as np
-            _cast[(103, 80)] = lambda img: np.array(img)          # PIL -> NdArray
-            _cast[(80, 103)] = lambda arr: PILImageLib.fromarray(arr.astype('uint8'))  # NdArray -> PIL
+            _cast[(103, 80)] = lambda img: np.array(img)
+            _cast[(80, 103)] = lambda arr: PILImageLib.fromarray(arr.astype('uint8'))
     except ImportError:
         pass
 
@@ -504,79 +602,75 @@ def setup_default_ports():
 
     # --- DateTime ---
     DATETIME = _reg(
-        "DateTime", QColor(255, 200, 80), 110, datetime,
+        "DateTime", color_index=58, type_id=110, python_type=datetime,
         default=datetime.now,
         formatter=lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if isinstance(x, datetime) else str(x),
         casts_to={
-            30: lambda dt: dt.isoformat(),                # DateTime -> String (ISO 8601)
-            11: lambda dt: dt.timestamp(),                # DateTime -> Float (unix timestamp)
-            12: lambda dt: int(dt.timestamp()),           # DateTime -> Int (unix timestamp)
+            30: lambda dt: dt.isoformat(),
+            11: lambda dt: dt.timestamp(),
+            12: lambda dt: int(dt.timestamp()),
         }
     )
-    # Reverse: String -> DateTime
     _cast[(30, 110)] = lambda s: datetime.fromisoformat(s)
 
     # --- Color (QColor) ---
     COLOR = _reg(
-        "Color", QColor(255, 100, 200), 111, QColor,
+        "Color", color_index=237, type_id=111, python_type=QColor,
         default=lambda: QColor(255, 255, 255),
         formatter=lambda c: c.name() if isinstance(c, QColor) else str(c),
         casts_to={
-            30: lambda c: c.name(),                                # Color -> String ("#rrggbb")
-            41: lambda c: [c.red(), c.green(), c.blue(), c.alpha()],  # Color -> List [R,G,B,A]
-            42: lambda c: (c.red(), c.green(), c.blue(), c.alpha()),  # Color -> Tuple (R,G,B,A)
-            50: lambda c: {"r": c.red(), "g": c.green(), "b": c.blue(), "a": c.alpha()},  # Color -> Dict
+            30: lambda c: c.name(),
+            41: lambda c: [c.red(), c.green(), c.blue(), c.alpha()],
+            42: lambda c: (c.red(), c.green(), c.blue(), c.alpha()),
+            50: lambda c: {"r": c.red(), "g": c.green(), "b": c.blue(), "a": c.alpha()},
         }
     )
-    # Reverse casts into Color
-    _cast[(30, 111)] = lambda s: QColor(s)                          # String ("#ff0000") -> Color
-    _cast[(41, 111)] = lambda lst: QColor(*lst[:4])                 # List [R,G,B,A] -> Color
-    _cast[(42, 111)] = lambda t: QColor(*t[:4])                     # Tuple (R,G,B,A) -> Color
+    _cast[(30, 111)] = lambda s: QColor(s)
+    _cast[(41, 111)] = lambda lst: QColor(*lst[:4])
+    _cast[(42, 111)] = lambda t: QColor(*t[:4])
 
     # --- Path / FilePath ---
     FILEPATH = _reg(
-        "Path", QColor(180, 160, 100), 120, Path,
+        "Path", color_index=62, type_id=120, python_type=Path,
         default=lambda: Path("."),
         formatter=lambda p: str(p),
         casts_to={
-            30: lambda p: str(p),                         # Path -> String
-            60: lambda p: p.read_bytes() if p.is_file() else b"",  # Path -> Bytes (read file)
+            30: lambda p: str(p),
+            60: lambda p: p.read_bytes() if p.is_file() else b"",
         }
     )
-    # Reverse: String -> Path
     _cast[(30, 120)] = lambda s: Path(s)
 
     # --- Enum / Choice ---
     ENUM = _reg(
-        "Enum", QColor(200, 200, 50), 121, Enum,
+        "Enum", color_index=64, type_id=121, python_type=Enum,
         default=None,
         formatter=lambda e: f"{e.name}={e.value}" if isinstance(e, Enum) else str(e),
         casts_to={
-            30: lambda e: e.name if isinstance(e, Enum) else str(e),    # Enum -> String (name)
-            12: lambda e: e.value if isinstance(e, Enum) and isinstance(e.value, int) else 0,  # Enum -> Int (value)
+            30: lambda e: e.name if isinstance(e, Enum) else str(e),
+            12: lambda e: e.value if isinstance(e, Enum) and isinstance(e.value, int) else 0,
         }
     )
 
     # --- Regex (compiled pattern) ---
     REGEX = _reg(
-        "Regex", QColor(255, 120, 120), 122, re.Pattern,
+        "Regex", color_index=35, type_id=122, python_type=re.Pattern,
         default=lambda: re.compile(""),
         formatter=lambda r: f"re({r.pattern!r})" if isinstance(r, re.Pattern) else str(r),
         casts_to={
-            30: lambda r: r.pattern,                      # Regex -> String (pattern text)
+            30: lambda r: r.pattern,
         }
     )
-    # Reverse: String -> Regex
     _cast[(30, 122)] = lambda s: re.compile(s)
 
     # --- Error / Result ---
     ERROR = _reg(
-        "Error", QColor(255, 0, 0), 123, Exception,
+        "Error", color_index=23, type_id=123, python_type=Exception,
         default=None,
         formatter=lambda e: f"Error({type(e).__name__}: {e})" if isinstance(e, Exception) else str(e),
         casts_to={
-            30: lambda e: f"{type(e).__name__}: {e}",     # Error -> String
-            20: lambda e: False,                           # Error -> Bool (always falsy)
+            30: lambda e: f"{type(e).__name__}: {e}",
+            20: lambda e: False,
         }
     )
 

@@ -133,6 +133,7 @@ from weave.stylemanager import StyleManager, StyleCategory
 from weave.themes.palette_bridge import (
     resolve_theme_colors, build_theme_palette, ThemeColors,
 )
+from weave.panel.mirror_factories import get_custom_signal_name as _get_custom_signal_name
 from weave.logger import get_logger
 
 log = get_logger("WeaveWidgetCore")
@@ -961,7 +962,14 @@ class WidgetCore(QWidget):
     }
 
     def _connect_change_signal(self, binding: WidgetBinding) -> None:
-        """Auto-detect and connect the widget's change signal."""
+        """Auto-detect and connect the widget's change signal.
+
+        Resolution order for auto-detection (when ``change_signal_name``
+        is ``None``):
+        1. Built-in ``_SIGNAL_MAP`` (standard Qt widgets).
+        2. Global ``_CUSTOM_SIGNAL_MAP`` from ``mirror_factories``
+           (custom widgets registered via ``register_mirror_factory``).
+        """
         sig_name = binding.change_signal_name
 
         if sig_name is None:
@@ -969,6 +977,10 @@ class WidgetCore(QWidget):
                 if isinstance(binding.widget, cls):
                     sig_name = name
                     break
+
+        # Fallback: consult the global custom-widget signal map.
+        if sig_name is None:
+            sig_name = _get_custom_signal_name(type(binding.widget))
 
         if sig_name is None:
             return

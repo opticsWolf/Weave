@@ -30,6 +30,7 @@ from PySide6.QtGui import QColor, QPainter
 # Assuming these exist in your project structure
 from weave.node.node_core import Node
 from weave.node.node_subcomponents import NodeState
+from weave.panel.dock_properties import DockProperties
 
 from weave.logger import get_logger
 log = get_logger("NodeDataFlow")
@@ -411,16 +412,20 @@ class BaseControlNode(Node, NodeDataFlow):
     IMPROVED: Comprehensive state change handling with proper cache management.
     
     Class-Level Metadata (override in subclasses):
-        node_class:       Category string for registry tree (e.g. "Math").
-        node_subclass:    Subcategory string (e.g. "Trigonometry").
-        node_name:        Human-readable display name shown in menus.
-                          Falls back to ``__name__`` if ``None``.
-        node_description: Short one-liner describing what the node does.
-                          Searched by the registry and shown in tooltips.
-        node_tags:        List of keywords for search relevance.
-        node_icon:        Path to an icon file (absolute, relative, or
-                          Qt resource ``":/icons/…"``).  Cached by the
-                          registry the first time it is resolved.
+        node_class:        Category string for registry tree (e.g. "Math").
+        node_subclass:     Subcategory string (e.g. "Trigonometry").
+        node_name:         Human-readable display name shown in menus.
+                           Falls back to ``__name__`` if ``None``.
+        node_description:  Short one-liner describing what the node does.
+                           Searched by the registry and shown in tooltips.
+        node_tags:         List of keywords for search relevance.
+        node_icon:         Path to an icon file (absolute, relative, or
+                           Qt resource ``":/icons/…"``).  Cached by the
+                           registry the first time it is resolved.
+        dock_properties:   Optional ``DockProperties`` instance that defines
+                           allowed dock areas, size constraints, and dock
+                           feature flags for static dock panels created
+                           from this node.  ``None`` means all defaults.
     
     Example::
     
@@ -432,6 +437,12 @@ class BaseControlNode(Node, NodeDataFlow):
             node_description = "Applies a gaussian blur to the input image."
             node_tags        = ["blur", "smooth", "filter", "gaussian"]
             node_icon        = ":/icons/blur.svg"
+            dock_properties  = DockProperties(
+                allowed_areas=Qt.DockWidgetArea.LeftDockWidgetArea
+                            | Qt.DockWidgetArea.RightDockWidgetArea,
+                min_width=250,
+                preferred_area=Qt.DockWidgetArea.RightDockWidgetArea,
+            )
     """
     node_class:       ClassVar[str]            = "Basic"
     node_subclass:    ClassVar[str]            = "Basic"
@@ -439,6 +450,7 @@ class BaseControlNode(Node, NodeDataFlow):
     node_description: ClassVar[Optional[str]]  = None
     node_tags:        ClassVar[Optional[List[str]]] = None
     node_icon:        ClassVar[Optional[str]]  = None
+    dock_properties:  ClassVar[Optional[DockProperties]] = None
     
     data_updated = Signal()
     # NOTE: Do NOT redefine state_changed here - parent Node already defines it
