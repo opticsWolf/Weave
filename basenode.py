@@ -36,8 +36,7 @@ from weave.logger import get_logger
 log = get_logger("NodeDataFlow")
 
 #mouse jump diagnostics:
-from weave.node_drag_diagnostic import NodeDragDiagnostic
-
+#from weave.node_drag_diagnostic import NodeDragDiagnostic
 
 class DisabledBehavior(Enum):
     """Defines what downstream nodes receive when this node is disabled."""
