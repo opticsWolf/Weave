@@ -14,18 +14,21 @@ from typing import List, Union
 from PySide6.QtCore import QRectF, QPointF, QLineF
 from PySide6.QtGui import QPainter, QPen
 
-# Scale factors applied to the base pen width for minor/major elements.
-_MINOR_WIDTH_FACTOR = 0.75
-_MAJOR_WIDTH_FACTOR = 1.25
 # Every Nth line/dot intersection is treated as a major (accent) element.
 _ACCENT_INTERVAL = 5
+
+# Fallback scale factors used only when no explicit major_pen is supplied to
+# draw_grid() — keeps the API backward-compatible for callers that have not
+# yet migrated to providing separate per-width pens.
+_FALLBACK_MINOR_FACTOR = 0.75
+_FALLBACK_MAJOR_FACTOR = 1.25
 
 
 class GridType(IntEnum):
     """Grid rendering style enumeration using IntEnum for faster comparisons."""
-    LINES = 0
-    DOTS = 1
-    NONE = 2
+    NONE = 0
+    LINES = 1
+    DOTS = 2
     # Every _ACCENT_INTERVAL-th vertical/horizontal line is drawn thicker;
     # the remaining lines are drawn thinner than the base pen width.
     LINES_ACCENT = 3
@@ -49,19 +52,24 @@ class GridRenderer:
                   rect: QRectF,
                   spacing: int,
                   pen: QPen,
-                  style: GridType = GridType.LINES) -> None:
+                  style: GridType = GridType.LINES,
+                  major_pen: Optional[QPen] = None) -> None:
         """
         Draws the grid using the specified style.
 
         Args:
-            painter: The QPainter to use.
-            rect: The visible rectangle in scene coordinates.
-            spacing: The distance between grid intersections.
-            pen: The QPen to use for drawing.  For LINES_ACCENT and
-                 DOTS_ACCENT the pen's width is used as the *base* width
-                 from which minor (_MINOR_WIDTH_FACTOR) and major
-                 (_MAJOR_WIDTH_FACTOR) widths are derived.
-            style: The GridType enum member.
+            painter:   The QPainter to use.
+            rect:      The visible rectangle in scene coordinates.
+            spacing:   The distance between grid intersections.
+            pen:       Base / minor pen.  Used as-is for LINES and DOTS.
+                       For LINES_ACCENT / DOTS_ACCENT it is the *minor*
+                       (non-accent) pen.
+            style:     The GridType enum member.
+            major_pen: Optional major (accent) pen for LINES_ACCENT /
+                       DOTS_ACCENT modes.  When *None* the renderer derives
+                       minor/major pens from *pen* via the fallback scale
+                       factors so that callers that have not yet migrated
+                       to explicit per-width pens continue to work correctly.
         """
         if style == GridType.NONE or spacing <= 0:
             return
@@ -84,12 +92,16 @@ class GridRenderer:
                             first_left, first_top, spacing)
 
         elif style == GridType.LINES_ACCENT:
+            minor_pen, resolved_major = self._resolve_accent_pens(pen, major_pen)
             self._draw_lines_accent(painter, left, right, top, bottom,
-                                    first_left, first_top, spacing, pen)
+                                    first_left, first_top, spacing,
+                                    minor_pen, resolved_major)
 
         elif style == GridType.DOTS_ACCENT:
+            minor_pen, resolved_major = self._resolve_accent_pens(pen, major_pen)
             self._draw_dots_accent(painter, left, right, top, bottom,
-                                   first_left, first_top, spacing, pen)
+                                   first_left, first_top, spacing,
+                                   minor_pen, resolved_major)
 
     def should_render(self, rect: QRectF, spacing: int, max_elements: int,
                       style: GridType) -> bool:
@@ -138,37 +150,44 @@ class GridRenderer:
     # Private helpers — accent styles
     # ------------------------------------------------------------------
 
-    def _make_accent_pens(self, base_pen: QPen):
+    @staticmethod
+    def _resolve_accent_pens(pen: QPen, major_pen: Optional[QPen]) -> tuple:
         """
-        Returns (minor_pen, major_pen) derived from *base_pen*.
+        Return *(minor_pen, major_pen)* ready for accent drawing.
 
-        A zero pen width is treated as hairline (1.0) for scaling purposes,
-        then set back to 0 for hairline rendering on the minor pen.
+        When an explicit *major_pen* has been provided (the normal path after
+        the canvas migrated to per-width pens), both pens are returned as-is.
+
+        When *major_pen* is *None* the method falls back to deriving both
+        pens from *pen* via the legacy scale factors so that callers that
+        have not yet migrated continue to work correctly.
         """
-        raw_width = base_pen.widthF()
+        if major_pen is not None:
+            return pen, major_pen
+
+        # ── Fallback: derive widths from base pen ───────────────────────
+        raw_width = pen.widthF()
         base_width = raw_width if raw_width > 0.0 else 1.0
 
-        minor_pen = QPen(base_pen)
-        minor_pen.setWidthF(base_width * _MINOR_WIDTH_FACTOR)
+        minor = QPen(pen)
+        minor.setWidthF(base_width * _FALLBACK_MINOR_FACTOR)
 
-        major_pen = QPen(base_pen)
-        major_pen.setWidthF(base_width * _MAJOR_WIDTH_FACTOR)
+        major = QPen(pen)
+        major.setWidthF(base_width * _FALLBACK_MAJOR_FACTOR)
 
-        return minor_pen, major_pen
+        return minor, major
 
     def _draw_lines_accent(self, painter, left, right, top, bottom,
-                           f_left, f_top, spacing, pen: QPen) -> None:
+                           f_left, f_top, spacing,
+                           minor_pen: QPen, major_pen: QPen) -> None:
         """
         Draws grid lines in two passes:
-          • Minor lines  — width × _MINOR_WIDTH_FACTOR  (non-accent)
-          • Major lines  — width × _MAJOR_WIDTH_FACTOR  (every _ACCENT_INTERVAL-th)
+          • Minor lines  — drawn with *minor_pen*  (non-accent)
+          • Major lines  — drawn with *major_pen*  (every _ACCENT_INTERVAL-th)
 
-        Accent index is based on the line's position index within the visible
-        range, aligned to the global grid origin so that major lines remain
-        stable as the viewport is panned.
+        Accent index is aligned to the global grid origin so that major
+        lines remain stable while the viewport is panned.
         """
-        minor_pen, major_pen = self._make_accent_pens(pen)
-
         v_coords = range(f_left, right  + spacing, spacing)
         h_coords = range(f_top,  bottom + spacing, spacing)
 
@@ -176,7 +195,6 @@ class GridRenderer:
         major_lines: List[QLineF] = []
 
         for x in v_coords:
-            # Use absolute grid index so major lines don't shift while panning.
             bucket = major_lines if (x // spacing) % _ACCENT_INTERVAL == 0 \
                      else minor_lines
             bucket.append(QLineF(x, top, x, bottom))
@@ -195,24 +213,22 @@ class GridRenderer:
             painter.drawLines(major_lines)
 
     def _draw_dots_accent(self, painter, left, right, top, bottom,
-                          f_left, f_top, spacing, pen: QPen) -> None:
+                          f_left, f_top, spacing,
+                          minor_pen: QPen, major_pen: QPen) -> None:
         """
         Draws grid dots in two passes:
-          • Minor dots  — width × _MINOR_WIDTH_FACTOR  (all non-accent intersections)
-          • Major dots  — width × _MAJOR_WIDTH_FACTOR  (intersections where *both*
-                          X and Y grid indices are multiples of _ACCENT_INTERVAL)
+          • Minor dots  — drawn with *minor_pen*  (all non-accent intersections)
+          • Major dots  — drawn with *major_pen*  (intersections where *both*
+                          X and Y indices are multiples of _ACCENT_INTERVAL)
 
-        The accent index uses the absolute grid coordinate so major dots stay
-        fixed relative to the scene origin regardless of viewport position.
+        Uses absolute grid coordinates so major dots stay fixed relative to
+        the scene origin regardless of viewport position.
         """
-        minor_pen, major_pen = self._make_accent_pens(pen)
-
         x_coords = np.arange(f_left, right  + spacing, spacing)
         y_coords = np.arange(f_top,  bottom + spacing, spacing)
 
-        # Boolean mask: True where the coordinate sits on a major grid line.
-        x_major = (x_coords // spacing) % _ACCENT_INTERVAL == 0  # shape (Nx,)
-        y_major = (y_coords // spacing) % _ACCENT_INTERVAL == 0  # shape (Ny,)
+        x_major = (x_coords // spacing) % _ACCENT_INTERVAL == 0  # (Nx,)
+        y_major = (y_coords // spacing) % _ACCENT_INTERVAL == 0  # (Ny,)
 
         xx, yy = np.meshgrid(x_coords, y_coords)          # (Ny, Nx)
         # A dot is major only when BOTH its column and row are accent lines.

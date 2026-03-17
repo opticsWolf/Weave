@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 from typing import Dict, Any
 from PySide6.QtWidgets import (
-    QGraphicsView, QGraphicsScene, QGraphicsItem
+    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsProxyWidget
 )
 from PySide6.QtCore import Qt, QEvent, QPointF, QTimer
 from PySide6.QtGui import QPainter, QMouseEvent, QColor
@@ -162,7 +162,24 @@ class CanvasView(QGraphicsView):
         )
 
     def wheelEvent(self, event):
-        """Zoom with configurable limits and sensitivity."""
+        """Zoom with configurable limits and sensitivity.
+
+        Widget-editing guard
+        --------------------
+        When the user is interacting with an embedded widget inside a
+        node (a ``QGraphicsProxyWidget`` holds scene focus), the wheel
+        event is forwarded to the scene's default handler so Qt delivers
+        it to the proxy.  This lets ``QSpinBox`` increment/decrement,
+        ``QComboBox`` scroll its dropdown, and ``QTextEdit`` scroll its
+        contents — instead of zooming the canvas.
+        """
+        scene = self.scene()
+        if scene is not None:
+            focus = scene.focusItem()
+            if isinstance(focus, QGraphicsProxyWidget):
+                super().wheelEvent(event)
+                return
+
         factor = self._config.get('zoom_factor', 1.15)
         zoom_factor = factor if event.angleDelta().y() > 0 else 1.0 / factor
 

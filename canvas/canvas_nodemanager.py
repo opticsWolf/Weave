@@ -24,6 +24,7 @@ from PySide6.QtWidgets import QGraphicsItem, QGraphicsScene
 
 # Import consolidated port utilities
 from weave.portutils import ConnectionFactory
+from weave.themes.core_theme import StyleCategory
 
 from weave.logger import get_logger
 log = get_logger("NodeManager")
@@ -344,6 +345,77 @@ class NodeManager:
 
         if connections_created > 0:
             log.debug(f"Reconstructed {connections_created} connections")
+
+    # ==========================================================================
+    # STYLE REFRESH
+    # ==========================================================================
+
+    def refresh_all_styles(self, style_manager) -> None:
+        """
+        Force-refresh styles on all managed nodes and their sub-elements
+        (ports, traces).  Called after a theme switch to ensure every item
+        in the scene picks up the new colours/metrics — even items that
+        are not registered as StyleManager subscribers.
+
+        Args:
+            style_manager: The StyleManager instance to pull current styles from.
+        """
+        node_styles = style_manager.get_all(StyleCategory.NODE)
+        port_styles = style_manager.get_all(StyleCategory.PORT)
+        trace_styles = style_manager.get_all(StyleCategory.TRACE)
+
+        # Track traces we've already refreshed (each trace is shared by two ports)
+        refreshed_traces: Set[int] = set()
+
+        for node in self._managed_nodes:
+            # --- Refresh the node itself ---
+            self._refresh_item(node, StyleCategory.NODE, node_styles)
+
+            # --- Refresh every port on the node ---
+            for port_attr in ('inputs', 'outputs'):
+                for port in getattr(node, port_attr, []):
+                    self._refresh_item(port, StyleCategory.PORT, port_styles)
+
+                    # --- Refresh traces connected to this port ---
+                    connected = getattr(port, 'connected_traces', None)
+                    if connected is None:
+                        connected = getattr(port, '_connected_traces', [])
+                    for trace in list(connected):
+                        trace_id = id(trace)
+                        if trace_id not in refreshed_traces:
+                            refreshed_traces.add(trace_id)
+                            self._refresh_item(
+                                trace, StyleCategory.TRACE, trace_styles
+                            )
+
+        if self._managed_nodes:
+            log.debug(
+                f"Style refresh complete: {len(self._managed_nodes)} nodes, "
+                f"{len(refreshed_traces)} traces"
+            )
+
+    @staticmethod
+    def _refresh_item(item: Any, category: StyleCategory, styles: Dict[str, Any]) -> None:
+        """
+        Push the full current style dict into a single scene item.
+
+        Tries ``on_style_changed(category, styles)`` first (the same
+        interface StyleManager subscribers use), then falls back to
+        ``refresh_style()`` for simpler components.
+        """
+        try:
+            if hasattr(item, 'on_style_changed'):
+                item.on_style_changed(category, styles)
+            elif hasattr(item, 'refresh_style'):
+                item.refresh_style()
+        except RuntimeError:
+            pass                    # C++ object already deleted
+        except Exception as e:
+            log.debug(f"Style refresh failed for {type(item).__name__}: {e}")
+
+    # ==========================================================================
+    # CLEANUP
+    # ==========================================================================
 
     def clear_all(self) -> None:
         """

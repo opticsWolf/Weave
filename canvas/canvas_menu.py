@@ -405,6 +405,22 @@ class ContextMenuProvider(CanvasCommandsMixin):
         
         menu.addSeparator()
 
+        # Action: Undo
+        undo_action = QAction("Undo", menu)
+        undo_action.setShortcut("Ctrl+Z")
+        undo_action.setEnabled(self.can_undo)
+        undo_action.triggered.connect(self.cmd_undo)
+        menu.addAction(undo_action)
+
+        # Action: Redo
+        redo_action = QAction("Redo", menu)
+        redo_action.setShortcut("Ctrl+Shift+Z")
+        redo_action.setEnabled(self.can_redo)
+        redo_action.triggered.connect(self.cmd_redo)
+        menu.addAction(redo_action)
+
+        menu.addSeparator()
+
         # Action: Add Inspector (creates a new dynamic dock)
         if not is_multi_selection:
             add_insp = QAction("Add Inspector", menu)
@@ -541,6 +557,22 @@ class ContextMenuProvider(CanvasCommandsMixin):
         clear_canvas_action.triggered.connect(self._on_clear_canvas_triggered)
         menu.addAction(clear_canvas_action)
         
+        menu.addSeparator()
+
+        # Action: Undo
+        undo_action = QAction("Undo", menu)
+        undo_action.setShortcut("Ctrl+Z")
+        undo_action.setEnabled(self.can_undo)
+        undo_action.triggered.connect(self.cmd_undo)
+        menu.addAction(undo_action)
+
+        # Action: Redo
+        redo_action = QAction("Redo", menu)
+        redo_action.setShortcut("Ctrl+Shift+Z")
+        redo_action.setEnabled(self.can_redo)
+        redo_action.triggered.connect(self.cmd_redo)
+        menu.addAction(redo_action)
+
         menu.addSeparator()
         
         # --- Panels submenu ---
@@ -877,9 +909,18 @@ class ContextMenuProvider(CanvasCommandsMixin):
         3. Duplicating a node copies the index, so the clone gets the
            correct palette colour — not the raw QColor from the old theme.
         """
+        from weave.canvas.undo_commands import NodePropertyCommand, get_node_uid
+        changes = []
         for node in targets:
+            uid = get_node_uid(node)
+            old_idx = getattr(node, '_header_color_index', None)
+            changes.append((uid, old_idx, palette_index))
             if hasattr(node, 'set_header_color_by_index'):
                 node.set_header_color_by_index(palette_index)
+        if changes:
+            self._undo_manager.push(NodePropertyCommand(
+                changes, 'set_header_color_by_index', 'Change header color',
+            ))
 
     # ==========================================================================
     # ACTION HANDLERS

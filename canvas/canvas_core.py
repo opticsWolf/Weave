@@ -17,8 +17,8 @@ Performance Optimizations (v12):
 4. Compatible with optimized qt_canvasstates (v12)
 
 Refactoring Changes from v10:
-1. Removed _apply_grid_snapping() - now invoked by IdleState
-2. Removed _handle_clone_trigger() - IdleState calls NodeManager directly
+1. Removed _apply_grid_snapping() - now invoked by DefaultInteractionState
+2. Removed _handle_clone_trigger() - DefaultInteractionState calls NodeManager directly
 3. Removed _resolve_node_for_item() - consolidated into ItemResolver utility
 4. Canvas is now a pure passive container for scene management
 
@@ -46,13 +46,14 @@ from weave.canvas.canvas_nodemanager import NodeManager
 from weave.canvas.canvas_menu import ContextMenuProvider
 
 from weave.canvas.canvas_states import (
-    CanvasInteractionState, IdleState, ConnectionDragState, delete_selected_nodes
+    CanvasInteractionState, DefaultInteractionState, ConnectionDragState
 )
 
 from weave.portutils import PortUtils, ConnectionFactory
 from weave.node.node_port import NodePort
 from weave.node.node_trace import NodeTrace, DragTrace
 from weave.basenode import BaseControlNode
+from weave.canvas.undo_commands import get_node_uid
 
 from weave.stylemanager import StyleManager, StyleCategory
 
@@ -71,7 +72,7 @@ class Canvas(QGraphicsScene):
     - Reduced overhead in high-frequency rendering
     
     This class is a pure passive container. All interaction logic is
-    delegated to the state machine (IdleState, ConnectionDragState).
+    delegated to the state machine (DefaultInteractionState, ConnectionDragState).
     
     Architectural Role:
     - Hosts the state machine
@@ -153,7 +154,7 @@ class Canvas(QGraphicsScene):
         self._grid_renderer = GridRenderer()
 
         # State Machine
-        self._current_state: CanvasInteractionState = IdleState(self)
+        self._current_state: CanvasInteractionState = DefaultInteractionState(self)
 
         # Re-entrancy guard: set True while inside super().mousePressEvent()
         # to prevent re-entrant mouseMoveEvent calls from moving nodes.
@@ -382,15 +383,49 @@ class Canvas(QGraphicsScene):
 
     def add_node(self, node: QGraphicsItem, pos: Tuple[float, float] = (0, 0)) -> None:
         """Add a node to the canvas."""
+        # Ensure every node has a stable unique_id for undo commands
+        # and serialization.  Nodes created via the serializer already
+        # have one; freshly spawned nodes get it from their Node UUID.
+        if not getattr(node, 'unique_id', None):
+            if hasattr(node, 'get_uuid_string'):
+                node.unique_id = node.get_uuid_string()
+            else:
+                import uuid as _uuid
+                node.unique_id = str(_uuid.uuid4())
+
         self._node_manager.add_node(node, pos)
         self._orchestrator.schedule_resize()
         self.node_added.emit(node)
+
+    def remove_node(self, node: QGraphicsItem) -> None:
+        """Remove a node from the canvas and emit ``node_removed``.
+
+        Prefers ``NodeManager.remove_node`` (which also tears down
+        connections) but falls back to ``QGraphicsScene.removeItem``
+        if the manager is not available.
+        """
+        node_manager = getattr(self, '_node_manager', None)
+        if node_manager:
+            node_manager.remove_node(node)
+        else:
+            self.removeItem(node)
+        self.node_removed.emit(node)
 
     def spawn_node(self, node_cls: Type[QGraphicsItem], pos: QPointF) -> None:
         """Instantiate and add a node at the given position."""
         try:
             node = node_cls()
             self.add_node(node, (pos.x(), pos.y()))
+            # Push undo command after graph topology changed.
+            from weave.canvas.undo_commands import AddNodeCommand, capture_node_snapshot
+            provider = getattr(self, '_context_menu_provider', None)
+            if provider is not None and hasattr(provider, '_undo_manager'):
+                uid, cls_name, state, npos = capture_node_snapshot(node)
+                cmd = AddNodeCommand(
+                    cls_name, state, uid, npos,
+                    provider._get_registry_map(),
+                )
+                provider._undo_manager.push(cmd)
         except Exception as e:
             log.error(f"Failed to spawn {node_cls.__name__}: {e}")
 
@@ -610,8 +645,11 @@ class Canvas(QGraphicsScene):
         focus, the node's ``ItemIsMovable`` flag is restored (if it was
         suppressed), and canvas shortcuts become active again.
 
-        Shortcuts (handled by IdleState, only when NOT editing a widget):
-        - Delete / Backspace: Remove selected nodes
+        Shortcuts (handled by DefaultInteractionState, only when NOT editing a widget):
+        - Delete: Remove selected nodes
+        - Backspace: Disconnect all traces from selected nodes
+        - Ctrl+Z: Undo
+        - Ctrl+Shift+Z: Redo
         - Ctrl+D: Duplicate selected nodes (with internal traces)
         - Ctrl+A: Select all nodes
         - Ctrl+N: New canvas
@@ -805,6 +843,25 @@ class Canvas(QGraphicsScene):
         )
         if result:
             self.connection_created.emit(start, end)
+            # Push undo command for the new connection.
+            from weave.canvas.undo_commands import AddConnectionCommand, _get_port_lists
+            provider = getattr(self, '_context_menu_provider', None)
+            if provider is not None and hasattr(provider, '_undo_manager'):
+                src_node = getattr(start, 'node', None)
+                dst_node = getattr(end, 'node', None)
+                if src_node and dst_node:
+                    _, out = _get_port_lists(src_node)
+                    in_list, _ = _get_port_lists(dst_node)
+                    try:
+                        conn = (
+                            get_node_uid(src_node),
+                            out.index(start),
+                            get_node_uid(dst_node),
+                            in_list.index(end),
+                        )
+                        provider._undo_manager.push(AddConnectionCommand(conn))
+                    except ValueError:
+                        pass
         return result
 
     def _set_global_port_dimming(self, active: bool, source_port: Optional[NodePort]) -> None:

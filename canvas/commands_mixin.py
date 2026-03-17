@@ -11,11 +11,11 @@ CanvasCommandsMixin
 Defines all canvas-level commands as public ``cmd_*`` methods.
 
 Both :class:`~weave.canvas_menu.ContextMenuProvider` and
-:class:`~weave.canvas_states.IdleState` use this mixin so that every
+:class:`~weave.canvas_states.DefaultInteractionState` use this mixin so that every
 command is implemented exactly once.
 
 ContextMenuProvider inherits from it directly.
-IdleState accesses it via ``canvas._context_menu_provider``.
+DefaultInteractionState accesses it via ``canvas._context_menu_provider``.
 """
 
 import os
@@ -44,6 +44,8 @@ HAS_NODE_COMPONENTS = True
 #try:
 from weave.serializer import GraphSerializer
 HAS_SERIALIZER = True
+
+from weave.canvas.undo_commands import get_node_uid
 #except ImportError:
 #    GraphSerializer = None
 #    HAS_SERIALIZER = False
@@ -56,7 +58,7 @@ class CanvasCommandsMixin:
 
     Subclasses (or users of the mixin) must set ``self._canvas`` before
     calling any command.  :class:`ContextMenuProvider` does this in its
-    ``__init__``; :class:`IdleState` accesses the mixin through
+    ``__init__``; :class:`DefaultInteractionState` accesses the mixin through
     ``canvas._context_menu_provider``.
 
     File-management state (current path, serializer cache, history) also
@@ -87,6 +89,12 @@ class CanvasCommandsMixin:
         # Static docks keyed by node UUID string — one per node.
         self._static_docks: Dict[str, Any] = {}
 
+        # Undo / Redo
+        from weave.canvas.undo_manager import UndoManager
+        self._undo_manager = UndoManager(
+            canvas, self._get_registry_map,
+        )
+
     # =========================================================================
     # PUBLIC COMMAND API
     # =========================================================================
@@ -104,6 +112,7 @@ class CanvasCommandsMixin:
             style_manager.apply_theme(current_theme)
 
         self._canvas.update()
+        self._undo_manager.clear()
         log.info("New canvas created with default settings")
 
     def cmd_save(self) -> None:
@@ -165,6 +174,7 @@ class CanvasCommandsMixin:
         if hasattr(self._canvas, '_node_manager'):
             self._canvas._node_manager.clear_all()
         self._canvas.clearSelection()
+        self._undo_manager.clear()
 
     def cmd_select_all(self) -> None:
         """Select all movable nodes in the scene."""
@@ -179,6 +189,9 @@ class CanvasCommandsMixin:
         Duplicate the target node (or all selected nodes if target is part
         of a multi-selection).
         """
+        from weave.canvas.undo_commands import (
+            AddNodeCommand, CompoundCommand, capture_node_snapshot,
+        )
         root_node = self._resolve_root(target_item)
         if root_node is None:
             return
@@ -189,15 +202,40 @@ class CanvasCommandsMixin:
 
         selected_nodes = self._get_movable_selected()
         if root_node in selected_nodes and len(selected_nodes) > 1:
-            self._canvas.clone_nodes(selected_nodes)
+            cloned = self._canvas.clone_nodes(selected_nodes)
         else:
-            self._canvas.clone_nodes([root_node])
+            cloned = self._canvas.clone_nodes([root_node])
+
+        if cloned:
+            reg = self._get_registry_map()
+            cmds = []
+            for node in cloned:
+                uid, cls_name, state, pos = capture_node_snapshot(node)
+                cmds.append(AddNodeCommand(cls_name, state, uid, pos, reg))
+            if len(cmds) == 1:
+                self._undo_manager.push(cmds[0])
+            else:
+                self._undo_manager.push(CompoundCommand(cmds, "Duplicate nodes"))
 
     def cmd_duplicate_selected(self) -> None:
         """Duplicate all currently selected movable nodes."""
+        from weave.canvas.undo_commands import (
+            AddNodeCommand, CompoundCommand, capture_node_snapshot,
+        )
         nodes = self._get_movable_selected()
-        if nodes:
-            self._canvas.clone_nodes(nodes)
+        if not nodes:
+            return
+        cloned = self._canvas.clone_nodes(nodes)
+        if cloned:
+            reg = self._get_registry_map()
+            cmds = []
+            for node in cloned:
+                uid, cls_name, state, pos = capture_node_snapshot(node)
+                cmds.append(AddNodeCommand(cls_name, state, uid, pos, reg))
+            if len(cmds) == 1:
+                self._undo_manager.push(cmds[0])
+            else:
+                self._undo_manager.push(CompoundCommand(cmds, "Duplicate nodes"))
 
     def cmd_delete(self, target_item: QGraphicsItem) -> None:
         """
@@ -223,6 +261,99 @@ class CanvasCommandsMixin:
             return 0
         return self._remove_nodes(nodes)
 
+    def cmd_disconnect_selected(self) -> int:
+        """Disconnect all traces from selected nodes without deleting them.
+
+        Returns the number of traces removed.
+        """
+        from weave.portutils import ConnectionFactory
+        from weave.canvas.undo_commands import RemoveConnectionsCommand
+        from weave.node.node_trace import NodeTrace
+
+        selected = self._canvas.selectedItems()
+        if not selected:
+            return 0
+
+        nodes = [
+            item for item in selected
+            if (item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+            and not (HAS_NODE_COMPONENTS and isinstance(item, (NodeTrace, DragTrace)))
+        ]
+        if not nodes:
+            return 0
+
+        # Capture connection tuples BEFORE removing
+        from weave.canvas.undo_commands import _get_port_lists
+        seen: set = set()
+        conn_tuples = []
+        traces_to_remove: set = set()
+        for node in nodes:
+            for port_attr in ('inputs', 'outputs'):
+                for port in getattr(node, port_attr, []):
+                    for trace in list(getattr(port, 'connected_traces', [])):
+                        if id(trace) in seen:
+                            continue
+                        seen.add(id(trace))
+                        traces_to_remove.add(trace)
+
+                        src = getattr(trace, 'source', None)
+                        dst = getattr(trace, 'target', None)
+                        if src and dst:
+                            src_node = getattr(src, 'node', None)
+                            dst_node = getattr(dst, 'node', None)
+                            if src_node and dst_node:
+                                _, out = _get_port_lists(src_node)
+                                in_list, _ = _get_port_lists(dst_node)
+                                try:
+                                    conn_tuples.append((
+                                        get_node_uid(src_node),
+                                        out.index(src),
+                                        get_node_uid(dst_node),
+                                        in_list.index(dst),
+                                    ))
+                                except ValueError:
+                                    pass
+
+        removed = 0
+        for trace in traces_to_remove:
+            try:
+                ConnectionFactory.remove(trace, trigger_compute=True)
+                removed += 1
+            except RuntimeError:
+                pass
+
+        if removed and conn_tuples:
+            self._undo_manager.push(RemoveConnectionsCommand(conn_tuples))
+        return removed
+
+    # ── Undo / Redo ─────────────────────────────────────────────────────
+
+    def cmd_undo(self) -> bool:
+        """Undo the last graph-state change."""
+        return self._undo_manager.undo()
+
+    def cmd_redo(self) -> bool:
+        """Redo the previously undone change."""
+        return self._undo_manager.redo()
+
+    def cmd_push(self, cmd) -> None:
+        """Push a command onto the undo stack.
+
+        Called by ``DefaultInteractionState`` and ``Canvas`` when they
+        construct granular undo commands (e.g. ``MoveNodesCommand``).
+        """
+        self._undo_manager.push(cmd)
+
+    @property
+    def can_undo(self) -> bool:
+        """True when there is at least one command to undo."""
+        return self._undo_manager.can_undo
+
+    @property
+    def can_redo(self) -> bool:
+        """True when there is at least one command to redo."""
+        return self._undo_manager.can_redo
+
     def cmd_bring_to_front(self, target_item: QGraphicsItem) -> None:
         """Bring the target item to the front of the z-order."""
         root_node = self._resolve_root(target_item)
@@ -231,11 +362,20 @@ class CanvasCommandsMixin:
 
     def cmd_change_header_color(self, nodes: List[QGraphicsItem], color) -> None:
         """Apply ``color`` to the header of all ``nodes``."""
+        from weave.canvas.undo_commands import NodePropertyCommand
+        changes = []
         for node in nodes:
+            uid = get_node_uid(node)
+            old_color = getattr(node, '_header_bg', None)
+            changes.append((uid, old_color, color))
             if hasattr(node, 'set_config'):
                 node.set_config(header_bg=color)
             else:
                 node.update()
+        if changes:
+            self._undo_manager.push(NodePropertyCommand(
+                changes, 'set_config', 'Change header color',
+            ))
 
     def cmd_set_grid_type(self, grid_type: GridType) -> None:
         """
@@ -496,8 +636,8 @@ class CanvasCommandsMixin:
             entry["pinned"] = panel.is_pinned
             # If pinned to a node, record the serializer-assigned ID.
             if panel.is_pinned and panel.node is not None:
-                ser_id = getattr(panel.node, "unique_id", None)
-                if ser_id is not None:
+                ser_id = get_node_uid(panel.node)
+                if ser_id:
                     entry["pinned_node_uuid"] = ser_id
             dynamic.append(entry)
 
@@ -506,9 +646,8 @@ class CanvasCommandsMixin:
             node = dock.node
             if node is None:
                 continue
-            # Use the serializer-assigned unique_id, not _node_uuid.
-            ser_id = getattr(node, "unique_id", None)
-            if ser_id is None:
+            ser_id = get_node_uid(node)
+            if not ser_id:
                 continue
             static.append({
                 "node_uuid": ser_id,
@@ -739,6 +878,9 @@ class CanvasCommandsMixin:
         if success:
             self._current_filepath = filepath
             self._add_to_file_history(filepath)
+            self._undo_manager.clear()
+            self._undo_manager.wire_existing_nodes()
+            self._undo_manager.snapshot_widget_baselines()
             log.info(f"Graph loaded from: {filepath}")
         else:
             log.error(f"Load failed: {filepath}")
@@ -764,19 +906,40 @@ class CanvasCommandsMixin:
         return node
 
     def _remove_nodes(self, nodes: List[QGraphicsItem]) -> int:
-        """Remove nodes via NodeManager (or directly from scene). Returns count."""
-        node_manager = getattr(self._canvas, '_node_manager', None)
+        """Remove nodes via Canvas.remove_node (emits ``node_removed``). Returns count."""
+        from weave.canvas.undo_commands import (
+            RemoveNodesCommand, capture_node_snapshot, capture_node_connections,
+        )
+        # Capture state BEFORE removal for undo
+        snapshots = []
+        all_conns = []
+        seen_conns: set = set()
+        for node in nodes:
+            if node.scene() != self._canvas:
+                continue
+            snapshots.append(capture_node_snapshot(node))
+            for conn in capture_node_connections(self._canvas, node):
+                if conn not in seen_conns:
+                    all_conns.append(conn)
+                    seen_conns.add(conn)
+
+        # Perform deletion
         count = 0
         for node in nodes:
             if node.scene() != self._canvas:
                 continue
             if hasattr(node, 'remove_all_connections'):
                 node.remove_all_connections()
-            if node_manager:
-                node_manager.remove_node(node)
-            else:
-                self._canvas.removeItem(node)
-            count += 1
+            try:
+                self._canvas.remove_node(node)
+                count += 1
+            except RuntimeError as e:
+                log.debug(f"Node already removed: {e}")
+
+        if count and snapshots:
+            self._undo_manager.push(
+                RemoveNodesCommand(snapshots, all_conns, self._get_registry_map())
+            )
         return count
 
     def _get_view(self):
@@ -800,6 +963,14 @@ class CanvasCommandsMixin:
 
         self._serializer = GraphSerializer(registry_map)
         return self._serializer
+
+    def _get_registry_map(self) -> Dict[str, type]:
+        """Return ``{class_name: cls}`` for node instantiation by undo commands."""
+        try:
+            from weave.noderegistry import NODE_REGISTRY
+            return {cls.__name__: cls for cls in NODE_REGISTRY.get_all_nodes()}
+        except ImportError:
+            return {}
 
     # ── File history ─────────────────────────────────────────────────────────
 

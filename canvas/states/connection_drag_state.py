@@ -15,8 +15,8 @@ from PySide6.QtGui import QTransform
 # Import from the orchestrator to avoid circular dependencies  
 from weave.canvas.states.interaction_state import CanvasInteractionState
 from weave.canvas.states.state_utils import ItemResolver
-# NOTE: IdleState is imported locally inside on_mouse_release to
-# break the mutual import cycle (IdleState ↔ ConnectionDragState).
+# NOTE: DefaultInteractionState  is imported locally inside on_mouse_release to
+# break the mutual import cycle (DefaultInteractionState  ↔ ConnectionDragState).
 from weave.portutils import PortUtils, PortFinder, ConnectionFactory
 from weave.node.node_port import NodePort
 from weave.node.node_trace import DragTrace, NodeTrace
@@ -147,13 +147,13 @@ class ConnectionDragState(CanvasInteractionState):
     def on_mouse_release(self, event: QGraphicsSceneMouseEvent) -> bool:
         """Finalize connection if valid, then return to idle."""
         # Deferred import to break the IdleState ↔ ConnectionDragState cycle.
-        from weave.canvas.states.idle_state import IdleState
+        from weave.canvas.states.default_state import DefaultInteractionState 
         if event.button() != Qt.MouseButton.LeftButton:
             return True
         
         # If pending detach but never moved far enough, keep original connection
         if self._pending_detach_port and not self._detachment_occurred:
-            self.canvas.set_state(IdleState(self.canvas))
+            self.canvas.set_state(DefaultInteractionState(self.canvas))
             return True
             
         # Create connection if we have a valid snap target
@@ -167,7 +167,7 @@ class ConnectionDragState(CanvasInteractionState):
             elif hasattr(node, 'evaluate'):
                 node.evaluate()
         
-        self.canvas.set_state(IdleState(self.canvas))
+        self.canvas.set_state(DefaultInteractionState(self.canvas))
         return True
     
     def _update_snap_feedback(self, target_port: Optional[NodePort]) -> None:
