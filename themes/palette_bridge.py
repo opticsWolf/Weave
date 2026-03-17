@@ -136,6 +136,52 @@ def resolve_theme_colors() -> ThemeColors:
     )
 
 
+def resolve_node_colors(
+    header_bg: QColor,
+    body_bg: Optional[QColor] = None,
+) -> ThemeColors:
+    """
+    Build a ``ThemeColors`` with per-node overrides for header and body.
+
+    This is the node-level counterpart of ``resolve_theme_colors()``.
+    It lets ``WidgetCore`` build a palette that reflects the *actual*
+    colours of its owning node — including custom header colours and
+    selection-highlight shifts — rather than the global theme defaults.
+
+    Parameters
+    ----------
+    header_bg : QColor
+        The node's effective header colour (may be a custom colour,
+        a palette-index colour, or a selection-highlighted colour).
+        Used for the ``Highlight`` palette role so that selection
+        inside spinboxes, combos, etc. matches the node header.
+    body_bg : QColor, optional
+        The node's effective body colour.  When ``None`` the global
+        theme ``body_bg`` is used.
+
+    Returns
+    -------
+    ThemeColors
+        A fresh ``ThemeColors`` instance with the overridden values.
+    """
+    base = resolve_theme_colors()
+
+    effective_body = body_bg if body_bg is not None else base.body_bg
+    effective_input = QColor(effective_body).darker(120)
+
+    # Re-derive disabled / placeholder from the base body_text — those
+    # depend on text colour, not on body or header background.
+    return ThemeColors(
+        canvas_bg=base.canvas_bg,
+        body_bg=effective_body,
+        body_text=base.body_text,
+        header_bg=header_bg,
+        input_bg=effective_input,
+        disabled_text=base.disabled_text,
+        placeholder_text=base.placeholder_text,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Palette construction
 # ══════════════════════════════════════════════════════════════════════════════
