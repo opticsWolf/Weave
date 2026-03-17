@@ -316,6 +316,7 @@ class NodePanel(QWidget):
         if wc is not None:
             wc.value_changed.connect(self._on_node_value_changed)
             wc.port_value_written.connect(self._on_node_value_changed)
+            wc.port_enabled_changed.connect(self._on_port_enabled_changed)
 
         # Listen for node state changes to update the header badge.
         if hasattr(node, "state_changed"):
@@ -367,6 +368,10 @@ class NodePanel(QWidget):
                 pass
             try:
                 wc.port_value_written.disconnect(self._on_node_value_changed)
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                wc.port_enabled_changed.disconnect(self._on_port_enabled_changed)
             except (RuntimeError, TypeError):
                 pass
 
@@ -566,6 +571,10 @@ class NodePanel(QWidget):
                 continue
 
             self._mirrors[port_name] = mirror
+
+            # Sync the initial enabled state from the source widget so
+            # mirrors for auto-disabled ports start out greyed.
+            mirror.setEnabled(binding.widget.isEnabled())
 
             label_text = port_name.replace("_", " ").title()
             self._form.addRow(f"{label_text}:", mirror)
@@ -776,6 +785,13 @@ class NodePanel(QWidget):
             log.debug(f"Failed to set mirror value: {exc}")
         finally:
             mirror.blockSignals(was_blocked)
+
+    @Slot(str, bool)
+    def _on_port_enabled_changed(self, port_name: str, enabled: bool) -> None:
+        """A widget inside the node was enabled/disabled — sync the mirror."""
+        mirror = self._mirrors.get(port_name)
+        if mirror is not None:
+            mirror.setEnabled(enabled)
 
     # ──────────────────────────────────────────────────────────────────────
     # Node state badge

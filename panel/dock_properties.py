@@ -56,6 +56,10 @@ class DockProperties:
     preferred_area : Qt.DockWidgetArea | None
         The area the dock should be placed in by default when first
         created.  ``None`` → the caller decides.
+    tabbed_dock : bool | None
+        Whether the main window allows tabbed docking. ``None`` → True.
+    nested_dock : bool | None
+        Whether the main window allows nesting (splitting). ``None`` → True.
     min_width : int | None
         Minimum width in pixels for the dock panel.
     max_width : int | None
@@ -83,6 +87,8 @@ class DockProperties:
 
     allowed_areas: Optional[Qt.DockWidgetAreas] = None
     preferred_area: Optional[Qt.DockWidgetArea] = None
+    tabbed_dock: Optional[bool] = None
+    nested_dock: Optional[bool] = None
 
     min_width: Optional[int] = None
     max_width: Optional[int] = None
@@ -95,3 +101,4 @@ class DockProperties:
     movable: Optional[bool] = None
     floatable: Optional[bool] = None
     title_bar_visible: Optional[bool] = None
+    
