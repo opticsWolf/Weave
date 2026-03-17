@@ -308,6 +308,7 @@ class NodeDockAdapter(QDockWidget):
 
     def _apply_dock_properties(self, props: DockProperties) -> None:
         """Apply *props* hints to this QDockWidget."""
+        # 1. Apply standard QDockWidget features (closable, movable, etc.)
         # Allowed areas
         if props.allowed_areas is not None:
             self.setAllowedAreas(props.allowed_areas)
@@ -351,6 +352,27 @@ class NodeDockAdapter(QDockWidget):
         # Title bar visibility
         if props.title_bar_visible is False:
             self.setTitleBarWidget(QWidget())  # empty widget hides the bar
+            
+        # 2. Apply QMainWindow dock options (tabbed and nested)
+        # We must get the top-level main window to set these flags
+        main_window = self.window()
+        
+        if isinstance(main_window, QMainWindow):
+            options = main_window.dockOptions()
+            
+            # Handle Tabbed Docks
+            if props.tabbed_dock is False:
+                options &= ~QMainWindow.AllowTabbedDocks
+            elif props.tabbed_dock is True: 
+                options |= QMainWindow.AllowTabbedDocks
+                
+            # Handle Nested Docks
+            if props.nested_dock is False:
+                options &= ~QMainWindow.AllowNestedDocks
+            elif props.nested_dock is True: 
+                options |= QMainWindow.AllowNestedDocks
+                
+            main_window.setDockOptions(options)
 
     # ──────────────────────────────────────────────────────────────────────
     # Exposed QDockWidget properties (change #4)

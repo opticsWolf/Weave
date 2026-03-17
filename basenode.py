@@ -510,6 +510,33 @@ class BaseControlNode(Node, NodeDataFlow):
         except RuntimeError:
             return False
 
+    # ------------------------------------------------------------------
+    # Widget palette synchronisation
+    # ------------------------------------------------------------------
+
+    def _update_colors(self, is_selected: bool):
+        """Extend the mixin to propagate effective colours to WidgetCore.
+
+        After the parent updates header/body brushes, the *actual*
+        colours (including selection highlights and custom overrides) are
+        stored on ``self.header._bg_color`` and ``self.body._bg_color``.
+        We forward them to the embedded ``WidgetCore`` so that:
+
+        - ``QPalette.Highlight`` (text selection, combo focus) matches
+          the node's real header colour — not the global theme default.
+        - ``QPalette.Window`` / ``Base`` shift when the node is selected,
+          giving embedded widgets a subtle visual cue that mirrors the
+          QPainter-drawn body fill.
+        """
+        super()._update_colors(is_selected)
+
+        wc = getattr(self, '_widget_core', None) or getattr(self, '_weave_core', None)
+        if wc is not None and hasattr(wc, 'apply_node_palette'):
+            wc.apply_node_palette(
+                self.header._bg_color,
+                self.body._bg_color,
+            )
+
     def set_state(self, state: NodeState) -> None:
         """Override to integrate state changes with dataflow logic.
         

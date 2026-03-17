@@ -131,7 +131,7 @@ if TYPE_CHECKING:
     from weave.node.node_core import Node
 from weave.stylemanager import StyleManager, StyleCategory
 from weave.themes.palette_bridge import (
-    resolve_theme_colors, build_theme_palette, ThemeColors,
+    resolve_theme_colors, resolve_node_colors, build_theme_palette, ThemeColors,
 )
 from weave.panel.mirror_factories import get_custom_signal_name as _get_custom_signal_name
 from weave.logger import get_logger
@@ -244,6 +244,7 @@ class WidgetCore(QWidget):
 
     value_changed = Signal(str)  # port_name — user edits (suppressed during set_port_value)
     port_value_written = Signal(str)  # port_name — every programmatic write via set_port_value
+    port_enabled_changed = Signal(str, bool)  # (port_name, enabled) — auto-disable on connect/disconnect
 
     # ── Construction ──────────────────────────────────────────────────────
 
@@ -544,6 +545,13 @@ class WidgetCore(QWidget):
         (proxy root's ``parentWidget()`` is ``None``, so it would
         otherwise fall back to ``QApplication::palette()``).
 
+        When a back-reference to the owning node is available, the
+        palette is derived from the node's *effective* header and body
+        colours (which already include selection highlights and custom
+        per-node overrides).  This ensures that deferred calls — e.g.
+        from ``_patch_parent_proxy`` via ``QTimer.singleShot(0)`` —
+        do not overwrite a node-specific palette with global defaults.
+
         Children inherit both style and palette via Qt's parent-chain
         lookup — no per-child calls are made.
         """
@@ -552,7 +560,17 @@ class WidgetCore(QWidget):
         if style is not None:
             self.setStyle(style)
 
-        colors = resolve_theme_colors()
+        # Use the owning node's effective colours when available,
+        # otherwise fall back to global theme defaults (no node context
+        # yet during early __init__).
+        node = self._node_ref
+        if node is not None and hasattr(node, 'header') and hasattr(node, 'body'):
+            colors = resolve_node_colors(
+                node.header._bg_color, node.body._bg_color
+            )
+        else:
+            colors = resolve_theme_colors()
+
         pal = build_theme_palette(
             window_color=colors.body_bg,
             base_palette=self.palette(),
@@ -579,6 +597,51 @@ class WidgetCore(QWidget):
             automatically.
         """
         self._apply_container_background()
+
+    def apply_node_palette(
+        self,
+        header_bg: QColor,
+        body_bg: Optional[QColor] = None,
+    ) -> None:
+        """
+        Rebuild the widget palette using the owning node's *actual*
+        header and body colours.
+
+        This is called by the node's ``_update_colors()`` whenever the
+        effective colours change — including selection highlights and
+        custom per-node header colours.  The result is that:
+
+        - ``QPalette.Highlight`` inside spinboxes, combos, line-edits
+          etc. matches the node's (possibly custom) header colour rather
+          than the global theme default.
+        - When the node is selected the ``Window`` / ``Base`` roles
+          shift to the highlighted body colour, giving embedded widgets
+          a subtle visual cue that mirrors the QPainter-drawn body fill.
+
+        Parameters
+        ----------
+        header_bg : QColor
+            The node's effective header colour (already highlight-shifted
+            when the node is selected).
+        body_bg : QColor, optional
+            The node's effective body colour.  ``None`` keeps the global
+            theme ``body_bg``.
+        """
+        colors = resolve_node_colors(header_bg, body_bg)
+        pal = build_theme_palette(
+            window_color=colors.body_bg,
+            base_palette=self.palette(),
+            colors=colors,
+        )
+        self.setPalette(pal)
+
+        # Proxy root's parentWidget() is None so it would fall back to
+        # the application-level palette without an explicit update.
+        proxy = self._find_proxy()
+        if proxy is not None:
+            root = proxy.widget()
+            if root is not None and root is not self:
+                root.setPalette(pal)
 
     def refresh_widget_stylesheets(self, *, extra_qss: str = "") -> None:
         """
@@ -815,11 +878,13 @@ class WidgetCore(QWidget):
         binding = self._bindings.get(port_name)
         if binding is not None:
             binding.widget.setEnabled(enabled)
+            self.port_enabled_changed.emit(port_name, enabled)
 
     def set_all_enabled(self, enabled: bool) -> None:
         """Bulk enable / disable every registered widget."""
-        for binding in self._bindings.values():
+        for port_name, binding in self._bindings.items():
             binding.widget.setEnabled(enabled)
+            self.port_enabled_changed.emit(port_name, enabled)
 
     # ══════════════════════════════════════════════════════════════════════
     # Serialisation — THE sole source of widget state
