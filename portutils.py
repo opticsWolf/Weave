@@ -488,7 +488,18 @@ class ConnectionFactory:
             # Create the trace
             trace = NodeTrace(output_port, input_port)
             scene.addItem(trace)
-            
+
+            # Sync the trace's state overlay with the source node's current
+            # state immediately after connection.  Without this, a freshly
+            # drawn trace always starts with the default transparent overlay
+            # and only updates after the next node state change.
+            # We read from the OUTPUT port's node (the source of data flow).
+            source_node = PortUtils.get_node(output_port)
+            if source_node is not None:
+                overlay = getattr(source_node, '_overlay_color', None)
+                if overlay is not None:
+                    trace.set_state_overlay(overlay)
+
             # Trigger downstream computation if requested
             if trigger_compute:
                 ConnectionFactory._trigger_compute(input_port)
