@@ -89,7 +89,15 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
             'resize_handle_extend': 4,
             'resize_handle_offset': -6,
             'resize_handle_width': 2.5,
-            'resize_handle_hover_width': 3.0
+            'resize_handle_hover_width': 3.0,
+            "pulse_waveform": "ripple",
+            "pulse_duration": 1000,
+            "pulse_glow_width_min": 2.0,
+            "pulse_glow_width_max": 12.0,
+            "pulse_glow_layers": 6,
+            "pulse_glow_opacity_min": 12,
+            "pulse_glow_opacity_max": 128,
+            "pulse_glow_offset": 4,
         },
         StyleCategory.PORT: {
             "inner_color": [28, 32, 40, 255],

@@ -113,7 +113,7 @@ class NodeStyleSchema:
     header_gradient_enabled: bool = True
     header_gradient_angle: float = 0.0
     header_gradient_shift: int = -20
-    body_gradient_enabled: bool = False
+    body_gradient_enabled: bool = True
     body_gradient_angle: float = 0.0
     body_gradient_shift: int = 5
     header_bottom_line_enabled: bool = True
@@ -190,6 +190,24 @@ class NodeStyleSchema:
     
     # State Visuals
     state_visuals: Optional[Dict[Any, Dict[str, Any]]] = None
+
+    # Pulse Animation — Waveform & Timing
+    pulse_waveform: str = 'orbital' #'breathe'|'flash'|'heartbeat'|'ripple'|'sawtooth'|'orbital' (or custom)
+    pulse_duration: int = 1200
+    pulse_easing: str = 'InOutSine' #QEasingCurve.Type name applied to the raw sawtooth
+    # Pulse Animation — Glow Geometry
+    pulse_glow_offset: float = 0.0
+    pulse_glow_width_min: float = 2.0
+    pulse_glow_width_max: float = 16.0
+    pulse_glow_layers: int = 8
+    # Pulse Animation — Glow Opacity
+    pulse_glow_opacity_min: int = 16
+    pulse_glow_opacity_max: int = 128
+    # Pulse Animation — Border
+    pulse_border_width: float = 1.5
+    pulse_border_opacity: int = 160
+    # Pulse Animation — Colour Override (None = derive from header bg)
+    pulse_color: Optional[List[int]] = None
 
 
 @dataclass
@@ -335,8 +353,8 @@ BASE_DEFAULTS: Dict[StyleCategory, Dict[str, Any]] = {
             'NORMAL': { "overlay": [0, 0, 0, 0], "opacity": 1.0, "icon_color": [100, 220, 100, 255] },
             'PASSTHROUGH': { "overlay": [128, 0, 164, 128], "opacity": 0.50, "icon_color": [255, 180, 50, 255] },
             'DISABLED': { "overlay": [225, 40, 0, 128], "opacity": 0.34, "icon_color": [220, 60, 60, 255] },
-            'COMPUTING': { "overlay": [0, 0, 0, 0], "opacity": 1.0, "icon_color": [80, 180, 255, 255] }
-        }
+            'COMPUTING': { "overlay": [0, 0, 0, 0], "opacity": 1.0, "icon_color": [80, 180, 255, 255] },        
+        },
     },
     StyleCategory.PORT: {
         "inner_color": [50, 53, 61, 255],
