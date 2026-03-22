@@ -37,7 +37,7 @@ panel-local custom factories but *before* the built-in factories.
 
 ``WidgetCore`` also consults the global signal registry when auto-
 detecting change signals for custom widgets (see ``_SIGNAL_MAP``
-extension in ``widgetcore.py``).
+extension in ``widgetcore_adapter.py``).
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
 )
 
 if TYPE_CHECKING:
-    from weave.widgetcore import WidgetBinding
+    from weave.widgetcore_port_models import WidgetBinding
 
 # ---------------------------------------------------------------------------
 # Type alias
@@ -70,10 +70,10 @@ def _clone_spinbox(src: QSpinBox, _binding) -> QSpinBox:
     w = QSpinBox()
     w.setRange(src.minimum(), src.maximum())
     w.setSingleStep(src.singleStep())
-    w.setValue(src.value())
     w.setPrefix(src.prefix())
     w.setSuffix(src.suffix())
     w.setWrapping(src.wrapping())
+    w.setValue(src.value())
     return w
 
 
@@ -82,10 +82,10 @@ def _clone_double_spinbox(src: QDoubleSpinBox, _binding) -> QDoubleSpinBox:
     w.setRange(src.minimum(), src.maximum())
     w.setSingleStep(src.singleStep())
     w.setDecimals(src.decimals())
-    w.setValue(src.value())
     w.setPrefix(src.prefix())
     w.setSuffix(src.suffix())
     w.setWrapping(src.wrapping())
+    w.setValue(src.value())
     return w
 
 
@@ -104,8 +104,8 @@ def _clone_combobox(src: QComboBox, _binding) -> QComboBox:
 
 def _clone_checkbox(src: QCheckBox, _binding) -> QCheckBox:
     w = QCheckBox(src.text())
-    w.setChecked(src.isChecked())
     w.setTristate(src.isTristate())
+    w.setChecked(src.isChecked())
     return w
 
 
@@ -114,9 +114,9 @@ def _clone_slider(src: QSlider, _binding) -> QSlider:
     w.setRange(src.minimum(), src.maximum())
     w.setSingleStep(src.singleStep())
     w.setPageStep(src.pageStep())
-    w.setValue(src.value())
     w.setTickPosition(src.tickPosition())
     w.setTickInterval(src.tickInterval())
+    w.setValue(src.value())
     return w
 
 
@@ -190,22 +190,12 @@ _MIRROR_SIGNAL_MAP: Dict[type, str] = {
 # ══════════════════════════════════════════════════════════════════════════════
 # Global custom-widget registry
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# These registries are module-level singletons.  Any code that imports
-# ``mirror_factories`` sees the same dict, so registrations made at
-# import time (e.g. inside a plugin's ``__init__.py``) are immediately
-# visible to all ``NodePanel`` instances.
 
 _CUSTOM_FACTORIES: Dict[type, MirrorFactory] = {}
 """Exact-type → factory mapping for globally registered custom widgets."""
 
 _CUSTOM_SIGNAL_MAP: Dict[type, str] = {}
-"""Exact-type → signal-name mapping for globally registered custom widgets.
-
-``WidgetCore._connect_change_signal`` consults this after its built-in
-``_SIGNAL_MAP`` so that custom widgets fire ``value_changed`` correctly
-even without an explicit ``change_signal_name`` in ``register_widget()``.
-"""
+"""Exact-type → signal-name mapping for globally registered custom widgets."""
 
 
 def register_mirror_factory(
@@ -229,16 +219,6 @@ def register_mirror_factory(
         it is added to the global signal map so that both ``WidgetCore``
         and ``NodePanel`` can auto-detect the change signal without the
         node author passing ``change_signal_name`` explicitly.
-
-    Example
-    -------
-    ::
-
-        register_mirror_factory(
-            ColorPickerWidget,
-            lambda src, _b: ColorPickerWidget(src.color()),
-            signal_name="colorChanged",
-        )
     """
     _CUSTOM_FACTORIES[widget_type] = factory
     if signal_name is not None:

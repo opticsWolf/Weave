@@ -15,16 +15,48 @@ bindings on bind, creates lightweight *mirror* widgets, and keeps them
 bidirectionally synchronised with the node for as long as the panel is
 bound.
 
+Label mirroring
+---------------
+When building mirrors, the panel walks the source ``QFormLayout`` row
+by row.  For each registered widget it reads the *actual* label from
+``labelForField()`` (e.g. ``"Fill:"``, ``"Dim 0:"``).  Unregistered
+decorative elements — section-header ``QLabel`` widgets like
+``"── Axis 0 ──"`` and ``QFrame`` HLine separators — are cloned
+into the panel at their correct position so the visual structure
+matches the node body exactly.  Labels are never fabricated from
+port names.
+
+Visibility mirroring
+--------------------
+``WidgetCore`` emits ``widget_visibility_changed(port_name, visible)``
+whenever a registered widget is directly shown or hidden (e.g.
+``NumpyArrayNode._sync_fill_value_visibility``).  The panel hides or
+shows the entire mirror row (label + widget) in response.  The initial
+visibility is synced at bind time so widgets that start hidden (e.g. the
+*Value* spinbox when Fill ≠ Full) appear correctly from the first frame.
+
+Parent-propagated visibility changes (node body collapsed on the canvas)
+are intentionally ignored — the dock panel stays fully visible.
+
+Dynamic widget support
+----------------------
+When a node dynamically registers or unregisters widgets in its
+``WidgetCore`` (e.g. ``MultiFloatOutputNode``, ``NumpyArrayNode``
+adding/removing dim spinboxes), the panel reacts automatically via the
+``widget_registered`` / ``widget_unregistered`` signals.  No full
+rebuild is needed.
+
 Sync paths
 ----------
 User edits mirror widget
   → mirror signal fires
-  → _on_mirror_changed()
+  → _on_mirror_edited()
   → widget_core.set_port_value(name, value)
+  → widget_core.value_changed.emit(name)
   → node.compute()  (via existing signal chain)
 
 Upstream data arrives / user edits node widget
-  → widget_core.value_changed(port_name)
+  → widget_core.value_changed(port_name)  OR  port_value_written(port_name)
   → _on_node_value_changed(port_name)
   → update mirror widget  (signals blocked)
 """
@@ -44,8 +76,9 @@ from PySide6.QtWidgets import (
 
 if TYPE_CHECKING:
     from weave.node.node_core import Node
-    from weave.widgetcore import WidgetBinding
+    from weave.widgetcore.widgetcore_port_models import WidgetBinding
 
+from weave.widgetcore.widgetcore_adapter import generic_get, generic_set
 
 from weave.panel.mirror_factories import (
     MirrorFactory,
@@ -62,16 +95,17 @@ log = get_logger("NodePanel")
 # ---------------------------------------------------------------------------
 # shiboken6 validity guard
 # ---------------------------------------------------------------------------
-# PySide6 emits a RuntimeWarning (not a RuntimeError) when you try to
-# disconnect a signal on a C++ object that has already been destroyed.
-# Using shiboken6.isValid() lets us skip the disconnect entirely in that
-# situation rather than relying on catching the warning after the fact.
 try:
     from shiboken6 import isValid as _cpp_is_valid
 except ImportError:  # pragma: no cover
     def _cpp_is_valid(obj) -> bool:  # type: ignore[misc]
         """Fallback when shiboken6 is not importable; assume valid."""
         return True
+
+
+# Sentinel used to distinguish "caller did not pass label_text" from
+# "caller explicitly passed None" in _add_mirror_for_binding.
+_UNSET = object()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -83,6 +117,10 @@ class NodePanel(QWidget):
     A plain ``QWidget`` that mirrors the widgets of a single node's
     ``WidgetCore`` into standard Qt widgets suitable for embedding in
     dock panels, sidebars, dialogs, or tab widgets.
+
+    Both **inspector** (dynamic, follows canvas selection) and **mirror**
+    (static, bound to one node) panels are fully **bidirectional** — edits
+    in the panel push values to the node, and node changes update the panel.
 
     Supports two binding modes:
 
@@ -112,8 +150,6 @@ class NodePanel(QWidget):
     node_unbound = Signal()
     linked_node_lost = Signal()
     pin_changed = Signal(bool)
-    # Emitted in **static** mode when the node's title changes so the
-    # parent ``NodeDockAdapter`` can update the dock's title bar.
     dock_title_changed = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -122,13 +158,9 @@ class NodePanel(QWidget):
         self._node: Optional["Node"] = None
         self._static: bool = False
         self._pinned: bool = False
-        # True only while _watch_node_lifetime() connections are live.
-        # Guards all _unwatch_node_lifetime() disconnect calls so we never
-        # attempt to disconnect signals that were never connected (dynamic
-        # bindings never call _watch_node_lifetime, so the slots don't
-        # exist — trying to disconnect them produces a RuntimeWarning).
         self._watching_lifetime: bool = False
         self._mirrors: Dict[str, QWidget] = {}
+        self._mirror_labels: Dict[str, QLabel] = {}
         self._mirror_slots: Dict[str, Callable] = {}
         self._custom_factories: Dict[type, MirrorFactory] = {}
 
@@ -173,22 +205,14 @@ class NodePanel(QWidget):
 
     @property
     def node(self) -> Optional["Node"]:
-        """The currently bound node, or ``None``."""
         return self._node
 
     @property
     def is_static(self) -> bool:
-        """``True`` if the panel is statically pinned to a node."""
         return self._static
 
     @property
     def is_pinned(self) -> bool:
-        """``True`` if the panel is perma-linked to its current node.
-
-        A pinned panel ignores canvas selection changes until the user
-        unpins it or the node is deleted.  Only meaningful for dynamic
-        panels — static panels are inherently pinned.
-        """
         return self._pinned
 
     # ──────────────────────────────────────────────────────────────────────
@@ -198,14 +222,7 @@ class NodePanel(QWidget):
     def register_mirror_factory(
         self, widget_type: type, factory: MirrorFactory
     ) -> None:
-        """
-        Register a custom mirror-widget factory for *widget_type*.
-
-        The factory signature is ``(original_widget, binding) -> QWidget``.
-        It will be preferred over the built-in cloners for exact type
-        matches (``isinstance`` is **not** used — register the concrete
-        class, not a base class).
-        """
+        """Register a per-panel custom mirror-widget factory."""
         self._custom_factories[widget_type] = factory
 
     # ──────────────────────────────────────────────────────────────────────
@@ -214,26 +231,15 @@ class NodePanel(QWidget):
 
     @Slot(bool)
     def _on_pin_toggled(self, pinned: bool) -> None:
-        """Handle the header pin button toggle.
-
-        When *pinned* is True the panel is perma-linked to its current
-        node: canvas selection changes are ignored, and the node's
-        lifetime is watched so the panel cleans up if the node is
-        deleted.  When *pinned* is False normal dynamic behaviour
-        resumes.
-        """
         if self._node is None or self._static:
             return
 
         self._pinned = pinned
 
         if pinned:
-            # Start watching the node so deletion unpins automatically.
             if not self._watching_lifetime:
                 self._watch_node_lifetime(self._node)
         else:
-            # Stop watching — _unbind_internal or a future bind_node
-            # will handle cleanup.
             self._unwatch_node_lifetime(self._node)
 
         self.pin_changed.emit(pinned)
@@ -243,23 +249,10 @@ class NodePanel(QWidget):
     # ──────────────────────────────────────────────────────────────────────
 
     def bind_node(self, node: "Node", *, static: bool = False) -> None:
-        """
-        Bind to *node* — populate the panel with mirror widgets.
-
-        Parameters
-        ----------
-        node : Node
-            The node whose ``_widget_core`` should be mirrored.
-        static : bool
-            If ``True`` the panel is permanently pinned to this node.
-            The panel will emit ``linked_node_lost`` and refuse to
-            rebind to a different node if the user calls ``bind_node``
-            again.
-        """
+        """Bind to *node* — populate the panel with mirror widgets."""
         if self._node is node:
             return
 
-        # Static and pinned panels refuse to be rebound to a different node.
         if (self._static or self._pinned) and self._node is not None:
             log.debug(
                 "Panel is locked (static=%s, pinned=%s) — ignoring "
@@ -284,13 +277,8 @@ class NodePanel(QWidget):
 
         title = self._node_title(node)
         if not static:
-            # Dynamic panels show the node name in the header because the
-            # dock title bar has a generic label (e.g. "Inspector").
             self._header.set_title(title)
         else:
-            # Static panels use the dock title bar for the node name, so
-            # the header title row is hidden.  Emit a signal so that the
-            # parent dock adapter can update its QDockWidget title.
             self._header.set_title("")
             self.dock_title_changed.emit(title)
 
@@ -307,89 +295,78 @@ class NodePanel(QWidget):
         self._header.set_pin_checked(False)
         self._pinned = False
 
-        # Listen for value changes coming FROM the node.
-        # value_changed fires on user edits (not suppressed).
-        # port_value_written fires on every programmatic write via
-        # set_port_value (upstream data, on_evaluate_finished, etc.)
-        # which is suppressed for value_changed.  Between the two,
-        # the mirror sees every change regardless of source.
+        # Connect WidgetCore signals.
         if wc is not None:
             wc.value_changed.connect(self._on_node_value_changed)
             wc.port_value_written.connect(self._on_node_value_changed)
             wc.port_enabled_changed.connect(self._on_port_enabled_changed)
+            wc.widget_registered.connect(self._on_widget_registered)
+            wc.widget_unregistered.connect(self._on_widget_unregistered)
+            wc.widget_visibility_changed.connect(
+                self._on_widget_visibility_changed
+            )
 
-        # Listen for node state changes to update the header badge.
+        # Node state changes → header badge.
         if hasattr(node, "state_changed"):
             try:
                 node.state_changed.connect(self._on_node_state_changed)
             except (RuntimeError, TypeError):
                 pass
 
-        # Listen for title edits on the node's EditableTitle.
+        # Title edits.
         if hasattr(node, "title_changed"):
             try:
                 node.title_changed.connect(self._on_node_title_changed)
             except (RuntimeError, TypeError):
                 pass
 
-        # In static mode, watch for node destruction so we can auto-close.
+        # In static mode, watch for node destruction.
         if static:
             self._watch_node_lifetime(node)
 
         self.node_bound.emit(node)
 
     def unbind(self) -> None:
-        """
-        Public unbind — disconnect from the currently bound node and
-        clear all mirrors.
-
-        In **static** mode this also releases the static lock, so the
-        panel can be rebound or closed.
-        """
+        """Public unbind — releases the static lock too."""
         self._static = False
         self._unbind_internal()
 
     def _unbind_internal(self) -> None:
-        """
-        Core unbind logic shared by ``unbind()`` and internal callers.
-        Does **not** clear ``_static`` — callers decide.
-        """
+        """Core unbind logic."""
         if self._node is None:
             return
 
         node = self._node
         wc = getattr(node, "_widget_core", None)
 
-        # Disconnect WidgetCore signals
+        # Disconnect WidgetCore signals.
         if wc is not None:
-            try:
-                wc.value_changed.disconnect(self._on_node_value_changed)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                wc.port_value_written.disconnect(self._on_node_value_changed)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                wc.port_enabled_changed.disconnect(self._on_port_enabled_changed)
-            except (RuntimeError, TypeError):
-                pass
+            for sig_name, slot in [
+                ("value_changed", self._on_node_value_changed),
+                ("port_value_written", self._on_node_value_changed),
+                ("port_enabled_changed", self._on_port_enabled_changed),
+                ("widget_registered", self._on_widget_registered),
+                ("widget_unregistered", self._on_widget_unregistered),
+                ("widget_visibility_changed",
+                 self._on_widget_visibility_changed),
+            ]:
+                try:
+                    getattr(wc, sig_name).disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
 
-        # Disconnect state_changed
         if hasattr(node, "state_changed"):
             try:
                 node.state_changed.disconnect(self._on_node_state_changed)
             except (RuntimeError, TypeError):
                 pass
 
-        # Disconnect title_changed
         if hasattr(node, "title_changed"):
             try:
                 node.title_changed.disconnect(self._on_node_title_changed)
             except (RuntimeError, TypeError):
                 pass
 
-        # Stop watching lifetime
         self._unwatch_node_lifetime(node)
 
         self._tear_down_mirrors()
@@ -400,7 +377,6 @@ class NodePanel(QWidget):
         self._header.set_pin_visible(False)
         self._header.set_pin_checked(False)
 
-        # Re-add placeholder
         self._placeholder.setParent(self._body)
         self._form.addRow(self._placeholder)
         self._placeholder.show()
@@ -412,30 +388,11 @@ class NodePanel(QWidget):
     # ──────────────────────────────────────────────────────────────────────
 
     def _watch_node_lifetime(self, node: "Node") -> None:
-        """
-        Connect to every available destruction signal so we learn about
-        node removal regardless of how it happens (scene removeItem,
-        ``del``, C++ destructor, …).
-
-        Two independent hooks are used:
-
-        1. ``QObject.destroyed`` — fires when the C++ side is deleted.
-           This is the most reliable because it works regardless of
-           whether the deletion came from Python ``del``, C++ parent
-           cleanup, or ``QGraphicsScene.removeItem()``.
-
-        2. ``Canvas.node_removed(QGraphicsItem)`` — fires when
-           ``NodeManager.remove_node()`` is used.  This catches
-           explicit graph-level removals (Delete key, context menu)
-           that may happen *before* the C++ destructor runs.
-        """
-        # QObject.destroyed — reliable for any QObject-derived node.
         try:
             node.destroyed.connect(self._on_linked_node_destroyed)
         except (RuntimeError, TypeError):
             pass
 
-        # Canvas.node_removed — emitted by some deletion paths.
         scene = None
         try:
             scene = node.scene()
@@ -447,32 +404,13 @@ class NodePanel(QWidget):
             except (RuntimeError, TypeError):
                 pass
 
-        # Mark that lifetime connections are live so _unwatch_node_lifetime
-        # knows it is safe (and necessary) to disconnect them.
         self._watching_lifetime = True
 
     def _unwatch_node_lifetime(self, node: "Node") -> None:
-        """Disconnect all lifetime signals for *node*.
-
-        This method is a no-op when ``_watching_lifetime`` is ``False`` —
-        i.e. when the panel was bound in **dynamic** mode and
-        ``_watch_node_lifetime`` was never called.  Attempting to
-        disconnect slots that were never connected causes PySide6 to emit
-        a ``RuntimeWarning`` (not a ``RuntimeError``), which bypasses the
-        usual ``except (RuntimeError, TypeError)`` guard.  The flag is the
-        authoritative gate.
-
-        ``_cpp_is_valid`` is checked as a secondary guard for the case
-        where the C++ object was already destroyed before we got here,
-        which would also produce a ``RuntimeWarning`` on disconnect.
-        """
         if not self._watching_lifetime:
             return
         self._watching_lifetime = False
 
-        # Only attempt to disconnect the destroyed signal when the C++ object
-        # is still alive.  If it is already gone Qt has already cleaned up the
-        # connection on its side, so there is nothing left to disconnect.
         if _cpp_is_valid(node):
             try:
                 node.destroyed.disconnect(self._on_linked_node_destroyed)
@@ -493,27 +431,12 @@ class NodePanel(QWidget):
 
     @Slot()
     def _on_linked_node_destroyed(self) -> None:
-        """The pinned node's C++ side is being destroyed.
-
-        We are called from inside the ``destroyed`` signal emission, which
-        means we must **not** try to disconnect from ``destroyed`` ourselves —
-        Qt is already tearing down that connection.  We *can* still reach the
-        scene to clean up the ``node_removed`` connection, because the scene
-        outlives its items.
-        """
         log.debug("Static panel: linked node destroyed.")
 
-        # Clear the flag first so that any later path through
-        # _unwatch_node_lifetime is a safe no-op.  We handle the scene
-        # disconnect inline below; the destroyed disconnect is handled by
-        # Qt itself as part of the signal emission teardown.
         watching = self._watching_lifetime
         self._watching_lifetime = False
 
         if watching:
-            # Disconnect the scene-level signal now, while we can still ask
-            # the (partially-alive) node for its scene.  This prevents a
-            # dangling connection that would produce a RuntimeWarning later.
             node = self._node
             if node is not None and _cpp_is_valid(node):
                 scene = None
@@ -523,12 +446,12 @@ class NodePanel(QWidget):
                     pass
                 if scene is not None and hasattr(scene, "node_removed"):
                     try:
-                        scene.node_removed.disconnect(self._on_scene_node_removed)
+                        scene.node_removed.disconnect(
+                            self._on_scene_node_removed
+                        )
                     except (RuntimeError, TypeError):
                         pass
 
-        # Node is already gone — null out our reference directly without
-        # trying to call methods on the dead object.
         self._tear_down_mirrors()
         self._node = None
         self._static = False
@@ -546,7 +469,6 @@ class NodePanel(QWidget):
 
     @Slot(QGraphicsItem)
     def _on_scene_node_removed(self, item: QGraphicsItem) -> None:
-        """Canvas emitted ``node_removed`` — check if it is our node."""
         if item is self._node:
             self._on_linked_node_destroyed()
 
@@ -555,7 +477,25 @@ class NodePanel(QWidget):
     # ──────────────────────────────────────────────────────────────────────
 
     def _build_mirrors(self) -> None:
-        """Create mirror widgets for every binding in the node's WidgetCore."""
+        """Create mirror widgets by walking the source form row-by-row.
+
+        Instead of iterating ``wc.bindings()`` (which loses decorative
+        elements), we walk every row of the source ``QFormLayout`` and:
+
+        - **Registered widget** in FieldRole → create a mirror clone,
+          copy the LabelRole text if any, wire bidirectional sync.
+        - **Spanning QLabel** (section header, e.g. "── Axis 0 ──") →
+          clone it into the panel as a spanning row.
+        - **Spanning QFrame** separator → clone it.
+        - **Unregistered widget** → skip.
+
+        This preserves the exact visual structure of the node body —
+        section headers, separators, and labelled widgets all appear in
+        the panel in the same order as in the node.
+
+        If the source layout is not a ``QFormLayout`` (unusual), we fall
+        back to iterating bindings in dict order.
+        """
         wc = getattr(self._node, "_widget_core", None)
         if wc is None:
             return
@@ -564,23 +504,168 @@ class NodePanel(QWidget):
         self._placeholder.hide()
         self._placeholder.setParent(None)
 
-        bindings = wc.bindings()  # returns a copy
-        for port_name, binding in bindings.items():
-            mirror = self._create_mirror(binding)
-            if mirror is None:
+        src_layout = wc.layout()
+        if not isinstance(src_layout, QFormLayout):
+            # Fallback: iterate bindings in dict order (no decorative rows).
+            for port_name, binding in wc.bindings().items():
+                self._add_mirror_for_binding(port_name, binding)
+            return
+
+        # Build reverse map: id(source_widget) → port_name.
+        bindings = wc.bindings()
+        widget_to_port = {id(b.widget): pn for pn, b in bindings.items()}
+
+        for row in range(src_layout.rowCount()):
+            span_item = src_layout.itemAt(
+                row, QFormLayout.ItemRole.SpanningRole,
+            )
+            lbl_item = src_layout.itemAt(
+                row, QFormLayout.ItemRole.LabelRole,
+            )
+            fld_item = src_layout.itemAt(
+                row, QFormLayout.ItemRole.FieldRole,
+            )
+
+            # ── Spanning row ──────────────────────────────────────────
+            if span_item is not None:
+                sw = span_item.widget()
+                if sw is None:
+                    continue
+
+                port_name = widget_to_port.get(id(sw))
+                if port_name is not None:
+                    # Registered spanning widget → mirror without label.
+                    binding = bindings.get(port_name)
+                    if binding is not None:
+                        self._add_mirror_for_binding(port_name, binding)
+                    continue
+
+                # Unregistered spanning QLabel → clone as section header.
+                if isinstance(sw, QLabel):
+                    clone = QLabel(sw.text())
+                    clone.setAlignment(sw.alignment())
+                    clone.setWordWrap(sw.wordWrap())
+                    self._form.addRow(clone)
+                    continue
+
+                # Unregistered spanning QFrame separator → clone.
+                if isinstance(sw, QFrame) and sw.frameShape() in (
+                    QFrame.Shape.HLine, QFrame.Shape.VLine,
+                ):
+                    sep = QFrame()
+                    sep.setFrameShape(sw.frameShape())
+                    sep.setFrameShadow(sw.frameShadow())
+                    self._form.addRow(sep)
+                    continue
+
+                # Other unregistered spanning widgets — skip.
                 continue
 
-            self._mirrors[port_name] = mirror
+            # ── Label + Field row ─────────────────────────────────────
+            fld_w = fld_item.widget() if fld_item is not None else None
+            if fld_w is None:
+                continue
 
-            # Sync the initial enabled state from the source widget so
-            # mirrors for auto-disabled ports start out greyed.
-            mirror.setEnabled(binding.widget.isEnabled())
+            port_name = widget_to_port.get(id(fld_w))
+            if port_name is None:
+                # Unregistered field widget — skip.
+                continue
 
-            label_text = port_name.replace("_", " ").title()
-            self._form.addRow(f"{label_text}:", mirror)
+            binding = bindings.get(port_name)
+            if binding is None:
+                continue
 
-            # Connect mirror → node
-            self._connect_mirror_signal(port_name, mirror, binding)
+            # Discover the label text from the LabelRole.
+            label_text = None
+            if lbl_item is not None:
+                lbl_w = lbl_item.widget()
+                if isinstance(lbl_w, QLabel):
+                    label_text = lbl_w.text()
+
+            self._add_mirror_for_binding(
+                port_name, binding, label_text=label_text,
+            )
+
+    def _add_mirror_for_binding(
+        self,
+        port_name: str,
+        binding: "WidgetBinding",
+        label_text: Optional[str] = _UNSET,
+    ) -> None:
+        """Create a single mirror widget, add it to the form, wire signals.
+
+        Parameters
+        ----------
+        port_name : str
+            The port/binding name.
+        binding : WidgetBinding
+            The source binding from WidgetCore.
+        label_text : str or None or _UNSET
+            If ``_UNSET`` (the default), the label is discovered from
+            the source form via ``labelForField()``.  If ``None``, no
+            label is added (spanning row).  If a string, that text is
+            used.
+        """
+        mirror = self._create_mirror(binding)
+        if mirror is None:
+            return
+
+        self._mirrors[port_name] = mirror
+
+        # Sync initial enabled state.
+        mirror.setEnabled(binding.widget.isEnabled())
+
+        # Sync initial value.
+        wc = getattr(self._node, "_widget_core", None)
+        if wc is not None:
+            value = wc.get_port_value(port_name)
+            if value is not None:
+                self._set_mirror_value(mirror, value)
+
+        # Resolve label text if not provided by the caller.
+        if label_text is _UNSET:
+            label_text = self._discover_label_text(binding.widget)
+
+        if label_text is not None:
+            label = QLabel(label_text)
+            self._mirror_labels[port_name] = label
+            self._form.addRow(label, mirror)
+        else:
+            self._form.addRow(mirror)
+
+        # Sync initial visibility (the source widget may already be hidden,
+        # e.g. the Value spinbox when Fill ≠ Full).
+        visible = binding.widget.isVisible()
+        if not visible:
+            mirror.hide()
+            label_w = self._mirror_labels.get(port_name)
+            if label_w is not None:
+                label_w.hide()
+
+        # Connect mirror → node (bidirectional sync).
+        self._connect_mirror_signal(port_name, mirror, binding)
+
+    def _discover_label_text(self, widget: QWidget) -> Optional[str]:
+        """Look up the label for *widget* from the source QFormLayout.
+
+        Uses ``labelForField()`` so we get the *exact* text the node
+        author wrote (e.g. ``"Dim 0:"``, ``"Fill:"``).  Returns
+        ``None`` when the widget spans the full row or the layout is
+        not a ``QFormLayout``.
+        """
+        wc = getattr(self._node, "_widget_core", None)
+        if wc is None:
+            return None
+        layout = wc.layout()
+        if not isinstance(layout, QFormLayout):
+            return None
+        lbl_w = layout.labelForField(widget)
+        if lbl_w is None:
+            return None
+        if isinstance(lbl_w, QLabel):
+            return lbl_w.text()
+        text_fn = getattr(lbl_w, "text", None)
+        return text_fn() if callable(text_fn) else None
 
     def _tear_down_mirrors(self) -> None:
         """Remove all mirror widgets and disconnect their signals."""
@@ -598,9 +683,17 @@ class NodePanel(QWidget):
             except RuntimeError:
                 pass
 
-        self._mirrors.clear()
+        for label in self._mirror_labels.values():
+            try:
+                label.setParent(None)
+                label.deleteLater()
+            except RuntimeError:
+                pass
 
-        # Clear the form layout
+        self._mirrors.clear()
+        self._mirror_labels.clear()
+
+        # Clear the form layout.
         while self._form.count():
             item = self._form.takeAt(0)
             w = item.widget()
@@ -608,39 +701,122 @@ class NodePanel(QWidget):
                 w.setParent(None)
                 w.deleteLater()
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Dynamic widget add/remove (reacts to WidgetCore signals)
+    # ──────────────────────────────────────────────────────────────────────
+
+    @Slot(str)
+    def _on_widget_registered(self, port_name: str) -> None:
+        """WidgetCore registered a new widget — add a mirror for it."""
+        if port_name in self._mirrors:
+            return  # already mirrored
+
+        wc = getattr(self._node, "_widget_core", None)
+        if wc is None:
+            return
+
+        binding = wc.get_binding(port_name)
+        if binding is None:
+            return
+
+        # Remove placeholder if it's showing.
+        if self._placeholder.parent() is self._body:
+            self._placeholder.hide()
+            self._placeholder.setParent(None)
+
+        self._add_mirror_for_binding(port_name, binding)
+
+    @Slot(str)
+    def _on_widget_unregistered(self, port_name: str) -> None:
+        """WidgetCore unregistered a widget — remove its mirror."""
+        mirror = self._mirrors.pop(port_name, None)
+        if mirror is None:
+            return
+
+        # Disconnect the mirror's change signal.
+        self._disconnect_mirror_signal(port_name, mirror)
+        self._mirror_slots.pop(port_name, None)
+
+        # Also discard the tracked label.
+        label = self._mirror_labels.pop(port_name, None)
+
+        # Remove the mirror's row from the form layout.
+        for row in range(self._form.rowCount()):
+            field_item = self._form.itemAt(
+                row, QFormLayout.ItemRole.FieldRole,
+            )
+            if field_item is not None and field_item.widget() is mirror:
+                self._form.removeRow(row)
+                return
+
+        # Fallback: if we couldn't find it in the form, just detach.
+        try:
+            mirror.setParent(None)
+            mirror.deleteLater()
+        except RuntimeError:
+            pass
+        if label is not None:
+            try:
+                label.setParent(None)
+                label.deleteLater()
+            except RuntimeError:
+                pass
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Visibility mirroring
+    # ──────────────────────────────────────────────────────────────────────
+
+    @Slot(str, bool)
+    def _on_widget_visibility_changed(
+        self, port_name: str, visible: bool
+    ) -> None:
+        """A registered widget in the node was shown/hidden — sync the
+        mirror row (both label and widget)."""
+        mirror = self._mirrors.get(port_name)
+        if mirror is not None:
+            mirror.setVisible(visible)
+
+        label = self._mirror_labels.get(port_name)
+        if label is not None:
+            label.setVisible(visible)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Mirror factory chain
+    # ──────────────────────────────────────────────────────────────────────
+
     def _create_mirror(self, binding: "WidgetBinding") -> Optional[QWidget]:
         """
         Create a mirror widget for *binding*.
 
         Resolution order:
-        1. Custom factory registered on *this panel* via
-           ``register_mirror_factory()`` (exact type match).
-        2. Global custom factory registered via
-           ``mirror_factories.register_mirror_factory()`` (exact type).
-        3. Built-in factory list (``isinstance`` check, subclass-first).
+        1. Panel-local custom factory (exact type match).
+        2. Global custom factory (exact type match).
+        3. Built-in factory list (isinstance check, subclass-first).
         4. ``None`` if no factory can handle the type.
         """
         original = binding.widget
         orig_type = type(original)
 
-        # 1. Panel-local custom factory (exact match)
+        # 1. Panel-local custom factory
         factory = self._custom_factories.get(orig_type)
         if factory is not None:
             try:
                 return factory(original, binding)
             except Exception as exc:
                 log.warning(
-                    f"Custom mirror factory for {orig_type.__name__} failed: {exc}"
+                    f"Custom mirror factory for {orig_type.__name__} "
+                    f"failed: {exc}"
                 )
 
-        # 2. Global custom factory (exact match)
+        # 2. Global custom factory
         global_factory = _get_custom_factory(orig_type)
         if global_factory is not None:
             try:
                 return global_factory(original, binding)
             except Exception as exc:
                 log.warning(
-                    f"Global mirror factory for {orig_type.__name__} failed: {exc}"
+                    f"Global mirror factory for {orig_type.__name__} "
+                    f"failed: {exc}"
                 )
 
         # 3. Built-in factories
@@ -650,7 +826,8 @@ class NodePanel(QWidget):
                     return factory_fn(original, binding)
                 except Exception as exc:
                     log.warning(
-                        f"Built-in mirror factory for {cls.__name__} failed: {exc}"
+                        f"Built-in mirror factory for {cls.__name__} "
+                        f"failed: {exc}"
                     )
                     return None
 
@@ -670,17 +847,15 @@ class NodePanel(QWidget):
         """Connect the mirror widget's change signal → push value to node."""
         sig_name: Optional[str] = None
 
-        # 1. Built-in signal map
         for cls, name in _MIRROR_SIGNAL_MAP.items():
             if isinstance(mirror, cls):
                 sig_name = name
                 break
 
-        # 2. Global custom signal map (exact type)
         if sig_name is None:
             sig_name = _CUSTOM_SIGNAL_MAP.get(type(mirror))
 
-        # QPushButton.clicked → forward to the original button
+        # QPushButton.clicked → forward to the original button.
         if sig_name is None and isinstance(mirror, QPushButton):
             original = binding.widget
 
@@ -706,32 +881,21 @@ class NodePanel(QWidget):
             return
 
         def _on_mirror_edited(*_args, _pn=port_name, _m=mirror, _wc=wc):
-            from weave.widgetcore import WidgetCore
-            value = WidgetCore._generic_get(_m)
-            # Push the value into the node's widget (signals blocked so the
-            # widget's own change signal doesn't fire).
+            value = generic_get(_m)
             _wc.set_port_value(_pn, value)
-            # Explicitly notify the node that the value changed.
-            # set_port_value suppresses the widget's change signal to avoid
-            # feedback loops, but this means the node's compute() pipeline
-            # never triggers.  Emitting value_changed here closes the gap:
-            # the node sees the change, reads the (already updated) widget,
-            # and runs compute().
-            # This also triggers _on_node_value_changed on this panel, which
-            # writes the same value back into the mirror with signals blocked
-            # — no infinite loop.
             _wc.value_changed.emit(_pn)
 
         sig.connect(_on_mirror_edited)
         self._mirror_slots[port_name] = _on_mirror_edited
 
-    def _disconnect_mirror_signal(self, port_name: str, mirror: QWidget) -> None:
+    def _disconnect_mirror_signal(
+        self, port_name: str, mirror: QWidget
+    ) -> None:
         """Disconnect a mirror widget's change signal."""
         slot = self._mirror_slots.get(port_name)
         if slot is None:
             return
 
-        # Try built-in signal map first.
         for cls, sig_name in _MIRROR_SIGNAL_MAP.items():
             if isinstance(mirror, cls):
                 sig = getattr(mirror, sig_name, None)
@@ -742,7 +906,6 @@ class NodePanel(QWidget):
                         pass
                 return
 
-        # Try global custom signal map (exact type).
         custom_sig_name = _CUSTOM_SIGNAL_MAP.get(type(mirror))
         if custom_sig_name is not None:
             sig = getattr(mirror, custom_sig_name, None)
@@ -761,7 +924,7 @@ class NodePanel(QWidget):
 
     @Slot(str)
     def _on_node_value_changed(self, port_name: str) -> None:
-        """A value changed inside the node — update the corresponding mirror."""
+        """A value changed inside the node — update the mirror."""
         mirror = self._mirrors.get(port_name)
         if mirror is None:
             return
@@ -776,19 +939,20 @@ class NodePanel(QWidget):
     @staticmethod
     def _set_mirror_value(mirror: QWidget, value: Any) -> None:
         """Write *value* into *mirror* with signals blocked."""
-        from weave.widgetcore import WidgetCore
         was_blocked = mirror.signalsBlocked()
         mirror.blockSignals(True)
         try:
-            WidgetCore._generic_set(mirror, value)
+            generic_set(mirror, value)
         except Exception as exc:
             log.debug(f"Failed to set mirror value: {exc}")
         finally:
             mirror.blockSignals(was_blocked)
 
     @Slot(str, bool)
-    def _on_port_enabled_changed(self, port_name: str, enabled: bool) -> None:
-        """A widget inside the node was enabled/disabled — sync the mirror."""
+    def _on_port_enabled_changed(
+        self, port_name: str, enabled: bool
+    ) -> None:
+        """A widget inside the node was enabled/disabled — sync."""
         mirror = self._mirrors.get(port_name)
         if mirror is not None:
             mirror.setEnabled(enabled)
@@ -808,12 +972,6 @@ class NodePanel(QWidget):
 
     @Slot(str)
     def _on_node_title_changed(self, new_title: str) -> None:
-        """The node's EditableTitle was edited — update accordingly.
-
-        Dynamic panels update the header label.  Static panels emit
-        ``dock_title_changed`` so the parent ``NodeDockAdapter`` can
-        update the ``QDockWidget`` title bar.
-        """
         if self._static:
             self.dock_title_changed.emit(new_title)
         else:
