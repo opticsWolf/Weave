@@ -25,7 +25,10 @@ from PySide6.QtGui import (
     QLinearGradient, QPainterPathStroker, QBrush
 )
 
-from weave.node.node_subcomponents import NodeState, StateSlider, MinimizeButton, EditableTitle, ResizeHandle, highlight_colors
+from weave.node.node_enums import NodeState, highlight_colors
+from weave.node.node_subcomponents import (
+    StateSlider, MinimizeButton, EditableTitle, ResizeHandle
+    )
 
 # Forward declaration (as in original)
 if TYPE_CHECKING:
@@ -35,7 +38,6 @@ if TYPE_CHECKING:
 # 1. HELPER FUNCTIONS
 # ==============================================================================
 
-# highlight_colors is imported from qt_nodesubcomponents to avoid circular imports
 
 def shift_color(color: QColor, shift: int) -> QColor:
     """

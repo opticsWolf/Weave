@@ -19,7 +19,7 @@ Handles:
 from typing import Optional, Dict, Any
 from PySide6.QtGui import QColor
 
-from weave.node.node_subcomponents import NodeState, highlight_colors
+from weave.node.node_enums import NodeState, highlight_colors
 #from weave.node import highlight_colors
 from weave.stylemanager import StyleManager, StyleCategory
 
@@ -138,17 +138,20 @@ class NodeConfigMixin:
         """
         Callback method called when the StyleManager notifies about style changes.
     
-        FIX: Explicitly update colors so the header and body receive new brushes.
-        Previously, this method updated self._config but did not trigger color updates
-        for visual components. This caused nodes to not refresh immediately when styles changed.
-    
         Args:
             category (StyleCategory): The style category that changed.
             changes (Dict[str, Any]): Dictionary of style key-value pairs that changed.
         """
         if category == StyleCategory.NODE:
             self._config.update(changes)
-    
+
+            # Refresh port geometry config.  Theme changes fire on_style_changed once
+            # per category; by the time NODE fires, StyleManager already holds the new
+            # PORT values, so reading them here keeps _port_config in sync without
+            # waiting for the PORT notification.
+            if hasattr(self, '_port_config'):
+                self._port_config = StyleManager.instance().get_all(StyleCategory.PORT)
+
             if hasattr(self, 'header'):
                 self.header._recalculate_layout()
                 self.header._title.update_selection_style(self.isSelected())
@@ -157,12 +160,21 @@ class NodeConfigMixin:
             # freshly-updated theme palette.  Must be called AFTER _config.update()
             # (so the new palette is available) but BEFORE _update_colors() (so the
             # correct derived colour is used for painting).
-            # If no index is stored this is a no-op.
             if hasattr(self, '_reapply_header_color_from_index'):
                 self._reapply_header_color_from_index()
 
+            # Refresh pulse animation timing / waveform if the theme changed them
+            if hasattr(self, '_on_pulse_style_changed'):
+                self._on_pulse_style_changed(changes)
+
             # Explicitly update colors so the header and body receive new brushes
             self._update_colors(is_selected=self.isSelected())
+
+            # Rebuild the resize handle's cached arc path and bounding rect.
+            # Paint reads colors/widths live from _config, but _path and _rect
+            # are only recalculated when update_config() is called explicitly.
+            if hasattr(self, 'handle') and hasattr(self.handle, 'update_config'):
+                self.handle.update_config()
     
             self._recalculate_paths()
             self.enforce_min_dimensions()
@@ -173,6 +185,30 @@ class NodeConfigMixin:
             if hasattr(self, 'header'): 
                 self.header.update()
             if hasattr(self, 'body'): 
+                self.body.update()
+
+        elif category == StyleCategory.PORT:
+            # Refresh the raw port geometry dict used by NodeGeometryMixin.
+            # Without this, port radius, offset, spacing and area settings remain
+            # frozen at init-time values when a theme changes PORT schema values.
+            if hasattr(self, '_port_config'):
+                self._port_config = StyleManager.instance().get_all(StyleCategory.PORT)
+
+            # Also refresh the legacy-prefixed port keys in _config that
+            # NodeHeader._recalculate_layout() and NodePortsMixin use.
+            self._config.update(self._get_port_config_for_node())
+
+            if hasattr(self, 'header'):
+                self.header._recalculate_layout()
+
+            self.enforce_min_dimensions()
+            self._recalculate_paths()
+            self.update_geometry()
+            self.update()
+
+            if hasattr(self, 'header'):
+                self.header.update()
+            if hasattr(self, 'body'):
                 self.body.update()
 
     # ------------------------------------------------------------------

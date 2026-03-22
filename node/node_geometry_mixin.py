@@ -33,11 +33,16 @@ from PySide6.QtCore import Qt, QRectF, QVariantAnimation
 from PySide6.QtGui import QPainterPath
 
 from weave.node.node_port import NodePort
+from weave.node.node_enums import VerticalSizePolicy
 from weave.stylemanager import StyleManager, StyleCategory
 
 from weave.logger import get_logger
 log = get_logger("NodeGeometryMixin")
 
+
+# ==============================================================================
+# NodeGeometryMixin - Mixin providing geometry, layout, and animation for Node
+# ==============================================================================
 
 class NodeGeometryMixin:
     """
@@ -47,6 +52,7 @@ class NodeGeometryMixin:
         - self._config: Dict[str, Any]
         - self._width, self._total_height, self._stored_height: float
         - self.is_minimized: bool
+        - self._vertical_size_policy: VerticalSizePolicy
         - self.header: NodeHeader (get_height, set_width, get_title_width, _recalculate_layout)
         - self.body: NodeBody (get_content_min_size, setPos, update_layout, setVisible)
         - self.handle: ResizeHandle (setPos, setVisible)
@@ -62,6 +68,40 @@ class NodeGeometryMixin:
         - self._update_all_connected_traces()
         - self._set_ports_visible(visible: bool)
     """
+
+    # ------------------------------------------------------------------
+    # Visible-Port Helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _visible_ports(ports: List[NodePort]) -> List[NodePort]:
+        """Return only ports whose QGraphicsItem visibility is True."""
+        return [p for p in ports if p.isVisible()]
+
+    # ------------------------------------------------------------------
+    # Vertical Size Policy
+    # ------------------------------------------------------------------
+
+    def get_vertical_size_policy(self) -> 'VerticalSizePolicy':
+        """Return the active vertical size policy for this instance."""
+        return getattr(self, '_vertical_size_policy', VerticalSizePolicy.GROW_ONLY)
+
+    def set_vertical_size_policy(self, policy: 'VerticalSizePolicy') -> None:
+        """Set the vertical size policy and apply it immediately.
+
+        Note:
+            ``BaseControlNode`` subclasses can declare a class-level default
+            via ``vertical_size_policy = VerticalSizePolicy.FIT`` which is
+            applied in ``__init__``.  This method is for *runtime* changes
+            and triggers an immediate ``auto_resize()``.
+
+        Args:
+            policy: ``VerticalSizePolicy.GROW_ONLY`` (default) or
+                    ``VerticalSizePolicy.FIT``.
+        """
+        self._vertical_size_policy = VerticalSizePolicy(policy)
+        # Apply immediately so the node reflects the new policy.
+        self.auto_resize()
 
     # ------------------------------------------------------------------
     # Bounding Rect
@@ -144,15 +184,20 @@ class NodeGeometryMixin:
     # ------------------------------------------------------------------
 
     def _calculate_port_stack_height(self, ports: List[NodePort]) -> float:
-        """Calculates total height required for a stack of ports."""
-        if not ports:
+        """Calculates total height required for a stack of visible ports.
+
+        Hidden ports (``isVisible() == False``) are excluded so that
+        toggling port visibility correctly adjusts the node's height.
+        """
+        visible = self._visible_ports(ports)
+        if not visible:
             return 0.0
 
         margin = self._port_config['area_margin']
         port_dia = self._port_config['radius'] * 2
 
         total_h = margin
-        for p in ports:
+        for p in visible:
             label_h = p.get_label_height() if hasattr(p, 'get_label_height') else port_dia
             row_h = max(port_dia, label_h)
             total_h += row_h + margin
@@ -163,7 +208,10 @@ class NodeGeometryMixin:
     # ------------------------------------------------------------------
 
     def _calculate_layout_metrics(self) -> Tuple[float, float, float, float]:
-        """Calculates internal heights for top area, widget, and bottom area."""
+        """Calculates internal heights for top area, widget, and bottom area.
+
+        Only visible ports contribute to stack height and label width.
+        """
         h_in = self._calculate_port_stack_height(self.inputs)
         h_out = self._calculate_port_stack_height(self.outputs)
         area_h = max(h_in, h_out)
@@ -188,12 +236,15 @@ class NodeGeometryMixin:
             else (0, 0)
         )
 
+        visible_in = self._visible_ports(self.inputs)
+        visible_out = self._visible_ports(self.outputs)
+
         max_in_w = max(
-            (p.get_label_width() for p in self.inputs if hasattr(p, 'get_label_width')),
+            (p.get_label_width() for p in visible_in if hasattr(p, 'get_label_width')),
             default=0.0,
         )
         max_out_w = max(
-            (p.get_label_width() for p in self.outputs if hasattr(p, 'get_label_width')),
+            (p.get_label_width() for p in visible_out if hasattr(p, 'get_label_width')),
             default=0.0,
         )
         min_middle_gap = 40.0
@@ -236,7 +287,17 @@ class NodeGeometryMixin:
         return self._calculate_expanded_min_size()
 
     def enforce_min_dimensions(self):
-        """Resizes node if current dimensions are too small."""
+        """Resizes node if current dimensions are too small.
+
+        This method is **always grow-only**: it never shrinks the node
+        below its current size.  It is used by style/config/theme change
+        callbacks where preserving user-set dimensions is the correct
+        behaviour.
+
+        For structural changes (port add/remove, widget set, visibility
+        toggle) use :meth:`auto_resize` instead, which respects the
+        node's ``_vertical_size_policy``.
+        """
         min_w, min_h = self.calculate_min_size()
         new_w = max(self._width, min_w)
         new_h = max(self._total_height, min_h)
@@ -253,6 +314,173 @@ class NodeGeometryMixin:
                 self.header.set_width(new_w)
             self._recalculate_paths()
             self.update_geometry()
+
+    # ------------------------------------------------------------------
+    # Auto-Resize (policy-aware)
+    # ------------------------------------------------------------------
+
+    def auto_resize(self) -> None:
+        """Resize the node to fit its content, respecting the size policy.
+
+        This is the primary resize method for **structural content
+        changes** — port additions / removals, widget changes, and port
+        visibility toggles.
+
+        Horizontal behaviour (always the same):
+            Width only *grows* to accommodate content.  If the node has
+            been manually widened beyond the minimum, the extra width is
+            preserved.
+
+        Vertical behaviour (policy-dependent):
+            ``VerticalSizePolicy.GROW_ONLY``
+                Height increases when content exceeds the current height
+                but never shrinks — identical to ``enforce_min_dimensions``.
+            ``VerticalSizePolicy.FIT``
+                Height always matches the minimum required to display
+                the current content.  Removing a port or hiding a widget
+                causes the node to shrink accordingly.
+
+        This method is a no-op while the node is minimised or while
+        the minimise/maximise animation is running.
+        """
+        if self.is_minimized:
+            return
+
+        # Don't fight the animation
+        if self._anim.state() == QVariantAnimation.State.Running:
+            return
+
+        min_w, min_h = self._calculate_expanded_min_size()
+
+        # Horizontal: grow-only (never shrink from user-set width)
+        new_w = max(self._width, min_w)
+
+        # Vertical: policy-dependent
+        policy = getattr(self, '_vertical_size_policy', VerticalSizePolicy.GROW_ONLY)
+        if policy == VerticalSizePolicy.FIT:
+            new_h = min_h
+        else:
+            new_h = max(self._total_height, min_h)
+
+        changed = (abs(new_w - self._width) > 0.1
+                    or abs(new_h - self._total_height) > 0.1)
+        if not changed:
+            return
+
+        if self.scene():
+            self.prepareGeometryChange()
+        self._width = new_w
+        self._total_height = new_h
+        self._stored_height = new_h
+
+        if hasattr(self.header, 'set_width'):
+            self.header.set_width(new_w)
+
+        self._recalculate_paths()
+        self.update_geometry()
+
+    # ------------------------------------------------------------------
+    # Content Change Notification
+    # ------------------------------------------------------------------
+
+    def notify_content_changed(self) -> None:
+        """Notify the node that body-widget dimensions may have changed.
+
+        Call this after toggling widget visibility, adding or removing
+        widgets from the body layout, or anything else that affects the
+        embedded content's minimum size.
+
+        This method is also called **automatically** by ``WidgetCore``
+        when it detects a ``QEvent.LayoutRequest`` on itself (fired by
+        Qt whenever a child widget is shown, hidden, added, removed, or
+        changes its size hint).  Manual calls are therefore only needed
+        when the content widget is *not* a ``WidgetCore``.
+
+        Skipped silently while the node is minimised or animating.
+        """
+        if self.is_minimized:
+            return
+        if self._anim.state() == QVariantAnimation.State.Running:
+            return
+        if self.scene():
+            self.prepareGeometryChange()
+        self.auto_resize()
+        self.update_geometry()
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Port Visibility
+    # ------------------------------------------------------------------
+
+    def set_port_visible(self, port: NodePort, visible: bool) -> None:
+        """Show or hide a single port and auto-resize the node.
+
+        Hidden ports are excluded from layout calculations so the node
+        can shrink (if the policy allows).  Their traces remain intact —
+        use :meth:`remove_port` to disconnect them.
+
+        Args:
+            port:    The port to show or hide.
+            visible: ``True`` to show, ``False`` to hide.
+        """
+        if port.isVisible() == visible:
+            return
+
+        port.setVisible(visible)
+        if hasattr(port, '_label') and port._label:
+            port._label.setVisible(visible)
+
+        self.auto_resize()
+        self._recalculate_paths()
+        self.update_geometry()
+        self._update_all_connected_traces()
+        self.update()
+
+    def set_ports_visible_by_filter(
+        self,
+        predicate,
+        ports: Optional[List[NodePort]] = None,
+    ) -> int:
+        """Batch-toggle port visibility via a predicate.
+
+        More efficient than calling :meth:`set_port_visible` in a loop
+        because the geometry rebuild runs only once.
+
+        Args:
+            predicate: A callable ``(NodePort) -> bool``.  Returns
+                       ``True`` for ports that should be visible.
+            ports:     Ports to evaluate.  Defaults to all inputs + outputs.
+
+        Returns:
+            Number of ports whose visibility actually changed.
+
+        Example::
+
+            # Hide all 'debug' ports
+            node.set_ports_visible_by_filter(
+                lambda p: p.datatype != 'debug'
+            )
+        """
+        if ports is None:
+            ports = self.inputs + self.outputs
+
+        changed = 0
+        for p in ports:
+            want_visible = bool(predicate(p))
+            if p.isVisible() != want_visible:
+                p.setVisible(want_visible)
+                if hasattr(p, '_label') and p._label:
+                    p._label.setVisible(want_visible)
+                changed += 1
+
+        if changed:
+            self.auto_resize()
+            self._recalculate_paths()
+            self.update_geometry()
+            self._update_all_connected_traces()
+            self.update()
+
+        return changed
 
     # ------------------------------------------------------------------
     # Geometry Update & Port Layout
@@ -312,7 +540,12 @@ class NodeGeometryMixin:
         output_rect: Optional[QRectF] = None,
         header_h: Optional[float] = None,
     ):
-        """Layouts ports with rect-based positioning."""
+        """Layouts visible ports with rect-based positioning.
+
+        Hidden ports are skipped entirely so they do not consume layout
+        space.  Their ``QGraphicsItem`` positions remain unchanged (they
+        are invisible anyway).
+        """
         if input_rect is None:
             input_rect = QRectF()
         if output_rect is None:
@@ -333,34 +566,37 @@ class NodeGeometryMixin:
 
         port_dia = self._port_config['radius'] * 2
 
+        visible_in = self._visible_ports(self.inputs)
+        visible_out = self._visible_ports(self.outputs)
+
         # 2. Input Ports
-        if self.inputs:
+        if visible_in:
             if not input_rect.isEmpty():
                 start_y = header_h + input_rect.top() + margin
-                for i, p in enumerate(self.inputs):
+                for p in visible_in:
                     label_h = p.get_label_height() if hasattr(p, 'get_label_height') else port_dia
                     row_h = max(port_dia, label_h)
                     cy = start_y + (row_h / 2)
                     p.setPos(-offset, cy)
                     start_y += row_h + margin
             else:
-                step = (self._total_height - header_h) / (len(self.inputs) + 1)
-                for i, port in enumerate(self.inputs):
+                step = (self._total_height - header_h) / (len(visible_in) + 1)
+                for i, port in enumerate(visible_in):
                     port.setPos(-offset, header_h + (i + 0.75) * step)
 
         # 3. Output Ports
-        if self.outputs:
+        if visible_out:
             if not output_rect.isEmpty():
                 start_y = header_h + output_rect.top() + margin
-                for i, p in enumerate(self.outputs):
+                for p in visible_out:
                     label_h = p.get_label_height() if hasattr(p, 'get_label_height') else port_dia
                     row_h = max(port_dia, label_h)
                     cy = start_y + (row_h / 2)
                     p.setPos(self._width + offset, cy)
                     start_y += row_h + margin
             else:
-                step = (self._total_height - header_h) / (len(self.outputs) + 1)
-                for i, port in enumerate(self.outputs):
+                step = (self._total_height - header_h) / (len(visible_out) + 1)
+                for i, port in enumerate(visible_out):
                     port.setPos(self._width + offset, header_h + (i + 0.75) * step)
 
     # ------------------------------------------------------------------
@@ -569,6 +805,7 @@ class NodeGeometryMixin:
 
     # ------------------------------------------------------------------
     # Computing Pulse Animation
+    # fallback if pulse animation mixin is not availbe
     # ------------------------------------------------------------------
 
     def _start_computing_pulse(self) -> None:

@@ -8,7 +8,6 @@ SPDX-License-Identifier: Apache-2.0
 """
 
 import math
-from enum import Enum
 from typing import Optional, Callable, TYPE_CHECKING
 from PySide6.QtWidgets import (
     QGraphicsItem, QWidget,
@@ -21,34 +20,12 @@ from PySide6.QtGui import (
     QPainterPathStroker, QBrush
 )
 
+from weave.node.node_enums import NodeState, highlight_colors
+
 # Forward declaration (as in original)
 if TYPE_CHECKING:
     from weave.node.node_core import Node
 
-# ==============================================================================
-# 1. HELPER FUNCTIONS
-# ==============================================================================
-
-def highlight_colors(color: QColor, b_offset: int, s_offset: int = 0) -> QColor:
-    """
-    Adjusts the brightness and saturation of a QColor.
-    All values cast to int for PySide6 C++ signature safety.
-    """
-    h, s, l, a = color.getHsl()
-    l = int(max(0, min(255, l + b_offset)))
-    s = int(max(0, min(255, s + s_offset)))
-    return QColor.fromHsl(int(h), s, l, int(a))
-
-
-# ==============================================================================
-# 2. COMPONENTS 
-# ==============================================================================
-
-class NodeState(Enum):
-    NORMAL = 0
-    PASSTHROUGH = 1
-    DISABLED = 2
-    COMPUTING = 3
 
 # ==============================================================================
 # StateSlider - Interactive State Toggle (Visual Component)

@@ -37,11 +37,12 @@ from PySide6.QtGui import (
 
 # Import node components (unchanged from original)
 from weave.node.node_components import NodeBody, NodeHeader
-from weave.node.node_subcomponents import (
-   NodeState, highlight_colors, ResizeHandle
-)
-
+from weave.node.node_subcomponents import ResizeHandle
 from weave.node.node_port import NodePort
+
+from weave.node.node_enums import (
+    NodeState, VerticalSizePolicy, DisabledBehavior, highlight_colors,
+)
 
 # Import style manager for integration
 from weave.stylemanager import StyleManager, StyleCategory
@@ -50,12 +51,13 @@ from weave.stylemanager import StyleManager, StyleCategory
 from weave.node.node_config_mixin import NodeConfigMixin
 from weave.node.node_ports_mixin import NodePortsMixin
 from weave.node.node_geometry_mixin import NodeGeometryMixin
+from weave.node.node_pulse_anim_mixin import NodePulseAnimMixin
 
 from weave.logger import get_logger
 log = get_logger("Node")
 
 
-class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
+class Node(NodeConfigMixin, NodePortsMixin, NodePulseAnimMixin, NodeGeometryMixin, QGraphicsObject):
     """
     Principal node class for the QGraphicsScene.
     Handles visual representation, state transitions, and port management.
@@ -71,6 +73,12 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
 
     # Signal emitted when geometry changes significantly
     geometry_changed = Signal()
+
+    # Signal emitted after a port is fully removed (receives the detached NodePort)
+    port_removed = Signal(object)
+
+    # Signal emitted after a port is added (receives the new NodePort)
+    port_added = Signal(object)
 
     def __init__(self, title: str = "Base Node", config: Optional[Dict[str, Any]] = None):
         """
@@ -97,6 +105,10 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         self.is_minimized = False
         self._is_hovered = False
 
+        # Vertical resize policy — controls whether the node shrinks when
+        # content is removed (FIT) or only ever grows (GROW_ONLY).
+        self._vertical_size_policy: VerticalSizePolicy = VerticalSizePolicy.GROW_ONLY
+
         # Custom color attributes (no longer using fallbacks)
         self._custom_header_bg = None
         self._custom_header_outline = None
@@ -119,9 +131,6 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
 
         # Overlay color attribute
         self._overlay_color = QColor(0, 0, 0, 0)
-
-        # Computing pulse state
-        self._computing_pulse_phase: float = 0.0
 
         # 2. UI Components
         self.header = NodeHeader(self, title)
@@ -154,14 +163,8 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         self._anim.valueChanged.connect(self._on_anim_value_changed)
         self._anim.finished.connect(self._on_anim_finished)
 
-        # Computing Pulse Animation (looping 0.0 → 1.0 → 0.0)
-        self._computing_pulse_anim = QVariantAnimation(self)
-        self._computing_pulse_anim.setStartValue(0.0)
-        self._computing_pulse_anim.setEndValue(1.0)
-        self._computing_pulse_anim.setDuration(1200)
-        self._computing_pulse_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
-        self._computing_pulse_anim.setLoopCount(-1)
-        self._computing_pulse_anim.valueChanged.connect(self._on_computing_pulse_tick)
+        # Computing Pulse Animation (configurable via NodePulseAnimMixin)
+        self._init_pulse_anim()
 
         # 5. Initial Layout & Colors
         self._update_colors(is_selected=False)
@@ -340,6 +343,7 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
             "outputs": outputs_state,
             "minimized": self.is_minimized,
             "node_state": self._state.value,
+            "vertical_size_policy": self._vertical_size_policy.value,
         }
 
     def restore_state(self, state: Dict[str, Any]) -> None:
@@ -431,17 +435,28 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         # 4. Rebuild Ports
         self.clear_ports()
         for p_data in state.get("inputs", []):
-            self.add_input(
+            port = self.add_input(
                 p_data["name"],
                 p_data.get("datatype", "flow"),
                 p_data.get("description", ""),
             )
+            if p_data.get("auto_disable", False):
+                port._auto_disable = True
+            if not p_data.get("visible", True):
+                port.setVisible(False)
+                if hasattr(port, '_label') and port._label:
+                    port._label.setVisible(False)
+
         for p_data in state.get("outputs", []):
-            self.add_output(
+            port = self.add_output(
                 p_data["name"],
                 p_data.get("datatype", "flow"),
                 p_data.get("description", ""),
             )
+            if not p_data.get("visible", True):
+                port.setVisible(False)
+                if hasattr(port, '_label') and port._label:
+                    port._label.setVisible(False)
 
         # 5. Node Visual State
         if "node_state" in state:
@@ -450,6 +465,13 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
             except (ValueError, TypeError):
                 log.error("Invalid node_state, defaulting to NORMAL")
                 self.set_state(NodeState.NORMAL)
+
+        # 5b. Vertical Size Policy
+        if "vertical_size_policy" in state:
+            try:
+                self._vertical_size_policy = VerticalSizePolicy(state["vertical_size_policy"])
+            except (ValueError, TypeError):
+                self._vertical_size_policy = VerticalSizePolicy.GROW_ONLY
 
         # 6. Minimized State
         if state.get("minimized", False):
@@ -641,43 +663,11 @@ class Node(NodeConfigMixin, NodePortsMixin, NodeGeometryMixin, QGraphicsObject):
         # 4. COMPUTING PULSE GLOW
         # ==================================================================
         if self._computing_pulse_phase > 0.001:
-            phase = self._computing_pulse_phase
-
-            pulse_base = QColor(self.header._bg_color)
-
-            pulse_glow_width_min = cfg['computing_glow_width_min']
-            pulse_glow_width_max = cfg['computing_glow_width_max']
-            pulse_opacity_min = cfg['computing_glow_opacity_min']
-            pulse_opacity_max = cfg['computing_glow_opacity_max']
-            pulse_layers = cfg['computing_glow_layers']
-            pulse_border_width = cfg['computing_border_width']
-            pulse_border_opacity = cfg['computing_border_opacity']
-
-            active_width = pulse_glow_width_min + phase * (pulse_glow_width_max - pulse_glow_width_min)
-            active_opacity = int(pulse_opacity_min + phase * (pulse_opacity_max - pulse_opacity_min))
-
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            for i in range(pulse_layers):
-                layer_progress = (pulse_layers - i) / pulse_layers
-                pen_width = active_width * layer_progress
-
-                layer_alpha = int(active_opacity * layer_progress)
-                pulse_base.setAlpha(max(0, min(255, layer_alpha)))
-
-                pen = QPen(pulse_base, pen_width)
-                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-                painter.setPen(pen)
-                painter.drawPath(self._cached_computing_glow_path)
-
-            border_alpha = int(pulse_border_opacity * (0.5 + 0.5 * phase))
-            pulse_base.setAlpha(max(0, min(255, border_alpha)))
-            pen = QPen(pulse_base, pulse_border_width)
-            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPath(self._cached_sel_path)
-
+            self._paint_pulse(
+                painter,
+                #self._cached_computing_glow_path,
+                self._cached_sel_path,
+            )
 
 # ==============================================================================
 # TEST / DEMO

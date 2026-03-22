@@ -19,7 +19,7 @@ from PySide6.QtGui import QPainter, QColor, QPainterPath, QFont, QBrush, QFontMe
 
 from weave.portregistry import PortRegistry
 from weave.stylemanager import StyleManager, StyleCategory
-from weave.node.node_subcomponents import highlight_colors
+from weave.node.node_enums import highlight_colors
 
 class NodePort(QGraphicsItem):
     """
@@ -511,12 +511,18 @@ class NodePort(QGraphicsItem):
         Returns a dictionary representing the configuration of this port.
         Used for cloning and serialization.
         """
-        return {
+        state = {
             "name": self.name,
             "datatype": self.datatype,
             "is_output": self.is_output,
             "description": self.port_description,
         }
+        # Only store non-default values to keep JSON compact.
+        if not self.isVisible():
+            state["visible"] = False
+        if self._auto_disable:
+            state["auto_disable"] = True
+        return state
 
     # ==========================================================================
     # RENDERING
