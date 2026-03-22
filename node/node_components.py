@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QGraphicsTextItem, QStyleOptionGraphicsItem, QGraphicsObject,
     QGraphicsSceneHoverEvent, QGraphicsSceneMouseEvent
 )
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, Property, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, Signal, Property, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QPainterPath, QFont, QTextCursor, QFontMetrics,
     QLinearGradient, QPainterPathStroker, QBrush
@@ -432,6 +432,117 @@ class NodeHeader(QGraphicsItem):
         # Note: MinimizeButton and StateSlider are QGraphicsObject children and paint themselves
 
 
+class NodeProxyWidget(QGraphicsProxyWidget):
+    """
+    Improved Proxy Widget that uses a polling heartbeat to ensure 
+    peripheral decorations (ports, handles) always restore their opacity.
+    """
+    _POLL_INTERVAL_MS: int = 50 
+
+    def __init__(self, parent: QGraphicsItem, node: 'Node') -> None:
+        super().__init__(parent)
+        self._node_ref = node
+        self._popup_child_ids: set[int] = set()
+        self._track_children: bool = False
+        
+        # Polling timer for robust cleanup
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(self._POLL_INTERVAL_MS)
+        self._poll_timer.timeout.connect(self._poll_popup_visibility)
+
+        # Deferred arming to ignore initial widget embedding
+        QTimer.singleShot(0, self._enable_tracking)
+
+    def _enable_tracking(self) -> None:
+        self._track_children = True
+
+    def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):
+        if self._track_children and change == QGraphicsItem.GraphicsItemChange.ItemChildAddedChange:
+            # The issue might be that 'value' can be None or not a valid proxy
+            if value is not None:
+                try:
+                    # Check for any widget-like child that could represent a popup
+                    # This covers both QGraphicsProxyWidget (for dropdowns) and 
+                    # potentially other Qt popup widgets
+                    self._popup_child_ids.add(id(value))
+                    self._set_peripheral_opacity(0.0)
+                    
+                    if not self._poll_timer.isActive():
+                        self._poll_timer.start()
+                except Exception:
+                    # If we can't track this child, just ignore it rather than crash
+                    pass
+
+        return super().itemChange(change, value)
+
+    def _poll_popup_visibility(self) -> None:
+        """
+        Actively checks if the tracked popups are still visible and in-scene.
+        """
+        try:
+            # Map current children by ID
+            current_children = {id(c): c for c in self.childItems()}
+        except RuntimeError:
+            # The Proxy itself might be in teardown
+            self._cleanup_popup_tracking()
+            return
+
+        still_active = set()
+        for cid in list(self._popup_child_ids):  # Make a copy to avoid modification during iteration
+            child = current_children.get(cid)
+            try:
+                # If child is gone, hidden, or removed from scene, it's no longer 'active'
+                if child and child.isVisible() and child.scene():
+                    still_active.add(cid)
+                elif child is None:
+                    # Child was deleted but still in our tracking set - remove it
+                    pass
+            except RuntimeError:
+                # C++ object deleted during poll check - remove from tracking
+                continue
+
+        self._popup_child_ids = still_active
+
+        # If no popups remain active, restore the node decorations
+        if not self._popup_child_ids:
+            self._cleanup_popup_tracking()
+
+    def _cleanup_popup_tracking(self) -> None:
+        self._poll_timer.stop()
+        self._popup_child_ids.clear()
+        self._set_peripheral_opacity(1.0)
+
+    def _set_peripheral_opacity(self, opacity: float) -> None:
+        node = self._node_ref
+        if node is None:
+            return
+
+        # 1. Ports and Labels (Standard + Summary)
+        all_ports = list(getattr(node, 'inputs', [])) + list(getattr(node, 'outputs', []))
+        for sp_attr in ['_summary_input', '_summary_output']:
+            sp = getattr(node, sp_attr, None)
+            if sp: all_ports.append(sp)
+
+        for port in all_ports:
+            try:
+                # Ensure the port has setOpacity method before calling it
+                if hasattr(port, 'setOpacity'):
+                    port.setOpacity(opacity)
+                    label = getattr(port, '_label', None)
+                    if label and hasattr(label, 'setOpacity'):
+                        label.setOpacity(opacity)
+            except RuntimeError:
+                continue
+
+        # 2. Resize Handle
+        handle = getattr(node, 'handle', None)
+        if handle and hasattr(handle, 'setOpacity'):
+            try:
+                handle.setOpacity(opacity)
+            except RuntimeError:
+                pass
+
+
 class NodeBody(QGraphicsItem):
     """
     Refactored body component with removed context menu handling.
@@ -466,7 +577,7 @@ class NodeBody(QGraphicsItem):
         self._input_area_rect = QRectF()
         self._output_area_rect = QRectF()
         
-        self._proxy = QGraphicsProxyWidget(self)
+        self._proxy = NodeProxyWidget(self, self._node)
         self._widget = QWidget()
         # The proxy root container must NOT have a stylesheet.
         # Stylesheets in Qt override QPalette for the widget and ALL
