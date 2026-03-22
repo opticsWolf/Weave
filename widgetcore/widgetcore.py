@@ -64,11 +64,29 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
     port_enabled_changed(str, bool)
         Emitted when a widget is enabled/disabled (auto-disable on
         connect/disconnect).
+    widget_registered(str)
+        Emitted after a new widget is registered via ``register_widget()``.
+        Dock panels listen to this to add mirrors for dynamically
+        created widgets.
+    widget_unregistered(str)
+        Emitted after a widget is removed via ``unregister_widget()``.
+        Dock panels listen to this to remove mirrors for dynamically
+        destroyed widgets.
+    widget_visibility_changed(str, bool)
+        Emitted when a registered widget is directly shown or hidden
+        (via ``setVisible()`` / ``show()`` / ``hide()``).  Only *direct*
+        calls trigger this — parent-propagated visibility changes
+        (e.g. node body collapsed) are intentionally ignored so the
+        dock panel stays fully visible regardless of the node's visual
+        state on the canvas.
     """
 
     value_changed = Signal(str)
     port_value_written = Signal(str)
     port_enabled_changed = Signal(str, bool)
+    widget_registered = Signal(str)
+    widget_unregistered = Signal(str)
+    widget_visibility_changed = Signal(str, bool)
 
     # ── Construction ─────────────────────────────────────────────────────
 
@@ -94,8 +112,6 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
 
         # WidgetCore itself is transparent — the QPainter-drawn node body
         # (including any state overlay) shows through from the scene canvas.
-        # autoFillBackground is explicitly kept False so Qt never paints a
-        # solid QPalette.Window fill over the scene rendering.
         self.setAutoFillBackground(False)
 
         # StyleManager subscription
@@ -227,8 +243,20 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         connect_change_signal(binding, _on_change)
         widget.installEventFilter(self)
 
+        # Notify listeners (dock panels) about the new widget.
+        self.widget_registered.emit(port_name)
+
     def unregister_widget(self, port_name: str) -> Optional[QWidget]:
-        """Remove a widget binding.  Returns the widget or None."""
+        """Remove a widget binding.  Returns the widget or ``None``.
+
+        The widget is disconnected from change-signal monitoring and
+        its event filter is removed.  The widget is **not** removed
+        from the layout — the caller is responsible for that (e.g.
+        ``form.removeRow(widget)``).
+
+        Emits ``widget_unregistered(port_name)`` so dock panels can
+        tear down the corresponding mirror widget.
+        """
         binding = self._bindings.pop(port_name, None)
         if binding is None:
             return None
@@ -240,6 +268,9 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
             binding.widget.removeEventFilter(self)
         except RuntimeError:
             pass
+
+        # Notify listeners (dock panels) so they remove the mirror.
+        self.widget_unregistered.emit(port_name)
 
         return binding.widget
 
@@ -483,14 +514,32 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
             self._flush_content_change()
 
     # ══════════════════════════════════════════════════════════════════════
-    # Event filter — delegates to ProxyMixin
+    # Event filter — delegates to ProxyMixin + visibility tracking
     # ══════════════════════════════════════════════════════════════════════
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         """Installed on every registered widget.
 
-        Delegates focus and undo handling to ``ProxyMixin._proxy_event_filter``.
+        Handles:
+        - Focus forwarding and undo interception (via ``ProxyMixin``).
+        - Visibility tracking: direct ``Show`` / ``Hide`` events on
+          registered widgets emit ``widget_visibility_changed`` so dock
+          panels can follow.  ``ShowToParent`` / ``HideToParent`` are
+          ignored — those fire when a *parent* changes visibility (e.g.
+          node body collapsed on canvas) and the dock panel should remain
+          visible in that case.
         """
+        et = event.type()
+
+        # ── Visibility tracking ──────────────────────────────────────
+        if et == QEvent.Type.Show or et == QEvent.Type.Hide:
+            port_name = self._widget_to_port.get(id(obj))
+            if port_name is not None:
+                self.widget_visibility_changed.emit(
+                    port_name, et == QEvent.Type.Show,
+                )
+
+        # ── Proxy focus + undo ───────────────────────────────────────
         return self._proxy_event_filter(obj, event)
 
     # ══════════════════════════════════════════════════════════════════════
