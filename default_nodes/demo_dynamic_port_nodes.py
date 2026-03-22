@@ -19,14 +19,19 @@ Provided nodes
     upstream trace is connected, ``compute()`` detects the source
     port's datatype, removes the old output, and creates a new one
     that matches.  When disconnected, the output reverts to generic.
-    Forwards the input value unchanged.
 
 ``MultiFloatOutputNode``
     A *Count* spinbox (with an auto-disable integer input port)
     controls how many float output ports exist.  Each output has a
-    matching ``QDoubleSpinBox`` in the node body.  Increasing the
-    count adds ports + widgets; decreasing removes them.  Uses
-    ``VerticalSizePolicy.FIT`` so the node visually shrinks when
+    matching ``QDoubleSpinBox`` in the node body **registered with
+    WidgetCore** so that dock panels mirror them automatically.
+
+    Increasing the count calls ``register_widget()`` for new spinboxes;
+    decreasing calls ``unregister_widget()`` which emits
+    ``widget_unregistered`` — dock panels hear this and remove the
+    mirror row incrementally.
+
+    Uses ``VerticalSizePolicy.FIT`` so the node visually shrinks when
     outputs are removed.
 
 Both nodes include extensive ``log.debug`` / ``print`` tracing so
@@ -49,7 +54,6 @@ from PySide6.QtWidgets import (
 from weave.basenode import ActiveNode
 from weave.noderegistry import register_node
 from weave.widgetcore import WidgetCore
-#from weave.node.node_geometry_mixin import VerticalSizePolicy
 
 from weave.logger import get_logger
 
@@ -98,9 +102,6 @@ class TypeAdapterNode(ActiveNode):
         "demo", "adapter", "type", "dynamic", "passthrough",
     ]
 
-    # FIT so the node resizes if we ever change the label height
-    #vertical_size_policy = VerticalSizePolicy.FIT
-
     def __init__(self, title: str = "Type Adapter", **kwargs: Any) -> None:
         super().__init__(title=title, **kwargs)
 
@@ -137,10 +138,7 @@ class TypeAdapterNode(ActiveNode):
     # ── Port type adaptation ──────────────────────────────────────────────
 
     def _detect_input_type(self) -> str:
-        """Read the datatype of the port connected to ``data_in``.
-
-        Returns ``"generic"`` if nothing is connected.
-        """
+        """Read the datatype of the port connected to ``data_in``."""
         in_port = self.find_port("data_in", is_output=False)
         if in_port is None:
             return "generic"
@@ -163,26 +161,18 @@ class TypeAdapterNode(ActiveNode):
         *new_type* — but only if the type actually changed.
         """
         if new_type == self._current_out_type:
-            _dbg(f"_adapt_output_type: type unchanged ('{new_type}'), skip")
             return
 
         old_type = self._current_out_type
         _dbg(f"_adapt_output_type: '{old_type}' → '{new_type}'")
 
-        # ── Remove old output ─────────────────────────────────────
-        _dbg(f"  removing output 'data_out' (type='{old_type}')")
-        removed = self.remove_port("data_out", is_output=True)
-        _dbg(f"  remove_port returned: {removed}")
-        _dbg(f"  outputs after remove: {[p.name for p in self.outputs]}")
+        # Remove old output
+        self.remove_port("data_out", is_output=True)
 
-        # ── Create new output ─────────────────────────────────────
-        _dbg(f"  adding output 'data_out' (type='{new_type}')")
+        # Create new output
         self.add_output("data_out", new_type)
         self._current_out_type = new_type
-        _dbg(f"  outputs after add: "
-             f"{[(p.name, p.datatype) for p in self.outputs]}")
 
-        # ── Update status label ───────────────────────────────────
         try:
             self._label_type.setText(new_type)
         except RuntimeError:
@@ -191,17 +181,10 @@ class TypeAdapterNode(ActiveNode):
     # ── Computation ───────────────────────────────────────────────────────
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Forward the input value and adapt the output type if needed."""
-        _dbg(f"TypeAdapterNode.compute: inputs={inputs}")
-
-        # Detect connected type and adapt output
         detected = self._detect_input_type()
         self._adapt_output_type(detected)
 
         value = inputs.get("data_in")
-        _dbg(f"  forwarding value: {type(value).__name__} "
-             f"→ data_out (type='{self._current_out_type}')")
-
         return {"data_out": value}
 
     # ── Serialisation ────────────────────────────────────────────────────
@@ -214,7 +197,6 @@ class TypeAdapterNode(ActiveNode):
         return state
 
     def restore_state(self, state: Dict[str, Any]) -> None:
-        _dbg("TypeAdapterNode.restore_state: start")
         super().restore_state(state)
 
         ta = state.get("type_adapter", {})
@@ -224,11 +206,6 @@ class TypeAdapterNode(ActiveNode):
             self._label_type.setText(self._current_out_type)
         except RuntimeError:
             pass
-
-        _dbg(f"TypeAdapterNode.restore_state: done, "
-             f"type='{self._current_out_type}', "
-             f"inputs={[p.name for p in self.inputs]}, "
-             f"outputs={[(p.name, p.datatype) for p in self.outputs]}")
 
     # ── Cleanup ──────────────────────────────────────────────────────────
 
@@ -248,16 +225,19 @@ class MultiFloatOutputNode(ActiveNode):
 
     A *Count* ``QSpinBox`` (range 1–16) controls how many outputs
     exist.  Each output ``float_0``, ``float_1``, … has a matching
-    ``QDoubleSpinBox`` in the node body.  An integer input port
-    ``count`` drives the spinbox value with ``_auto_disable``.
+    ``QDoubleSpinBox`` **registered with WidgetCore** via
+    ``register_widget()``.
 
-    Increasing the count adds new spinbox rows and output ports.
-    Decreasing removes the highest-index ones first (LIFO).
-    Widget rows are torn down before ports are batch-removed via
-    ``remove_ports()`` for a single geometry rebuild.
+    When the count increases, new spinboxes are registered —
+    ``WidgetCore`` emits ``widget_registered`` and any connected dock
+    panel adds a mirror row automatically.
 
-    Uses ``VerticalSizePolicy.FIT`` so the node shrinks when
-    outputs are removed.
+    When the count decreases, spinboxes are unregistered —
+    ``WidgetCore`` emits ``widget_unregistered`` and dock panels
+    remove the mirror row.  No full panel rebuild is needed.
+
+    An integer input port ``count`` drives the spinbox value with
+    ``_auto_disable``.
 
     Type: Active (propagates downstream on every change).
     """
@@ -275,8 +255,6 @@ class MultiFloatOutputNode(ActiveNode):
         "demo", "float", "multi", "dynamic", "generator",
     ]
 
-    #vertical_size_policy = VerticalSizePolicy.FIT
-
     # ── Construction ──────────────────────────────────────────────────────
 
     def __init__(
@@ -292,7 +270,6 @@ class MultiFloatOutputNode(ActiveNode):
         # ── Count input port (auto-disables the spinbox) ──────────
         self.add_input("count", "int")
         self.inputs[-1]._auto_disable = True
-        _dbg(f"  added input 'count', inputs={[p.name for p in self.inputs]}")
 
         # ── Widget layout ─────────────────────────────────────────
         form = QFormLayout()
@@ -301,7 +278,7 @@ class MultiFloatOutputNode(ActiveNode):
         self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
-        # Count spinbox
+        # Count spinbox — registered with WidgetCore for mirroring
         self._spin_count = QSpinBox()
         self._spin_count.setRange(1, self.MAX_OUTPUTS)
         self._spin_count.setValue(initial_count)
@@ -321,7 +298,6 @@ class MultiFloatOutputNode(ActiveNode):
         form.addRow(sep)
 
         # ── Dynamic state ─────────────────────────────────────────
-        self._float_widgets: Dict[int, QDoubleSpinBox] = {}
         self._current_count: int = 0
 
         # ── Finalise ──────────────────────────────────────────────
@@ -333,7 +309,8 @@ class MultiFloatOutputNode(ActiveNode):
         self._set_count(initial_count)
         self._spin_count.blockSignals(False)
 
-        # Wire count change
+        # Wire count change — the spinbox drives _set_count directly,
+        # and WidgetCore's value_changed handles upstream count changes.
         self._spin_count.valueChanged.connect(self._on_count_changed)
         self._widget_core.value_changed.connect(self._on_core_changed)
         self._widget_core.refresh_widget_palettes()
@@ -355,35 +332,17 @@ class MultiFloatOutputNode(ActiveNode):
                 self._add_float_output(i)
 
         elif new_count < old_count:
-            # ── 1. Tear down widget rows (highest first) ──────────
-            form: QFormLayout = self._widget_core.layout()
-            for i in range(old_count - 1, new_count - 1, -1):
-                spin = self._float_widgets.pop(i, None)
-                if spin is not None:
-                    _dbg(f"  removing widget row float_{i}")
-                    try:
-                        spin.valueChanged.disconnect(self._on_float_spin_changed)
-                    except RuntimeError:
-                        pass
-                    try:
-                        form.removeRow(spin)
-                    except Exception as exc:
-                        _dbg(f"  form.removeRow failed for float_{i}: {exc}")
-
-            # ── 2. Batch-remove ports ─────────────────────────────
-            port_names = [f"float_{i}" for i in range(new_count, old_count)]
-            _dbg(f"  batch removing ports: {port_names}")
-            removed = self.remove_ports(port_names, is_output=True)
-            _dbg(f"  remove_ports returned: {removed}")
+            self._remove_float_outputs(new_count, old_count)
 
         self._current_count = new_count
         _dbg(f"  _current_count={self._current_count}, "
              f"outputs={[p.name for p in self.outputs]}, "
-             f"widgets={list(self._float_widgets.keys())}")
+             f"wc_bindings={list(self._widget_core.bindings().keys())}")
 
     def _add_float_output(self, i: int) -> None:
         """Add a single float output port + spinbox row at index *i*."""
         form: QFormLayout = self._widget_core.layout()
+        port_name = f"float_{i}"
 
         spin = QDoubleSpinBox()
         spin.setRange(-1e9, 1e9)
@@ -392,14 +351,49 @@ class MultiFloatOutputNode(ActiveNode):
         spin.setMinimumWidth(100)
         form.addRow(f"Float {i}:", spin)
 
-        spin.valueChanged.connect(self._on_float_spin_changed)
-        self._float_widgets[i] = spin
+        # Register with WidgetCore — this:
+        #   1. Wires the spinbox's valueChanged → wc.value_changed
+        #   2. Emits widget_registered(port_name) so dock panels add a mirror
+        self._widget_core.register_widget(
+            port_name, spin,
+            role="output", datatype="float", default=self._DEFAULT_VALUE,
+            add_to_layout=False,  # already placed in the form above
+        )
 
-        port_name = f"float_{i}"
         self.add_output(port_name, "float")
 
         _dbg(f"  _add_float_output({i}): port='{port_name}', "
              f"outputs now={[p.name for p in self.outputs]}")
+
+    def _remove_float_outputs(self, from_idx: int, to_idx: int) -> None:
+        """Remove float outputs from *to_idx - 1* down to *from_idx* (LIFO).
+
+        For each output:
+        1. Unregister the widget from WidgetCore (emits ``widget_unregistered``
+           so dock panels remove the mirror row).
+        2. Remove the spinbox row from the node body's form layout.
+        3. Batch-remove the output ports.
+        """
+        form: QFormLayout = self._widget_core.layout()
+
+        for i in range(to_idx - 1, from_idx - 1, -1):
+            port_name = f"float_{i}"
+            _dbg(f"  removing widget + port '{port_name}'")
+
+            # Unregister from WidgetCore — disconnects signals, emits
+            # widget_unregistered so any connected panel drops the mirror.
+            spin = self._widget_core.unregister_widget(port_name)
+            if spin is not None:
+                try:
+                    form.removeRow(spin)
+                except Exception as exc:
+                    _dbg(f"  form.removeRow failed for {port_name}: {exc}")
+
+        # Batch-remove ports for a single geometry rebuild.
+        port_names = [f"float_{i}" for i in range(from_idx, to_idx)]
+        _dbg(f"  batch removing ports: {port_names}")
+        removed = self.remove_ports(port_names, is_output=True)
+        _dbg(f"  remove_ports returned: {removed}")
 
     # ── Slots ─────────────────────────────────────────────────────────────
 
@@ -417,7 +411,7 @@ class MultiFloatOutputNode(ActiveNode):
 
     @Slot(str)
     def _on_core_changed(self, port_name: str) -> None:
-        """Handle WidgetCore value changes (count spinbox via binding)."""
+        """Handle WidgetCore value changes."""
         _dbg(f"_on_core_changed: port_name='{port_name}'")
         try:
             if port_name == "count":
@@ -429,19 +423,11 @@ class MultiFloatOutputNode(ActiveNode):
         except Exception as exc:
             log.error(f"Exception in _on_core_changed: {exc}")
 
-    @Slot()
-    def _on_float_spin_changed(self) -> None:
-        """Propagate any float spinbox edit downstream."""
-        _dbg("_on_float_spin_changed: triggering recompute")
-        try:
-            self.on_ui_change()
-        except Exception as exc:
-            log.error(f"Exception in _on_float_spin_changed: {exc}")
-
     # ── Computation ───────────────────────────────────────────────────────
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Read each float spinbox and emit on the matching output port.
+        """Read each float spinbox via WidgetCore and emit on the matching
+        output port.
 
         The ``count`` input (if connected) drives the spinbox; by the
         time ``compute`` runs, ``_on_core_changed`` has already called
@@ -460,9 +446,12 @@ class MultiFloatOutputNode(ActiveNode):
 
         result: Dict[str, Any] = {}
         for i in range(self._current_count):
-            spin = self._float_widgets.get(i)
-            val = float(spin.value()) if spin is not None else float(self._DEFAULT_VALUE)
-            result[f"float_{i}"] = val
+            port_name = f"float_{i}"
+            # Read via WidgetCore — the single source of truth.
+            val = self._widget_core.get_port_value(port_name)
+            if val is None:
+                val = self._DEFAULT_VALUE
+            result[port_name] = float(val)
 
         _dbg(f"  result keys: {list(result.keys())}")
         return result
@@ -474,8 +463,8 @@ class MultiFloatOutputNode(ActiveNode):
         state["multi_float"] = {
             "count": self._current_count,
             "values": {
-                str(i): spin.value()
-                for i, spin in self._float_widgets.items()
+                str(i): self._widget_core.get_port_value(f"float_{i}")
+                for i in range(self._current_count)
             },
         }
         _dbg(f"get_state: count={self._current_count}, "
@@ -502,18 +491,16 @@ class MultiFloatOutputNode(ActiveNode):
                  f"{[p.name for p in float_ports]}")
             self.remove_ports(float_ports)
 
-        # Remove stale widget rows from __init__'s _set_count
+        # Remove stale widget bindings from __init__'s _set_count
         form: QFormLayout = self._widget_core.layout()
-        for spin in list(self._float_widgets.values()):
-            try:
-                spin.valueChanged.disconnect(self._on_float_spin_changed)
-            except RuntimeError:
-                pass
-            try:
-                form.removeRow(spin)
-            except Exception:
-                pass
-        self._float_widgets.clear()
+        for i in range(self._current_count):
+            port_name = f"float_{i}"
+            spin = self._widget_core.unregister_widget(port_name)
+            if spin is not None:
+                try:
+                    form.removeRow(spin)
+                except Exception:
+                    pass
         self._current_count = 0
 
         # ── Rebuild from scratch ──────────────────────────────────
@@ -523,13 +510,11 @@ class MultiFloatOutputNode(ActiveNode):
 
         self._set_count(count)
 
-        # Restore individual float values
+        # Restore individual float values via WidgetCore
         for i_str, val in mf.get("values", {}).items():
-            spin = self._float_widgets.get(int(i_str))
-            if spin is not None:
-                spin.blockSignals(True)
-                spin.setValue(float(val))
-                spin.blockSignals(False)
+            port_name = f"float_{int(i_str)}"
+            if self._widget_core.has_binding(port_name):
+                self._widget_core.set_port_value(port_name, float(val))
 
         self._widget_core.refresh_widget_palettes()
 
@@ -541,13 +526,6 @@ class MultiFloatOutputNode(ActiveNode):
 
     def cleanup(self) -> None:
         _dbg("MultiFloatOutputNode.cleanup")
-        for spin in list(self._float_widgets.values()):
-            try:
-                spin.valueChanged.disconnect(self._on_float_spin_changed)
-            except RuntimeError:
-                pass
-        self._float_widgets.clear()
-
         try:
             self._spin_count.valueChanged.disconnect(self._on_count_changed)
         except RuntimeError:
@@ -555,4 +533,3 @@ class MultiFloatOutputNode(ActiveNode):
 
         self._widget_core.cleanup()
         super().cleanup()
-        

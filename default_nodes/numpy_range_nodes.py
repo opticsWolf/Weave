@@ -369,8 +369,13 @@ class NumpyRange1DNode(ThreadedNode):
             log.error(f"Exception in NumpyRange1DNode._on_mode_changed: {exc}")
 
     @Slot(str)
-    def _on_core_changed(self, _port_name: str) -> None:
+    def _on_core_changed(self, port_name: str) -> None:
         try:
+            # When mode changes via the panel mirror, set_port_value
+            # blocks the combo's own signals so currentIndexChanged
+            # (→ _on_mode_changed) never fires.  Catch that case here.
+            if port_name == "mode":
+                self._sync_mode_visibility()
             self.on_ui_change()
         except Exception as exc:
             log.error(f"Exception in NumpyRange1DNode._on_core_changed: {exc}")
@@ -696,8 +701,13 @@ class NumpyRange2DNode(ThreadedNode):
             log.error(f"Exception in NumpyRange2DNode._on_mode_changed: {exc}")
 
     @Slot(str)
-    def _on_core_changed(self, _port_name: str) -> None:
+    def _on_core_changed(self, port_name: str) -> None:
         try:
+            # When mode changes via the panel mirror, set_port_value
+            # blocks the combo's own signals so currentIndexChanged
+            # (→ _on_mode_changed) never fires.  Catch that case here.
+            if port_name == "mode":
+                self._sync_mode_visibility()
             self.on_ui_change()
         except Exception as exc:
             log.error(f"Exception in NumpyRange2DNode._on_core_changed: {exc}")
