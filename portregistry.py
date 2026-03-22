@@ -506,6 +506,8 @@ def setup_default_ports():
         # Reverse casts into NdArray
         _cast[(41, 80)] = lambda x: np.array(x)    # List  -> NdArray
         _cast[(42, 80)] = lambda x: np.array(x)    # Tuple -> NdArray
+        _cast[(11, 80)] = lambda x: np.array(x)    # Float -> NdArray
+        _cast[(12, 80)] = lambda x: np.array(x)    # Int -> NdArray
     except ImportError:
         pass
 

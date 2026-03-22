@@ -112,7 +112,7 @@ from PySide6.QtCore import (
 )
 
 from weave.basenode import BaseControlNode, NodeDataFlow, CacheEntry
-from weave.node.node_subcomponents import NodeState
+from weave.node.node_enums import NodeState
 
 from weave.logger import get_logger
 log = get_logger("ThreadedNode")
@@ -181,12 +181,13 @@ class WorkerSignals(QObject):
     Signal bridge for :class:`ComputeWorker`.
 
     Signals:
-        finished(dict)   — compute results dict
+        finished(object) — raw compute() return value (dict *or* scalar);
+                           _on_worker_finished calls _normalize_results()
         error(str)       — formatted error message
         progress(int)    — optional 0-100 progress
         cancelled()      — worker exited due to cancellation
     """
-    finished  = Signal(dict)
+    finished  = Signal(object)   # object, not dict — scalar returns are valid
     error     = Signal(str)
     progress  = Signal(int)
     cancelled = Signal()
@@ -240,7 +241,11 @@ class ComputeWorker(QRunnable):
             if self._cancel_token.is_cancelled():
                 self.signals.cancelled.emit()
             else:
-                self.signals.finished.emit(results if isinstance(results, dict) else {})
+                # Emit the raw return value.  WorkerSignals.finished is
+                # Signal(object) so scalars are carried through intact.
+                # _on_worker_finished calls _normalize_results(), which
+                # maps scalars to single-output nodes — no data is lost.
+                self.signals.finished.emit(results)
 
         except Exception as exc:
             if self._cancel_token.is_cancelled():
@@ -357,10 +362,13 @@ class ThreadedNode(BaseControlNode):
             def snapshot_widget_inputs(self):
                 return {"_blur_radius": self.spin.value()}
         """
-        # Default: delegate to get_widget_state if available
-        if hasattr(self, "get_widget_state"):
+        # Default: read all values from the WidgetCore registry.
+        # This is the sole serialisation path — get_widget_state() was
+        # removed when WeaveWidgetCore replaced the legacy widget API.
+        wc = getattr(self, '_widget_core', None)
+        if wc is not None:
             try:
-                return self.get_widget_state()
+                return wc.get_all_values()
             except Exception:
                 pass
         return {}
@@ -423,6 +431,10 @@ class ThreadedNode(BaseControlNode):
                 # Direct attribute set to avoid triggering full state
                 # transition logic (COMPUTING is transient, not user-set)
                 super(BaseControlNode, self).set_state(NodeState.COMPUTING)
+                # Pulse animation bypassed the normal set_state path —
+                # start it explicitly.
+                if hasattr(self, '_start_computing_pulse'):
+                    self._start_computing_pulse()
             except Exception:
                 pass
 
@@ -451,8 +463,8 @@ class ThreadedNode(BaseControlNode):
     # WORKER CALLBACKS  (main thread, via queued connection)
     # ──────────────────────────────────────────────────────────────
 
-    @Slot(dict)
-    def _on_worker_finished(self, results: Dict[str, Any]) -> None:
+    @Slot(object)
+    def _on_worker_finished(self, results) -> None:
         """Phase 3: apply results on the main thread."""
         # Guard: node may have been deleted while worker was running
         if not self._is_scene_valid():
@@ -479,6 +491,16 @@ class ThreadedNode(BaseControlNode):
             # Preserve last valid values
             for port_name, entry in new_cache.items():
                 self._last_valid_values[port_name] = entry.value
+
+            # Re-notify downstream now that fresh results are in the cache.
+            # Downstream nodes may have already evaluated with a stale cached
+            # value while this worker was running (their _safe_evaluate timer
+            # fires before ours because _mark_downstream_dirty is called inside
+            # NodeDataFlow.set_dirty, which runs before QTimer.singleShot in
+            # ThreadedNode.set_dirty).  Re-dirtying them here is a no-op for
+            # nodes that are still dirty; for nodes that already evaluated
+            # incorrectly (_is_dirty=False) it schedules a clean re-evaluation.
+            self._mark_downstream_dirty("upstream_threaded_result")
 
             # Restore pre-compute state
             self._restore_pre_compute_state()
@@ -532,6 +554,10 @@ class ThreadedNode(BaseControlNode):
         self._pre_compute_state = None
         if _HAS_COMPUTING_STATE and self._state == NodeState.COMPUTING:
             try:
+                # Stop the pulse before leaving COMPUTING — bypassed the
+                # normal set_state path so must be called explicitly here.
+                if hasattr(self, '_stop_computing_pulse'):
+                    self._stop_computing_pulse()
                 super(BaseControlNode, self).set_state(target)
             except Exception:
                 pass
@@ -659,11 +685,12 @@ class ThreadedManualNode(BaseControlNode):
     def snapshot_widget_inputs(self) -> Dict[str, Any]:
         """
         Override to capture widget values before dispatch.
-        Default delegates to get_widget_state().
+        Default reads all values from the WidgetCore registry.
         """
-        if hasattr(self, "get_widget_state"):
+        wc = getattr(self, '_widget_core', None)
+        if wc is not None:
             try:
-                return self.get_widget_state()
+                return wc.get_all_values()
             except Exception:
                 pass
         return {}
@@ -705,6 +732,10 @@ class ThreadedManualNode(BaseControlNode):
         if _HAS_COMPUTING_STATE:
             try:
                 super(BaseControlNode, self).set_state(NodeState.COMPUTING)
+                # Pulse animation bypassed the normal set_state path —
+                # start it explicitly.
+                if hasattr(self, '_start_computing_pulse'):
+                    self._start_computing_pulse()
             except Exception:
                 pass
 
@@ -732,8 +763,8 @@ class ThreadedManualNode(BaseControlNode):
     # WORKER CALLBACKS  (main thread)
     # ──────────────────────────────────────────────────────────────
 
-    @Slot(dict)
-    def _on_worker_finished(self, results: Dict[str, Any]) -> None:
+    @Slot(object)
+    def _on_worker_finished(self, results) -> None:
         """Apply results on the main thread."""
         if not self._is_scene_valid():
             self._is_computing = False
@@ -757,6 +788,9 @@ class ThreadedManualNode(BaseControlNode):
 
             for port_name, entry in new_cache.items():
                 self._last_valid_values[port_name] = entry.value
+
+            # Re-notify downstream — same race-condition fix as ThreadedNode.
+            self._mark_downstream_dirty("upstream_threaded_result")
 
             self._restore_pre_compute_state()
 
@@ -804,6 +838,10 @@ class ThreadedManualNode(BaseControlNode):
         self._pre_compute_state = None
         if _HAS_COMPUTING_STATE and self._state == NodeState.COMPUTING:
             try:
+                # Stop the pulse before leaving COMPUTING — bypassed the
+                # normal set_state path so must be called explicitly here.
+                if hasattr(self, '_stop_computing_pulse'):
+                    self._stop_computing_pulse()
                 super(BaseControlNode, self).set_state(target)
             except Exception:
                 pass

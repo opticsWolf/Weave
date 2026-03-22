@@ -19,7 +19,7 @@ Key improvements:
 
 import sys
 import uuid
-from enum import Enum, auto
+from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Final, ClassVar, Callable
 from dataclasses import dataclass, field
 
@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QPainter
 
 # Assuming these exist in your project structure
 from weave.node.node_core import Node
-from weave.node.node_subcomponents import NodeState
+from weave.node.node_enums import NodeState, VerticalSizePolicy, DisabledBehavior
 from weave.panel.dock_properties import DockProperties
 
 from weave.logger import get_logger
@@ -37,13 +37,6 @@ log = get_logger("NodeDataFlow")
 
 #mouse jump diagnostics:
 #from weave.node_drag_diagnostic import NodeDragDiagnostic
-
-class DisabledBehavior(Enum):
-    """Defines what downstream nodes receive when this node is disabled."""
-    USE_LAST_VALID = auto()  # Return the last successfully computed value
-    USE_NONE = auto()        # Return None for all outputs
-    USE_DEFAULT = auto()     # Return port-specific default values
-    PROPAGATE_DISABLED = auto()  # Signal downstream that data is unavailable
 
 
 @dataclass
@@ -272,31 +265,52 @@ class NodeDataFlow:
 
     def _gather_inputs(self, visited: Optional[Set[int]] = None) -> Dict[str, Any]:
         """Gather input values from connected upstream nodes.
-        
-        IMPROVED: Handles upstream DISABLED nodes gracefully.
+
+        For each input port:
+        1. If connected, pull the upstream value via ``request_data()``.
+        2. If unconnected **and** a matching WidgetCore bidirectional
+           binding exists, fall back to the widget's current value so
+           node ``compute()`` methods don't need manual fallback logic.
+        3. Otherwise the value is ``None``.
+
+        This means a bidirectional port always provides a value to
+        ``compute()`` — either from upstream or from the local widget.
         """
         input_params: Dict[str, Any] = {}
         inputs = getattr(self, 'inputs', [])
-        
+
+        # Resolve WidgetCore once for the fallback path
+        wc = getattr(self, '_widget_core', None) or getattr(self, '_weave_core', None)
+
         for port in inputs:
             val = None
             traces = getattr(port, 'connected_traces', [])
-            
+
             if traces:
                 trace = traces[0]  # Single-source assumption
                 src_port = trace.source
-                
+
                 if src_port and src_port.node:
                     # Request data - upstream will handle its own state
                     val = src_port.node.request_data(src_port.name, visited)
-                    
+
                     # Handle DisabledMarker if upstream is propagating disabled state
                     if isinstance(val, DisabledMarker):
-                        # Option: Convert to None, or handle specially
                         val = None
-            
+
+            # Fall back to WidgetCore for unconnected bidirectional ports
+            if val is None and wc is not None and hasattr(wc, 'get_binding'):
+                binding = wc.get_binding(port.name)
+                if binding is not None:
+                    role_name = getattr(binding.role, 'name', '')
+                    if role_name in ('BIDIRECTIONAL', 'INPUT'):
+                        try:
+                            val = wc.get_port_value(port.name)
+                        except Exception:
+                            pass
+
             input_params[port.name] = val
-            
+
         return input_params
 
     def _normalize_results(self, results: Any) -> Dict[str, Any]:
@@ -425,6 +439,15 @@ class BaseControlNode(Node, NodeDataFlow):
                            allowed dock areas, size constraints, and dock
                            feature flags for static dock panels created
                            from this node.  ``None`` means all defaults.
+        vertical_size_policy:
+                           Controls whether the node shrinks vertically
+                           when content is removed.
+                           ``VerticalSizePolicy.GROW_ONLY`` (default) —
+                           height only increases, user-set height is
+                           preserved.
+                           ``VerticalSizePolicy.FIT`` — height always
+                           matches the minimum required, so removing
+                           a port or hiding a widget shrinks the node.
     
     Example::
     
@@ -442,6 +465,8 @@ class BaseControlNode(Node, NodeDataFlow):
                 min_width=250,
                 preferred_area=Qt.DockWidgetArea.RightDockWidgetArea,
             )
+            # Node shrinks when ports are removed or hidden
+            vertical_size_policy = VerticalSizePolicy.FIT
     """
     node_class:       ClassVar[str]            = "Basic"
     node_subclass:    ClassVar[str]            = "Basic"
@@ -450,6 +475,11 @@ class BaseControlNode(Node, NodeDataFlow):
     node_tags:        ClassVar[Optional[List[str]]] = None
     node_icon:        ClassVar[Optional[str]]  = None
     dock_properties:  ClassVar[Optional[DockProperties]] = None
+
+    #: Vertical resize behaviour.  Override in subclasses to change the
+    #: default.  Can also be changed at runtime via
+    #: ``node.set_vertical_size_policy(VerticalSizePolicy.FIT)``.
+    vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.GROW_ONLY
     
     data_updated = Signal()
     # NOTE: Do NOT redefine state_changed here - parent Node already defines it
@@ -462,7 +492,15 @@ class BaseControlNode(Node, NodeDataFlow):
         
         # Removed: self.unique_id: str = str(_uuid.uuid4())  # REMOVED
         # UUID is now handled at the Node level in node_core.py
+
+        # Apply the class-level vertical size policy to the instance.
+        # Node.__init__ sets GROW_ONLY as default; the subclass ClassVar
+        # overrides it here so each node type can declare its preference.
+        self._vertical_size_policy = type(self).vertical_size_policy
         
+        # Wire port lifecycle signals to dataflow/widget cleanup.
+        self.port_removed.connect(self._on_port_removed)
+
         # Deferred initial evaluation
         QTimer.singleShot(0, self._post_init_eval)
 
@@ -538,29 +576,55 @@ class BaseControlNode(Node, NodeDataFlow):
 
     def set_state(self, state: NodeState) -> None:
         """Override to integrate state changes with dataflow logic.
-        
-        IMPROVED: Comprehensive handling of all state transitions.
+
+        IMPORTANT: Do NOT set self._state here before calling super().
+        NodePortsMixin.set_state() owns the self._state assignment and uses
+        the current (old) value to detect whether a real transition is
+        occurring.  If we stomp self._state first, its guard:
+
+            if old_state == state: return
+
+        evaluates True immediately and the entire visual pipeline is skipped:
+        _apply_state_visuals(), sync_state_slider() (animation + color), and
+        all update() calls are never reached.
+
+        Execution order:
+        1. Guard + capture old_state (we read self._state while it is still OLD).
+        2. Pre-transition dataflow work that must happen BEFORE the visual update.
+        3. super().set_state(state) — sets self._state, applies visuals, animates
+           the slider, emits state_changed.
+        4. Post-transition dataflow logic that needs the new self._state in place.
+        5. Notify downstream nodes.
         """
+        if self._state == state:
+            return
+
         old_state = self._state
-        
-        if old_state == state:
-            return  # No change
-        
-        # --- PRE-TRANSITION ACTIONS ---
+        # NOTE: Do NOT write self._state here.  super().set_state() owns that
+        # assignment (NodePortsMixin line: self._state = state).
+
+        # --- STEP 2: Pre-transition work ---
+
+        # Computing pulse: managed here because NodePortsMixin doesn't know
+        # about start_computing_pulse / stop_computing_pulse.
+        if state == NodeState.COMPUTING:
+            self.start_computing_pulse()  # From NodeGeometryMixin
+        elif old_state == NodeState.COMPUTING:
+            self.stop_computing_pulse()   # From NodeGeometryMixin
+
+        # Preserve cache snapshot before entering DISABLED so that
+        # USE_LAST_VALID can serve the final good values downstream.
         if state == NodeState.DISABLED:
-            # Preserve current cache before disabling
-            self._preserve_valid_values()
-        
-        # Call parent for UI updates
+            self._preserve_valid_values()  # From NodeDataFlow
+
+        # --- STEP 3: Visual update (sets self._state, animates slider, repaints) ---
         super().set_state(state)
-        
-        # --- POST-TRANSITION ACTIONS ---
+
+        # --- STEP 4: Post-transition dataflow logic ---
         self._handle_state_transition(old_state, state)
-        
-        # Notify downstream about state change
+
+        # --- STEP 5: Notify downstream nodes ---
         self._notify_downstream_state_change(state)
-        
-        # NOTE: Parent Node.set_state() already emits state_changed signal
 
     def _handle_state_transition(self, old_state: NodeState, new_state: NodeState) -> None:
         """Handle specific state transition logic.
@@ -635,6 +699,48 @@ class BaseControlNode(Node, NodeDataFlow):
     def on_ui_change(self) -> None:
         """Hook for internal widgets to request updates."""
         self.set_dirty("ui_change")
+
+    # ------------------------------------------------------------------
+    # Port lifecycle — dataflow + widget cleanup
+    # ------------------------------------------------------------------
+
+    def _on_port_removed(self, port) -> None:
+        """Slot connected to ``port_removed``.
+
+        Cleans up dataflow artefacts that reference the removed port.
+
+        This runs *after* the visual teardown in ``NodePortsMixin.remove_port``
+        has already disconnected traces, unregistered the port from
+        StyleManager, and removed it from the scene.
+
+        Cleanup performed:
+            1. Purge the port's name from ``_cached_values`` so stale data
+               is never returned by ``request_data()`` / ``get_output_value()``.
+            2. Purge from ``_last_valid_values`` (pre-disable snapshot).
+            3. Purge from ``_port_defaults``.
+            4. Mark the node dirty so the next evaluation rebuilds its cache
+               without the removed port.
+
+        WidgetCore bindings are intentionally NOT touched here.  A
+        WidgetCore binding represents a static widget↔port-name mapping
+        declared in ``__init__`` — the widget itself outlives port
+        destruction (e.g. during ``restore_state → clear_ports``).
+        Nodes that dynamically create ports AND register them with
+        WidgetCore should call ``wc.unregister_widget()`` explicitly
+        before or after ``remove_port()``.
+        """
+        name = getattr(port, 'name', None)
+        if name is None:
+            return
+
+        # 1–3. Purge dataflow caches
+        self._cached_values.pop(name, None)
+        self._last_valid_values.pop(name, None)
+        self._port_defaults.pop(name, None)
+
+        # 4. Mark dirty (skip if already computing to avoid re-entrancy)
+        if not self._is_computing:
+            self._is_dirty = True
 
     def get_output_value(self, port_name: str) -> Any:
         """Public API to get current output value (for UI display, etc.)."""
@@ -712,7 +818,11 @@ class BaseControlNode(Node, NodeDataFlow):
 # ------------------------------------------------------------------------------
 
 class ActiveNode(BaseControlNode):
-    """Automatically updates and propagates changes immediately."""
+    """Automatically updates and propagates changes immediately.
+
+    Uses ``FIT`` policy so the node shrinks when ports are removed.
+    """
+    vertical_size_policy = VerticalSizePolicy.FIT
     
     def __init__(self, title: str = "Active Node", **kwargs):
         super().__init__(title, **kwargs)

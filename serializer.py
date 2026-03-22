@@ -424,8 +424,10 @@ class GraphSerializer:
                 connections.append({
                     "source_id": node_id_map[src_node],
                     "source_port": src_idx,
+                    "source_port_name": getattr(src, 'name', None),
                     "target_id": node_id_map[dst_node],
                     "target_port": dst_idx,
+                    "target_port_name": getattr(dst, 'name', None),
                 })
             except (ValueError, AttributeError) as e:
                 log.debug(f"Skipping connection on non-indexed port: {e}")
@@ -735,6 +737,28 @@ class GraphSerializer:
             _debug_print(f"    Adding to canvas at ({pos[0]:.0f}, {pos[1]:.0f})")
             canvas.add_node(node, (pos[0], pos[1]))
 
+            # FIX: Force a synchronous geometry refresh now that the node
+            # is in the scene.  restore_state() runs BEFORE add_node(), so
+            # the node has no scene at that point and its
+            # prepareGeometryChange() calls are no-ops.  Qt's internal
+            # geometry tracking therefore still reflects the constructor's
+            # default layout, not the restored one.  On the very first
+            # paint after addItem(), Qt uses this stale data — causing
+            # port labels from the pre-restore layout to flash briefly at
+            # the wrong position until the deferred _sync_to_widget_size
+            # timer (QTimer.singleShot 25 ms) corrects them.
+            #
+            # By calling prepareGeometryChange → _recalculate_paths →
+            # update_geometry → update synchronously here, we ensure Qt
+            # sees the correct bounds from the first frame.
+            if hasattr(node, 'prepareGeometryChange'):
+                node.prepareGeometryChange()
+            if hasattr(node, '_recalculate_paths'):
+                node._recalculate_paths()
+            if hasattr(node, 'update_geometry'):
+                node.update_geometry()
+            node.update()
+
             # Check ports again after add_node (some nodes create ports here)
             inputs_final = getattr(node, "inputs", [])
             outputs_final = getattr(node, "outputs", [])
@@ -827,6 +851,24 @@ class GraphSerializer:
                     f"    dst_port index lookup failed: idx={dst_idx}, "
                     f"list_len={len(dst_inputs_list)}"
                 )
+
+            # --- Name-based fallback (handles dynamic port shifts) ---
+            src_name = c_data.get("source_port_name")
+            dst_name = c_data.get("target_port_name")
+
+            if src_port is None and src_name:
+                for p in src_outputs_list:
+                    if getattr(p, 'name', None) == src_name:
+                        src_port = p
+                        _debug_print(f"    src_port by name '{src_name}': found")
+                        break
+
+            if dst_port is None and dst_name:
+                for p in dst_inputs_list:
+                    if getattr(p, 'name', None) == dst_name:
+                        dst_port = p
+                        _debug_print(f"    dst_port by name '{dst_name}': found")
+                        break
 
             # --- Create connection ---
             if src_port and dst_port:
