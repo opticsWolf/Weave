@@ -357,7 +357,10 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         Unlike ``set_port_value`` (which blocks the widget's own signals),
         this lets the native signal propagate so node-internal handlers
         execute their side-effects.  WidgetCore's ``value_changed`` is
-        still suppressed.
+        still suppressed (preventing re-recording by the undo manager).
+
+        ``port_value_written`` is emitted after the write so that dock
+        panels update their mirrors to reflect the new value.
 
         Use from undo/redo command paths.
         """
@@ -379,6 +382,12 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         proxy = self._find_proxy()
         if proxy is not None:
             proxy.update()
+
+        # Notify panels so mirror widgets update.  value_changed is
+        # suppressed (correctly — the undo manager must not re-record),
+        # but port_value_written is the channel panels listen to for
+        # programmatic writes.
+        self.port_value_written.emit(port_name)
 
     # ══════════════════════════════════════════════════════════════════════
     # Auto-disable (when an input port gets connected)
