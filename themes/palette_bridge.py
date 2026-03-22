@@ -76,7 +76,9 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTabWidget,
     QStackedWidget,
-    QAbstractScrollArea,
+    QAbstractItemView,
+    QTextEdit,
+    QPlainTextEdit,
 )
 
 from weave.stylemanager import StyleManager, StyleCategory
@@ -90,10 +92,11 @@ from weave.stylemanager import StyleManager, StyleCategory
 # These have no meaningful visual content of their own and should let the
 # QPainter-drawn node body (including state overlays) show through.
 #
-# NOT included (intentionally opaque interactive / display widgets):
-#   QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox,
-#   QDoubleSpinBox, QSlider, QProgressBar, QCheckBox, QRadioButton,
-#   QLabel, QPushButton, QToolButton, QListView, QTreeView, QTableView.
+# ``QAbstractScrollArea`` is intentionally NOT listed here — it is too broad.
+# ``QTextEdit``, ``QPlainTextEdit``, ``QListView``, ``QTreeView``,
+# ``QTableView`` all inherit from it and would lose their backgrounds.
+# ``QScrollArea`` (the specific non-interactive viewport wrapper) is listed
+# explicitly instead.
 _TRANSPARENT_CONTAINER_TYPES: tuple[type, ...] = (
     QFrame,              # generic divider / panel
     QGroupBox,           # labelled container
@@ -101,7 +104,16 @@ _TRANSPARENT_CONTAINER_TYPES: tuple[type, ...] = (
     QSplitter,           # resizable splitter handle container
     QTabWidget,          # tab bar + stacked pages
     QStackedWidget,      # page-switcher (no chrome of its own)
-    QAbstractScrollArea, # base of QScrollArea / QTextEdit viewport
+)
+
+# Interactive widget types that happen to inherit from a container base class
+# (typically QFrame) but must NEVER be made transparent because they paint
+# their own meaningful background.  Also covers QComboBox popup internals:
+# the dropdown list is a QListView → QAbstractItemView → QFrame.
+_OPAQUE_INTERACTIVE_TYPES: tuple[type, ...] = (
+    QTextEdit,           # QAbstractScrollArea → QFrame
+    QPlainTextEdit,      # QAbstractScrollArea → QFrame
+    QAbstractItemView,   # QListView, QTreeView, QTableView, QHeaderView, …
 )
 
 # Stylesheet applied to every matched container.
@@ -109,6 +121,29 @@ _CONTAINER_STYLESHEET: str = "background: transparent; border: none;"
 
 # Property key used to flag widgets already managed by the filter.
 _MANAGED_PROP: str = "_tw_transparency_managed"
+
+
+def _should_make_transparent(widget: QWidget) -> bool:
+    """Decide whether *widget* should be forced transparent.
+
+    Returns True only when the widget:
+    - matches a known container type,
+    - is NOT an interactive widget that inherits from a container base
+      (e.g. QTextEdit → QFrame, QListView → QFrame),
+    - is NOT a top-level / popup window (e.g. QComboBox dropdown), and
+    - has not opted out via the ``opaque_bg`` dynamic property.
+    """
+    if widget.property("opaque_bg"):
+        return False
+    if not isinstance(widget, _TRANSPARENT_CONTAINER_TYPES):
+        return False
+    if isinstance(widget, _OPAQUE_INTERACTIVE_TYPES):
+        return False
+    # Top-level windows (popups, tooltips, dialogs) must keep their
+    # background — they are not part of the node body compositing.
+    if widget.isWindow():
+        return False
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -173,9 +208,8 @@ class ContainerTransparencyFilter(QObject):
 
         elif etype == QEvent.Type.PaletteChange:
             # Re-assert autoFillBackground ONLY — no setStyleSheet here.
-            if isinstance(obj, _TRANSPARENT_CONTAINER_TYPES):
-                if not obj.property("opaque_bg"):
-                    obj.setAutoFillBackground(False)
+            if _should_make_transparent(obj):
+                obj.setAutoFillBackground(False)
 
         return False  # never consume events
 
@@ -190,9 +224,8 @@ class ContainerTransparencyFilter(QObject):
         widget.setProperty(_MANAGED_PROP, True)
         widget.installEventFilter(self)
 
-        if isinstance(widget, _TRANSPARENT_CONTAINER_TYPES):
-            if not widget.property("opaque_bg"):
-                _force_transparent(widget)
+        if _should_make_transparent(widget):
+            _force_transparent(widget)
 
         for child in widget.children():
             if isinstance(child, QWidget):
@@ -241,12 +274,46 @@ def make_containers_transparent(root: QWidget) -> None:
 
 def _walk_and_make_transparent(widget: QWidget, is_root: bool = False) -> None:
     """Recursive implementation for ``make_containers_transparent``."""
-    if not is_root and isinstance(widget, _TRANSPARENT_CONTAINER_TYPES):
-        if not widget.property("opaque_bg"):
-            _force_transparent(widget)
+    if not is_root and _should_make_transparent(widget):
+        _force_transparent(widget)
     for child in widget.children():
         if isinstance(child, QWidget):
             _walk_and_make_transparent(child, is_root=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Overlay blending
+# ══════════════════════════════════════════════════════════════════════════════
+
+def alpha_blend(base: QColor, overlay: QColor) -> QColor:
+    """Alpha-composite *overlay* over *base*, returning an opaque QColor.
+
+    Standard Porter-Duff "source over".  The result always has alpha 255
+    so it can be used directly as a ``QPalette`` role colour.
+    """
+    oa = overlay.alphaF()
+    if oa < 0.001:
+        return QColor(base)
+    if oa > 0.999:
+        return QColor(overlay)
+
+    ba = base.alphaF()
+    inv_oa = 1.0 - oa
+
+    r = overlay.redF()   * oa + base.redF()   * ba * inv_oa
+    g = overlay.greenF() * oa + base.greenF() * ba * inv_oa
+    b = overlay.blueF()  * oa + base.blueF()  * ba * inv_oa
+    a = oa + ba * inv_oa
+
+    if a < 0.001:
+        return QColor(0, 0, 0, 255)
+
+    return QColor.fromRgbF(
+        min(1.0, r / a),
+        min(1.0, g / a),
+        min(1.0, b / a),
+        1.0,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -343,6 +410,7 @@ def build_theme_palette(
     window_color: QColor,
     base_palette: Optional[QPalette] = None,
     colors: Optional[ThemeColors] = None,
+    overlay: Optional[QColor] = None,
 ) -> QPalette:
     """
     Construct a ``QPalette`` for Fusion-styled Weave widgets.
@@ -356,21 +424,41 @@ def build_theme_palette(
         Starting palette.  ``None`` creates a fresh default ``QPalette``.
     colors : ThemeColors, optional
         Pre-resolved colours.  ``None`` calls ``resolve_theme_colors()``.
+    overlay : QColor, optional
+        State overlay colour (from ``_apply_state_visuals``).  When its
+        alpha is > 0, the interactive-widget palette roles (``Base``,
+        ``AlternateBase``, ``Button``) are alpha-blended so leaf widgets
+        (spinboxes, combos, line-edits) visually reflect the node state.
+
+        The ``Window`` role is intentionally **not** blended: WidgetCore
+        and its containers are transparent (``autoFillBackground=False``)
+        so the QPainter-drawn node body — including the state overlay —
+        shows through directly.  Blending ``Window`` would cause the
+        proxy root widget to paint a second, redundant tinted fill.
     """
     if colors is None:
         colors = resolve_theme_colors()
 
     c = colors
+
+    def _blend(color: QColor) -> QColor:
+        """Blend *overlay* into an interactive-widget background colour."""
+        if overlay is not None and overlay.alpha() > 0:
+            return alpha_blend(color, overlay)
+        return QColor(color)
+
     pal = QPalette(base_palette) if base_palette else QPalette()
 
+    # Window role — NOT blended; containers are transparent.
     pal.setColor(QPalette.ColorRole.Window,     window_color)
     pal.setColor(QPalette.ColorRole.WindowText, c.body_text)
 
-    pal.setColor(QPalette.ColorRole.Base,          c.input_bg)
-    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(c.input_bg).darker(110))
+    # Interactive leaf-widget roles — blended with state overlay.
+    pal.setColor(QPalette.ColorRole.Base,          _blend(c.input_bg))
+    pal.setColor(QPalette.ColorRole.AlternateBase, _blend(QColor(c.input_bg).darker(110)))
     pal.setColor(QPalette.ColorRole.Text,          c.body_text)
 
-    pal.setColor(QPalette.ColorRole.Button,     c.input_bg)
+    pal.setColor(QPalette.ColorRole.Button,     _blend(c.input_bg))
     pal.setColor(QPalette.ColorRole.ButtonText, c.body_text)
 
     pal.setColor(QPalette.ColorRole.Highlight,       c.header_bg)
@@ -381,6 +469,8 @@ def build_theme_palette(
 
     pal.setColor(QPalette.ColorRole.PlaceholderText, c.placeholder_text)
 
+    # Structural roles — NOT blended; these are for frame edges and
+    # sunken/raised borders that should stay consistent.
     pal.setColor(QPalette.ColorRole.Mid,    QColor(c.body_bg).lighter(130))
     pal.setColor(QPalette.ColorRole.Light,  QColor(c.body_bg).lighter(150))
     pal.setColor(QPalette.ColorRole.Dark,   QColor(c.body_bg).darker(130))
