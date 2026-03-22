@@ -16,21 +16,24 @@ Encapsulates:
 - QSS generation for fine-grained styling.
 - Container transparency (via ``secure_node_transparency``).
 
-Container transparency
-----------------------
-After every ``setPalette()`` call Qt propagates the new palette down the
-widget tree, which resets ``autoFillBackground`` on children to ``True``
-and makes layout containers (``QFrame``, ``QGroupBox``, ``QScrollArea``,
-…) opaque again.  This blocks the QPainter-drawn node body fill and the
-per-state overlay colour, so nodes in DISABLED or PASSTHROUGH state
-appear unchanged inside embedded widgets.
+How state-overlay transparency works
+-------------------------------------
+``Node.paint()`` draws ``body_bg`` then alpha-composites the state overlay
+(DISABLED, PASSTHROUGH, …) directly onto the ``QGraphicsItem`` canvas.
+The ``QGraphicsProxyWidget`` is rendered on top of that canvas.
 
-The fix is to call ``secure_node_transparency(self)`` after every palette
-application.  That function installs a persistent ``ContainerTransparencyFilter``
-(a ``QObject`` event filter) on the root and all container children.  The
-filter intercepts ``PaletteChange`` and ``ChildAdded`` events, re-asserting
-transparency automatically for the lifetime of the node.  It is idempotent —
-safe to call on every palette refresh.
+``WidgetCore`` itself has ``autoFillBackground=False`` — it does **not**
+paint a background.  Every layout container beneath it (``QFrame``,
+``QGroupBox``, etc.) is also made transparent by
+``secure_node_transparency``.  This means the entire widget area is
+composited over what the scene already painted, and the state overlay is
+always visible underneath without any palette blending.
+
+The palette is still applied (for ``QPalette.Text``, ``Base``,
+``Button``, ``Highlight`` etc.) so that interactive leaf widgets
+(spinboxes, combos, line-edits) are correctly styled.  Only the
+``Window`` role (the widget fill colour) is irrelevant since
+``autoFillBackground`` is off.
 """
 
 from __future__ import annotations
@@ -55,8 +58,7 @@ log = get_logger("ThemeMixin")
 
 PROXY_WIDGET_STYLE: str = "Fusion"
 """Qt style name applied to widgets inside nodes.  Must be a style that
-fully honours ``QPalette``.  Change this before creating any nodes if you
-need a different style (e.g. ``"Windows"`` for testing)."""
+fully honours ``QPalette``."""
 
 _fusion_style = None
 
@@ -103,32 +105,27 @@ class ThemeMixin:
     # ── Core palette application ─────────────────────────────────────────
 
     def _apply_container_background(self: QWidget) -> None:
-        """Apply Fusion style and node-body palette to the widget.
+        """Apply Fusion style and palette to the widget.
 
-        When a back-reference to the owning node is available, the
-        palette is derived from the node's effective header/body colours
-        (including selection highlights and per-node overrides).
+        ``WidgetCore`` itself is transparent (``autoFillBackground=False``).
+        The palette is still built and applied so that interactive leaf
+        widgets (``QPalette.Base``, ``Text``, ``Button``, etc.) are
+        correctly coloured.  The state overlay shows through from the
+        QPainter canvas without any blending needed here.
 
         Also updates the proxy root widget palette (whose
         ``parentWidget()`` is None and would otherwise fall back to
         ``QApplication::palette()``).
-
-        After ``setPalette()``, calls ``secure_node_transparency(self)``
-        so that Qt's palette propagation — which resets
-        ``autoFillBackground`` on children — cannot make containers
-        opaque again.
         """
         from weave.themes.palette_bridge import (
             resolve_theme_colors, resolve_node_colors, build_theme_palette,
             secure_node_transparency,
         )
 
-        # Ensure Fusion is (still) active — reparenting may wipe it.
         style = get_proxy_style()
         if style is not None:
             self.setStyle(style)
 
-        # Use the owning node's effective colours when available.
         node = self._node_ref
         if node is not None and hasattr(node, "header") and hasattr(node, "body"):
             colors = resolve_node_colors(
@@ -142,33 +139,40 @@ class ThemeMixin:
             base_palette=self.palette(),
             colors=colors,
         )
-        self.setAutoFillBackground(True)
+
+        # WidgetCore does NOT fill its background — the scene canvas shows through.
+        self.setAutoFillBackground(False)
         self.setPalette(pal)
 
-        # Proxy root — parentWidget() is None so needs explicit palette.
+        # Proxy root palette (needed because its parentWidget() is None).
         proxy = self._find_proxy()
         if proxy is not None:
             root = proxy.widget()
             if root is not None and root is not self:
                 root.setPalette(pal)
+                # The proxy root must never paint a background — the
+                # QPainter-drawn node body (incl. state overlay) must
+                # show through.  Re-assert after every palette set.
+                root.setAutoFillBackground(False)
 
-        # Re-assert container transparency after palette propagation.
-        # setPalette() resets autoFillBackground on children; the filter
-        # installed here counters that for every subsequent palette change.
+        # Re-assert transparency on all container children after palette
+        # propagation (which resets autoFillBackground on children).
         secure_node_transparency(self)
+        # Also cover the proxy root and its subtree — secure_node_transparency
+        # walks *downward* from its argument, and the proxy root is
+        # WidgetCore's parent, so the self-rooted walk never reaches it.
+        if proxy is not None:
+            root = proxy.widget()
+            if root is not None and root is not self:
+                secure_node_transparency(root)
 
     def _apply_full_proxy_theme(self: QWidget) -> None:
         """Post-patch theme setup: Fusion + palette on proxy root and children.
 
-        Called by WidgetCore after _patch_parent_proxy succeeds.
-        Handles the proxy-root styling, child palette clearing, and
-        WidgetCore palette application as a single atomic step.
-
-        After all palette work, calls ``secure_node_transparency(self)``
-        to enroll the full widget tree in the reactive transparency filter.
-        This is the primary installation point: by the time this runs the
-        proxy exists and all initial child widgets are already in the tree,
-        so the filter's recursive walk covers everything.
+        Called by WidgetCore after ``_patch_parent_proxy`` succeeds.
+        This is the primary installation point for ``secure_node_transparency``:
+        by the time it runs, the proxy exists and all initial children are
+        already in the tree.
         """
         from weave.themes.palette_bridge import (
             resolve_theme_colors, build_theme_palette,
@@ -179,7 +183,6 @@ class ThemeMixin:
         if proxy is None:
             return
 
-        # Fusion style on proxy root
         style = get_proxy_style()
         root = proxy.widget()
 
@@ -187,6 +190,7 @@ class ThemeMixin:
             if style is not None:
                 root.setStyle(style)
             root.setAutoFillBackground(False)
+            root.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
             if root is not self:
                 colors = resolve_theme_colors()
@@ -197,21 +201,13 @@ class ThemeMixin:
         # Clear stale explicit palettes on children so they inherit.
         for child in self.findChildren(QWidget):
             try:
-                child.setAttribute(
-                    Qt.WidgetAttribute.WA_SetPalette, False,
-                )
+                child.setAttribute(Qt.WidgetAttribute.WA_SetPalette, False)
             except RuntimeError:
                 pass
 
-        # Apply body palette to WidgetCore (propagates to children).
-        # _apply_container_background already calls secure_node_transparency,
-        # but we call it explicitly here too so the filter is installed even
-        # before _apply_container_background's setPalette propagation fires.
+        # Apply palette to WidgetCore (transparent background, correct roles).
+        # _apply_container_background also calls secure_node_transparency.
         self._apply_container_background()
-
-        # Enroll the full tree now that the proxy root and all initial
-        # children are in place.  Idempotent — safe to call again.
-        secure_node_transparency(self)
 
     # ── Public palette API ───────────────────────────────────────────────
 
@@ -225,9 +221,12 @@ class ThemeMixin:
         Called by the node's ``_update_colors()`` whenever effective
         colours change (selection, custom header, state transition, …).
 
-        After ``setPalette()``, calls ``secure_node_transparency(self)``
-        to re-assert container transparency, which Qt's palette
-        propagation would otherwise reset.
+        ``WidgetCore`` is transparent, so the state overlay painted by
+        ``Node.paint()`` is always visible beneath the widget area — no
+        colour blending is needed here.  The palette update still matters
+        for ``QPalette.Base`` / ``Text`` / ``Button`` / ``Highlight``
+        (used by spinboxes, combos, etc.) and for the ``Highlight`` role
+        which reflects per-node header colours.
         """
         from weave.themes.palette_bridge import (
             resolve_node_colors, build_theme_palette,
@@ -247,12 +246,14 @@ class ThemeMixin:
             root = proxy.widget()
             if root is not None and root is not self:
                 root.setPalette(pal)
+                root.setAutoFillBackground(False)
 
-        # Re-assert container transparency after every palette update.
-        # This is the call site that fires on every state change (the node's
-        # _update_colors → BaseControlNode._update_colors → apply_node_palette).
-        # The filter is idempotent: widgets already managed are skipped in O(1).
+        # Re-assert container transparency after palette propagation.
         secure_node_transparency(self)
+        if proxy is not None:
+            root = proxy.widget()
+            if root is not None and root is not self:
+                secure_node_transparency(root)
 
     def refresh_widget_palettes(self: QWidget) -> None:
         """Force-refresh palettes on all child widgets.
