@@ -92,8 +92,11 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
             layout.setSpacing(4)
         self.setLayout(layout)
 
-        # Background
-        self.setAutoFillBackground(True)
+        # WidgetCore itself is transparent — the QPainter-drawn node body
+        # (including any state overlay) shows through from the scene canvas.
+        # autoFillBackground is explicitly kept False so Qt never paints a
+        # solid QPalette.Window fill over the scene rendering.
+        self.setAutoFillBackground(False)
 
         # StyleManager subscription
         sm = StyleManager.instance()
