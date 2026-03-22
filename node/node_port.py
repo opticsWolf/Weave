@@ -89,8 +89,9 @@ class NodePort(QGraphicsItem):
         # Cache the style manager instance FIRST (needed by _get_port_config)
         self._style_manager = StyleManager.instance()
         
-        # Add state overlay color attribute - NEW
-        self._state_overlay_color = Qt.GlobalColor.transparent
+        # State overlay: a fully transparent QColor means "no overlay".
+        # Always stored as QColor for reliable alpha() checks.
+        self._state_overlay_color = QColor(0, 0, 0, 0)
         
         # ADD UUID GENERATION FOR PORT IDENTIFICATION
         self._port_uuid = uuid.uuid4()
@@ -545,34 +546,24 @@ class NodePort(QGraphicsItem):
     
         Args:
             overlay_color: QColor or Qt.GlobalColor.transparent for blending effect
-                The color to be used for overlay rendering. This exact object will be
-                forwarded to all connected traces without modification.
-                
-        Example:
-            # Set an error red overlay on an output port
-            output_port.set_state_overlay(QColor(255, 0, 0, 128))  # Semi-transparent red
-            
-            # Clear overlay by setting transparent
-            output_port.set_state_overlay(Qt.GlobalColor.transparent)
-            
-            # Input ports do NOT forward colors (they receive them from connections)
-            input_port.set_state_overlay(QColor(0, 255, 0, 128))  # Will be received but not forwarded
         """
-        # 1. Update local state
-        self._state_overlay_color = overlay_color
+        # Normalise to QColor so alpha() checks are always reliable.
+        if isinstance(overlay_color, QColor):
+            self._state_overlay_color = QColor(overlay_color)
+        else:
+            self._state_overlay_color = QColor(0, 0, 0, 0)
         
-        # 2. Only forward to connected traces if this is an outgoing port
+        # Only forward to connected traces if this is an outgoing port
         # This prevents redundant propagation through connections
         if self.is_output:
             for trace in self.connected_traces:
                 if hasattr(trace, 'set_state_overlay'):
                     try:
-                        trace.set_state_overlay(overlay_color)  # Forward unmodified
+                        trace.set_state_overlay(self._state_overlay_color)
                     except Exception:
                         pass
         
-        # 3. Refresh trace colors to match the new port overlay color
-        # This ensures traces update their base color when the port overlay changes
+        # Refresh trace colors to match the new port overlay color
         for trace in self.connected_traces:
             if hasattr(trace, 'refresh_style'):
                 try:
@@ -580,42 +571,35 @@ class NodePort(QGraphicsItem):
                 except Exception:
                     pass
         
-        # 4. Trigger repaint of this port
         self.update()
 
     
     def _blend_color_with_overlay(self, base_color: QColor, overlay_color) -> QColor:
         """
-        Blend the overlay color with the base color, preserving the overlay's alpha
-        as the blend factor.
-        
+        Alpha-composite *overlay_color* over *base_color*.
+
+        Uses the overlay's alpha channel as the blend factor so the result
+        matches the visual intensity of the QPainter-drawn overlay on the
+        node body.  The base colour's own alpha is preserved.
+
         Args:
-            base_color: The original port color
-            overlay_color: The state overlay color (with alpha indicating blend strength)
-        
+            base_color: The original port color.
+            overlay_color: The state overlay color (QColor with alpha).
+
         Returns:
-            A new QColor blended between base and overlay
+            A new QColor blended between base and overlay.
         """
-        if overlay_color is None or overlay_color == Qt.GlobalColor.transparent:
+        if not isinstance(overlay_color, QColor) or overlay_color.alpha() == 0:
             return base_color
-        
-        # Handle QColor objects
-        if isinstance(overlay_color, QColor):
-            if overlay_color.alpha() == 0:
-                return base_color
-            
-            # Use overlay alpha as blend factor (0-255 -> 0.0-1.0)
-            blend_factor = (overlay_color.alpha() / 255) / 1.5
-            
-            # Linear interpolation between base and overlay RGB values
-            r = int(base_color.red() * (1 - blend_factor) + overlay_color.red() * blend_factor)
-            g = int(base_color.green() * (1 - blend_factor) + overlay_color.green() * blend_factor)
-            b = int(base_color.blue() * (1 - blend_factor) + overlay_color.blue() * blend_factor)
-            
-            # Preserve original base alpha
-            return QColor(r, g, b, base_color.alpha())
-        
-        return base_color
+
+        factor = overlay_color.alphaF()
+        inv = 1.0 - factor
+
+        r = int(base_color.red()   * inv + overlay_color.red()   * factor)
+        g = int(base_color.green() * inv + overlay_color.green() * factor)
+        b = int(base_color.blue()  * inv + overlay_color.blue()  * factor)
+
+        return QColor(r, g, b, base_color.alpha())
     
     def _has_real_connections(self) -> bool:
         """Check whether the real ports this summary port represents have traces."""
@@ -648,9 +632,7 @@ class NodePort(QGraphicsItem):
     
         # === OVERLAY BLENDING ===
         # If we have a state overlay color, blend it with the brush color
-        if (self._state_overlay_color is not None and 
-            self._state_overlay_color != Qt.GlobalColor.transparent):
-            
+        if self._state_overlay_color.alpha() > 0:
             base_color = own_brush.color()
             blended_color = self._blend_color_with_overlay(base_color, self._state_overlay_color)
             own_brush = QBrush(blended_color)
@@ -704,8 +686,7 @@ class NodePort(QGraphicsItem):
                             other_col = self._highlight_colors(other_col, self.cfg['highlight'], 20)
                         
                         # Also blend overlay with the complementary color
-                        if (self._state_overlay_color is not None and 
-                            self._state_overlay_color != Qt.GlobalColor.transparent):
+                        if self._state_overlay_color.alpha() > 0:
                             other_col = self._blend_color_with_overlay(other_col, self._state_overlay_color)
                         
                         painter.setBrush(QBrush(other_col))
@@ -734,8 +715,7 @@ class NodePort(QGraphicsItem):
                 final_inner = base_inner
             
             # Blend overlay with inner circle color too
-            if (self._state_overlay_color is not None and 
-                self._state_overlay_color != Qt.GlobalColor.transparent):
+            if self._state_overlay_color.alpha() > 0:
                 final_inner = self._blend_color_with_overlay(final_inner, self._state_overlay_color)
             
             inner_brush = QBrush(final_inner)

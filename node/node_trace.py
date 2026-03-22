@@ -76,7 +76,8 @@ class NodeTrace(TracePathMixin, QGraphicsPathItem):
         '_last_src_pos', '_last_dst_pos',
         '_local_style', '_style_manager',
         '_main_pen', '_outline_pen', '_shadow_pen', '_shadow_offset',
-        '_source_uuid', '_target_uuid', '_connection_type'
+        '_source_uuid', '_target_uuid', '_connection_type',
+        '_state_overlay_color',
     )
 
     def __init__(
@@ -108,6 +109,7 @@ class NodeTrace(TracePathMixin, QGraphicsPathItem):
         self._shadow_pen = None
         self._shadow_offset = QPointF(0, 0)
         self._connection_type = "bezier" # Default type
+        self._state_overlay_color = QColor(0, 0, 0, 0)
 
         self.refresh_style()
         self._register_connection()
@@ -146,12 +148,11 @@ class NodeTrace(TracePathMixin, QGraphicsPathItem):
 
     def _setup_pens(self, config: Dict[str, Any]) -> None:
         """Builds main, outline, and shadow pens from config."""
-        # 1. Main Pen
+        # 1. Main Pen — blend port colour with state overlay
         c = config.get("color")
         if c is None:
             base_color = getattr(self.source, 'color', QColor(200, 200, 200))
-            port_overlay = getattr(self.source, '_state_overlay_color', Qt.GlobalColor.transparent)
-            c = self._blend_color_with_overlay(base_color, port_overlay)
+            c = self._blend_color_with_overlay(base_color, self._state_overlay_color)
 
         width = config.get("width", 3.0)
         self._main_pen = QPen(QColor(c), width)
@@ -201,28 +202,38 @@ class NodeTrace(TracePathMixin, QGraphicsPathItem):
         self.update_path()
 
     def set_state_overlay(self, overlay_color) -> None:
-        """Triggered when the source port's overlay changes; rebuilds pen color."""
+        """Store the state overlay and rebuild pens to reflect the new colour.
+
+        The overlay's alpha also controls the trace's scene opacity so that
+        traces emanating from DISABLED / PASSTHROUGH nodes visually fade
+        to match the node body.
+        """
+        if isinstance(overlay_color, QColor):
+            self._state_overlay_color = QColor(overlay_color)
+        else:
+            self._state_overlay_color = QColor(0, 0, 0, 0)
+
         self.refresh_style()
 
     def _blend_color_with_overlay(self, base_color: QColor, overlay_color) -> QColor:
         """
-        Blend overlay into base_color using the overlay's alpha as the blend factor.
-        Returns base_color unchanged if overlay is transparent or absent.
+        Alpha-composite *overlay_color* over *base_color*.
+
+        Uses the overlay's alpha channel as the blend factor so the result
+        matches the visual intensity of the QPainter-drawn overlay on the
+        node body.  The base colour's own alpha is preserved.
         """
-        if overlay_color is None or overlay_color == Qt.GlobalColor.transparent:
+        if not isinstance(overlay_color, QColor) or overlay_color.alpha() == 0:
             return base_color
 
-        if isinstance(overlay_color, QColor):
-            if overlay_color.alpha() == 0:
-                return base_color
+        factor = overlay_color.alphaF()
+        inv = 1.0 - factor
 
-            blend_factor = (overlay_color.alpha() / 255) / 1.5
-            r = int(base_color.red()   * (1 - blend_factor) + overlay_color.red()   * blend_factor)
-            g = int(base_color.green() * (1 - blend_factor) + overlay_color.green() * blend_factor)
-            b = int(base_color.blue()  * (1 - blend_factor) + overlay_color.blue()  * blend_factor)
-            return QColor(r, g, b, base_color.alpha())
+        r = int(base_color.red()   * inv + overlay_color.red()   * factor)
+        g = int(base_color.green() * inv + overlay_color.green() * factor)
+        b = int(base_color.blue()  * inv + overlay_color.blue()  * factor)
 
-        return base_color
+        return QColor(r, g, b, base_color.alpha())
 
     def update_geometry(self) -> None:
         """Alias for update_path."""
@@ -275,6 +286,13 @@ class NodeTrace(TracePathMixin, QGraphicsPathItem):
         path = self.path()
         if not path:
             return
+
+        # Fade trace when its source node has a state overlay (DISABLED,
+        # PASSTHROUGH, …).  The overlay alpha drives a proportional opacity
+        # reduction so the trace dims together with the node body.
+        if self._state_overlay_color.alpha() > 0:
+            opacity = max(0.35, 1.0 - self._state_overlay_color.alphaF() * 0.5)
+            painter.setOpacity(opacity)
 
         # Shadow -> Outline -> Main
         if self._shadow_pen:
