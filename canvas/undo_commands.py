@@ -206,7 +206,27 @@ class WidgetValueCommand(UndoCommand):
         if node is None:
             return
         wc = getattr(node, '_widget_core', None) or getattr(node, '_weave_core', None)
-        if wc is not None:
+        if wc is None:
+            return
+
+        # Use apply_port_value (NOT set_port_value) so the widget's
+        # native signal fires.  This is critical for widgets whose
+        # signal handlers drive side-effects (e.g. a count spinbox's
+        # valueChanged → _on_count_changed → port creation/removal).
+        #
+        # set_port_value blocks ALL signals, which is correct for normal
+        # upstream data pushes but breaks undo/redo because the node's
+        # internal handlers never run.
+        #
+        # apply_port_value suppresses only WidgetCore's value_changed
+        # (preventing the undo manager from re-recording), while letting
+        # QSpinBox.valueChanged etc. propagate to the node's own slots.
+        # The undo manager's _restoring flag is also True as a secondary
+        # guard.
+        if hasattr(wc, 'apply_port_value'):
+            wc.apply_port_value(self.port_name, value)
+        else:
+            # Fallback for older WidgetCore without apply_port_value
             wc.set_port_value(self.port_name, value)
 
     def try_merge(self, other: UndoCommand) -> bool:
@@ -225,14 +245,15 @@ class WidgetValueCommand(UndoCommand):
 
 
 # ======================================================================
-# Generic node property (minimize, state, header color)
+# Generic node property (state, header color, etc.)
 # ======================================================================
 
 class NodePropertyCommand(UndoCommand):
-    """A simple property changed on one or more nodes.
+    """A property changed on one or more nodes via a value-accepting setter.
 
-    *setter_name* is called with the value; *getter_name* is not
-    used at runtime but documents what was read.
+    *setter_name* must accept a single positional argument (the value).
+    Examples: ``set_state(NodeState.DISABLED)``,
+    ``set_header_color_by_index(2)``.
     """
 
     def __init__(
@@ -261,6 +282,40 @@ class NodePropertyCommand(UndoCommand):
     @property
     def description(self) -> str:
         return self._label
+
+
+# ======================================================================
+# Toggle minimize
+# ======================================================================
+
+class ToggleMinimizeCommand(UndoCommand):
+    """One or more nodes were minimized or restored.
+
+    Stores the target ``is_minimized`` state for each node.  On undo /
+    redo, only calls ``toggle_minimize()`` if the node's current state
+    differs from the desired state — avoiding a double-toggle that
+    would leave the node in the wrong state.
+    """
+
+    def __init__(self, nodes: List[Tuple[str, bool]]) -> None:
+        # [(node_uuid, new_is_minimized), ...]
+        self._nodes = nodes
+
+    def undo(self, canvas) -> None:
+        for uid, was_minimized_after in self._nodes:
+            node = _find_node(canvas, uid)
+            if node is not None and node.is_minimized == was_minimized_after:
+                node.toggle_minimize()
+
+    def redo(self, canvas) -> None:
+        for uid, was_minimized_after in self._nodes:
+            node = _find_node(canvas, uid)
+            if node is not None and node.is_minimized != was_minimized_after:
+                node.toggle_minimize()
+
+    @property
+    def description(self) -> str:
+        return "Toggle minimize"
 
 
 # ======================================================================
@@ -467,6 +522,164 @@ class RemoveConnectionsCommand(UndoCommand):
     def description(self) -> str:
         n = len(self._connections)
         return f"Remove {n} connection{'s' if n != 1 else ''}"
+
+
+# ======================================================================
+# Add port (dynamic)
+# ======================================================================
+
+class AddPortCommand(UndoCommand):
+    """A port was dynamically added to a node at runtime.
+
+    Stores the port definition so that undo can remove it and redo can
+    re-create it.  Connected traces are NOT captured here — they are
+    always empty at creation time.
+    """
+
+    def __init__(
+        self,
+        node_uuid: str,
+        port_name: str,
+        datatype: str,
+        is_output: bool,
+        description: str = "",
+    ) -> None:
+        self._node_uuid = node_uuid
+        self._port_name = port_name
+        self._datatype = datatype
+        self._is_output = is_output
+        self._port_desc = description
+
+    def undo(self, canvas) -> None:
+        node = _find_node(canvas, self._node_uuid)
+        if node is None:
+            return
+        if hasattr(node, 'remove_port'):
+            node.remove_port(self._port_name, is_output=self._is_output)
+
+    def redo(self, canvas) -> None:
+        node = _find_node(canvas, self._node_uuid)
+        if node is None:
+            return
+        if self._is_output:
+            node.add_output(self._port_name, self._datatype, self._port_desc)
+        else:
+            node.add_input(self._port_name, self._datatype, self._port_desc)
+
+    @property
+    def description(self) -> str:
+        side = "output" if self._is_output else "input"
+        return f"Add {side} port '{self._port_name}'"
+
+
+# ======================================================================
+# Remove port (dynamic)
+# ======================================================================
+
+class RemovePortCommand(UndoCommand):
+    """A port was dynamically removed from a node at runtime.
+
+    Captures the port definition and any connections that were attached
+    to it so that undo can fully restore the port and its traces.
+    """
+
+    def __init__(
+        self,
+        node_uuid: str,
+        port_name: str,
+        datatype: str,
+        is_output: bool,
+        description: str = "",
+        connections: Optional[List[ConnectionTuple]] = None,
+    ) -> None:
+        self._node_uuid = node_uuid
+        self._port_name = port_name
+        self._datatype = datatype
+        self._is_output = is_output
+        self._port_desc = description
+        self._connections = connections or []
+
+    def undo(self, canvas) -> None:
+        from weave.portutils import ConnectionFactory
+
+        # 1. Re-create port
+        node = _find_node(canvas, self._node_uuid)
+        if node is None:
+            return
+        if self._is_output:
+            node.add_output(self._port_name, self._datatype, self._port_desc)
+        else:
+            node.add_input(self._port_name, self._datatype, self._port_desc)
+
+        # 2. Re-create connections
+        for src_uuid, src_idx, dst_uuid, dst_idx in self._connections:
+            src_node = _find_node(canvas, src_uuid)
+            dst_node = _find_node(canvas, dst_uuid)
+            if src_node is None or dst_node is None:
+                continue
+            _, out = _get_port_lists(src_node)
+            in_list, _ = _get_port_lists(dst_node)
+            if src_idx < len(out) and dst_idx < len(in_list):
+                ConnectionFactory.create(
+                    canvas, out[src_idx], in_list[dst_idx],
+                    validate=False, trigger_compute=True,
+                )
+
+    def redo(self, canvas) -> None:
+        node = _find_node(canvas, self._node_uuid)
+        if node is None:
+            return
+        if hasattr(node, 'remove_port'):
+            node.remove_port(self._port_name, is_output=self._is_output)
+
+    @property
+    def description(self) -> str:
+        side = "output" if self._is_output else "input"
+        return f"Remove {side} port '{self._port_name}'"
+
+
+# ======================================================================
+# Port visibility
+# ======================================================================
+
+class PortVisibilityCommand(UndoCommand):
+    """One or more ports had their visibility toggled.
+
+    Stores ``[(port_name, is_output, old_visible, new_visible), ...]``
+    for a single node.
+    """
+
+    def __init__(
+        self,
+        node_uuid: str,
+        changes: List[Tuple[str, bool, bool, bool]],
+    ) -> None:
+        # changes: [(port_name, is_output, was_visible, now_visible), ...]
+        self._node_uuid = node_uuid
+        self._changes = changes
+
+    def undo(self, canvas) -> None:
+        self._apply(canvas, revert=True)
+
+    def redo(self, canvas) -> None:
+        self._apply(canvas, revert=False)
+
+    def _apply(self, canvas, revert: bool) -> None:
+        node = _find_node(canvas, self._node_uuid)
+        if node is None:
+            return
+        for port_name, is_output, was_visible, now_visible in self._changes:
+            target_vis = was_visible if revert else now_visible
+            port = None
+            if hasattr(node, 'find_port'):
+                port = node.find_port(port_name, is_output=is_output)
+            if port is not None and hasattr(node, 'set_port_visible'):
+                node.set_port_visible(port, target_vis)
+
+    @property
+    def description(self) -> str:
+        n = len(self._changes)
+        return f"Toggle {n} port visibility"
 
 
 # ======================================================================

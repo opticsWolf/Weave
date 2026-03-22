@@ -54,7 +54,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QGraphicsItem
 
-from weave.canvas.undo_commands import UndoCommand, WidgetValueCommand, get_node_uid
+from weave.canvas.undo_commands import (
+    UndoCommand, WidgetValueCommand, AddPortCommand, RemovePortCommand,
+    CompoundCommand, get_node_uid,
+)
 from weave.logger import get_logger
 log = get_logger("UndoManager")
 
@@ -104,6 +107,10 @@ class UndoManager:
         # disconnect cleanly on node removal.
         self._connected_cores: Dict[int, Tuple[Any, Any]] = {}
 
+        # Port lifecycle slots.
+        # Stores {id(node): (port_added_slot, port_removed_slot)}.
+        self._port_slots: Dict[int, Tuple[Any, Any]] = {}
+
         # Baseline widget values captured at the start of each edit
         # session.  Keyed by (node_uuid, port_name).  Used to produce
         # the old_value for WidgetValueCommand.
@@ -130,6 +137,25 @@ class UndoManager:
 
         ``cmd.redo()`` is **not** called — the caller has already
         performed the action.
+
+        Side-effect port command discarding
+        ------------------------------------
+        When a widget change drives port creation/removal (e.g. a count
+        spinbox), the signal sequence is:
+
+            port_added / port_removed  →  AddPortCommand pushed first
+            value_changed              →  WidgetValueCommand pushed second
+
+        The port commands are *side effects* of the widget value change,
+        not independent operations.  The ``WidgetValueCommand`` alone is
+        sufficient: its undo/redo restores the widget value via
+        ``apply_port_value``, which lets the native widget signal fire.
+        The node's own handler (e.g. ``_on_count_changed`` →
+        ``_set_count``) then manages both ports and widgets correctly.
+
+        When a ``WidgetValueCommand`` arrives, any ``AddPortCommand`` /
+        ``RemovePortCommand`` for the same node sitting at the top of
+        the stack are therefore **discarded**.
         """
         if self._restoring:
             return
@@ -141,6 +167,30 @@ class UndoManager:
                 log.debug(f"Merged into: {top.description}")
                 self._restart_merge_window()
                 return
+
+        # -- Discard side-effect port commands --
+        # When a WidgetValueCommand arrives after AddPort/RemovePort
+        # commands for the same node, the port commands are side-effects
+        # of the widget change.  Discard them — the WidgetValueCommand's
+        # undo/redo will re-trigger the node's own port management via
+        # apply_port_value (which lets native widget signals fire).
+        if isinstance(cmd, WidgetValueCommand) and self._undo_stack:
+            discarded = 0
+            while self._undo_stack:
+                top = self._undo_stack[-1]
+                if (
+                    isinstance(top, (AddPortCommand, RemovePortCommand))
+                    and top._node_uuid == cmd.node_uuid
+                ):
+                    self._undo_stack.pop()
+                    discarded += 1
+                else:
+                    break
+            if discarded:
+                log.debug(
+                    f"Discarded {discarded} port cmd(s) — side-effect of "
+                    f"widget change on '{cmd.port_name}'"
+                )
 
         # Standard push — discard forward history
         self._redo_stack.clear()
@@ -168,8 +218,16 @@ class UndoManager:
             # Refresh baselines so the next widget edit has a correct
             # old_value reflecting the post-undo state.
             if isinstance(cmd, WidgetValueCommand):
+                # Surgical update: only the one port changed.
                 key = (cmd.node_uuid, cmd.port_name)
                 self._widget_baselines[key] = cmd.old_value
+            else:
+                # Non-widget commands (move, add, delete, connect) may
+                # indirectly change widget values (e.g. node recreated by
+                # undo-of-delete gets fresh widget state).  Snapshot all
+                # connected cores so the next user edit has the correct
+                # old_value and doesn't produce a stale-baseline command.
+                self.snapshot_widget_baselines()
             return True
         except Exception as e:
             log.error(f"Undo failed: {e}")
@@ -194,8 +252,13 @@ class UndoManager:
             # Refresh baselines so the next widget edit has a correct
             # old_value reflecting the post-redo state.
             if isinstance(cmd, WidgetValueCommand):
+                # Surgical update: only the one port changed.
                 key = (cmd.node_uuid, cmd.port_name)
                 self._widget_baselines[key] = cmd.new_value
+            else:
+                # Non-widget commands: resnapshot all baselines in case
+                # redo recreated nodes or otherwise altered widget state.
+                self.snapshot_widget_baselines()
             return True
         except Exception as e:
             log.error(f"Redo failed: {e}")
@@ -257,9 +320,21 @@ class UndoManager:
                 continue
             self._wire_node(item)
 
+    def wire_node(self, node) -> None:
+        """Public entry point: wire a single node's WidgetCore and port
+        lifecycle signals for undo tracking.
+
+        Call this for nodes added via paths that don't emit the
+        ``node_added`` signal (e.g. ``NodeManager.clone_nodes``).
+        Idempotent — safe to call on an already-wired node.
+        """
+        if id(node) in self._connected_cores:
+            return
+        self._wire_node(node)
+
     def _wire_node(self, node) -> None:
-        """Connect a node's WidgetCore.value_changed with a closure
-        that captures the node UUID and widget core reference.
+        """Connect a node's WidgetCore.value_changed and port lifecycle
+        signals with closures that capture the node UUID.
         
         Also snapshots all current widget values as baselines so the
         very first edit has a correct old_value to revert to.
@@ -281,6 +356,21 @@ class UndoManager:
             slot = self._make_widget_slot(node_uuid, wc)
             wc.value_changed.connect(slot)
             self._connected_cores[id(node)] = (wc, slot)
+
+            # Wire port lifecycle signals for undo tracking
+            if hasattr(node, 'port_added'):
+                pa_slot = self._make_port_added_slot(node_uuid)
+                node.port_added.connect(pa_slot)
+                # Store slot reference for cleanup
+                self._port_slots[id(node)] = (pa_slot, None)
+
+            if hasattr(node, 'port_removed'):
+                pr_slot = self._make_port_removed_slot(node_uuid)
+                node.port_removed.connect(pr_slot)
+                # Merge with existing entry
+                existing = self._port_slots.get(id(node), (None, None))
+                self._port_slots[id(node)] = (existing[0] or pa_slot, pr_slot)
+
         except (RuntimeError, TypeError):
             pass
 
@@ -328,14 +418,63 @@ class UndoManager:
 
         return _on_value_changed
 
+    def _make_port_added_slot(self, node_uuid: str):
+        """Return a slot closure for ``port_added`` that pushes an
+        ``AddPortCommand`` so the dynamic port addition can be undone.
+        """
+
+        def _on_port_added(port):
+            if self._restoring:
+                return
+            cmd = AddPortCommand(
+                node_uuid=node_uuid,
+                port_name=getattr(port, 'name', ''),
+                datatype=getattr(port, 'datatype', 'flow'),
+                is_output=getattr(port, 'is_output', True),
+                description=getattr(port, 'port_description', ''),
+            )
+            self.push(cmd)
+
+        return _on_port_added
+
+    def _make_port_removed_slot(self, node_uuid: str):
+        """Return a slot closure for ``port_removed`` that pushes a
+        ``RemovePortCommand`` so the dynamic port removal can be undone.
+
+        NOTE: By the time ``port_removed`` fires, the port's traces have
+        already been disconnected by ``_detach_port``.  Connection data
+        is therefore empty here.  If callers need connection-preserving
+        undo they must capture connections *before* calling
+        ``remove_port()`` and push a ``CompoundCommand`` manually.
+        """
+
+        def _on_port_removed(port):
+            if self._restoring:
+                return
+            cmd = RemovePortCommand(
+                node_uuid=node_uuid,
+                port_name=getattr(port, 'name', ''),
+                datatype=getattr(port, 'datatype', 'flow'),
+                is_output=getattr(port, 'is_output', True),
+                description=getattr(port, 'port_description', ''),
+                connections=[],
+            )
+            self.push(cmd)
+
+        return _on_port_removed
+
     def _disconnect_all_cores(self) -> None:
-        """Disconnect every tracked widget core."""
+        """Disconnect every tracked widget core and port signal."""
         for wc, slot in self._connected_cores.values():
             try:
                 wc.value_changed.disconnect(slot)
             except (RuntimeError, TypeError):
                 pass
         self._connected_cores.clear()
+
+        # Port lifecycle slots — need the actual node to disconnect,
+        # but during clear() nodes may already be gone.  Best-effort.
+        self._port_slots.clear()
 
     def _on_node_added(self, node) -> None:
         """Wire a newly added node's widget core."""
@@ -344,15 +483,28 @@ class UndoManager:
         self._wire_node(node)
 
     def _on_node_removed(self, node) -> None:
-        """Disconnect a removed node's widget core."""
+        """Disconnect a removed node's widget core and port signals."""
         entry = self._connected_cores.pop(id(node), None)
-        if entry is None:
-            return
-        wc, slot = entry
-        try:
-            wc.value_changed.disconnect(slot)
-        except (RuntimeError, TypeError):
-            pass
+        if entry is not None:
+            wc, slot = entry
+            try:
+                wc.value_changed.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+
+        port_entry = self._port_slots.pop(id(node), None)
+        if port_entry is not None:
+            pa_slot, pr_slot = port_entry
+            if pa_slot is not None and hasattr(node, 'port_added'):
+                try:
+                    node.port_added.disconnect(pa_slot)
+                except (RuntimeError, TypeError):
+                    pass
+            if pr_slot is not None and hasattr(node, 'port_removed'):
+                try:
+                    node.port_removed.disconnect(pr_slot)
+                except (RuntimeError, TypeError):
+                    pass
 
     # ------------------------------------------------------------------
     # Baseline management

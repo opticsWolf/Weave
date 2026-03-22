@@ -162,24 +162,25 @@ class CanvasView(QGraphicsView):
         )
 
     def wheelEvent(self, event):
-        """Zoom with configurable limits and sensitivity.
+        """Zoom the canvas, or delegate to a proxy widget under the cursor.
 
-        Widget-editing guard
-        --------------------
-        When the user is interacting with an embedded widget inside a
-        node (a ``QGraphicsProxyWidget`` holds scene focus), the wheel
-        event is forwarded to the scene's default handler so Qt delivers
-        it to the proxy.  This lets ``QSpinBox`` increment/decrement,
-        ``QComboBox`` scroll its dropdown, and ``QTextEdit`` scroll its
-        contents — instead of zooming the canvas.
+        Proxy-widget guard (cursor-position based)
+        ------------------------------------------
+        Only forward the event to the embedded widget when the mouse is
+        *physically over* a ``QGraphicsProxyWidget``.  Using
+        ``scene.focusItem()`` (keyboard focus) instead would cause canvas
+        zooming to be replaced by scrolling whenever a widget holds focus
+        but the cursor has moved away — the problem this guard prevents.
         """
-        scene = self.scene()
-        if scene is not None:
-            focus = scene.focusItem()
-            if isinstance(focus, QGraphicsProxyWidget):
+        item = self.itemAt(event.position().toPoint())
+        # Walk up the item hierarchy: the hit item may be a child of the proxy.
+        while item is not None:
+            if isinstance(item, QGraphicsProxyWidget):
                 super().wheelEvent(event)
                 return
+            item = item.parentItem()
 
+        # Canvas zoom
         factor = self._config.get('zoom_factor', 1.15)
         zoom_factor = factor if event.angleDelta().y() > 0 else 1.0 / factor
 

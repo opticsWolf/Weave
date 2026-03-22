@@ -1,645 +1,415 @@
 # -*- coding: utf-8 -*-
 """
-Weave: A modular PySide6 framework for the visual synthesis 
+Weave: A modular PySide6 framework for the visual synthesis
 and execution of high-concurrency simulation workflows.
 Copyright (c) 2026 opticsWolf
 
 SPDX-License-Identifier: Apache-2.0
+
+Default Interaction State — idle / selection / drag / shake.
+
+Refactor highlights:
+  § 1  Uses ``get_movable_nodes`` from state_utils (single source of truth).
+  § 2  Legacy header paths (_min_btn_rect, _state_icon_rect) removed.
+       Headers must expose ``get_minimize_btn_rect`` / ``get_state_slider_rect``.
+  § 3  ``on_mouse_press`` delegates to a prioritised handler chain.
+  § 4  State transitions go through ``self.request_transition(name, **kw)``
+       — no direct imports of other state classes.
+  § 5  Style caching handled by ``StylableStateMixin``.
+  § 6  ``ItemResolver`` now multi-hit aware (scene.items).
 """
 
-from collections import deque
-from typing import Optional, List, Type, TypeVar, Sequence
-from PySide6.QtWidgets import QGraphicsSceneMouseEvent, QGraphicsItem, QGraphicsProxyWidget, QGraphicsTextItem
-from PySide6.QtCore import Qt, QPointF, QElapsedTimer, QTimer
-from PySide6.QtGui import QTransform, QKeyEvent
+from __future__ import annotations
+
+from typing import Optional, Sequence
+
+from PySide6.QtWidgets import (
+    QGraphicsItem,
+    QGraphicsProxyWidget,
+    QGraphicsSceneMouseEvent,
+    QGraphicsTextItem,
+)
+from PySide6.QtCore import Qt, QPointF
+from PySide6.QtGui import QKeyEvent
+
 from weave.logger import get_logger
-log = get_logger("State Utils")
 
-# Import from the orchestrator to avoid circular dependencies
-from weave.canvas.states.interaction_state import CanvasInteractionState
-from weave.canvas.states.state_utils import OptimizedShakeRecognizer, ItemResolver
-# NOTE: ConnectionDragState is imported locally inside _handle_port_press to
-# break the mutual import cycle (ConnectionDragState ↔ DefaultInteractionState).
+log = get_logger("DefaultState")
 
-from weave.portutils import PortUtils, PortFinder, ConnectionFactory
+from weave.canvas.states.interaction_state import (
+    CanvasInteractionState,
+    InteractionHandler,
+)
+from weave.canvas.states.state_utils import (
+    ItemResolver,
+    OptimizedShakeRecognizer,
+    StylableStateMixin,
+    build_connection_tuples,
+    get_movable_nodes,
+)
+from weave.canvas.commands_mixin import CanvasCommandsMixin
+from weave.portutils import ConnectionFactory
 from weave.node.node_port import NodePort
 from weave.node.node_trace import DragTrace, NodeTrace
-from weave.basenode import BaseControlNode
 from weave.canvas.undo_commands import get_node_uid
 
-# Import StyleManager at module level (not in properties)
-try:
-    from weave.stylemanager import StyleCategory, StyleManager
-    STYLEMANAGER_AVAILABLE = True
-except ImportError:
-    STYLEMANAGER_AVAILABLE = False
-    log.warning("StyleManager not available - shake detection will use defaults")
+
+# ============================================================================
+# INTERACTION HANDLERS  (Review §3 — Chain of Responsibility)
+# ============================================================================
+
+class ProxyWidgetHandler:
+    """Detect and yield to interactive widgets inside nodes."""
+
+    def try_handle(
+        self,
+        event: QGraphicsSceneMouseEvent,
+        state: "DefaultInteractionState",
+    ) -> bool:
+        scene_pos = event.scenePos()
+        if not state._is_interactive_widget_click(scene_pos):
+            return False
+        state._ensure_node_selected(scene_pos, event)
+        return state._yield_to_proxy(scene_pos)
 
 
-def _get_movable_nodes(items: Sequence[QGraphicsItem]) -> list[QGraphicsItem]:
-    """Filter items to only movable nodes, excluding traces."""
-    return [
-        item for item in items
-        if (item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
-        and not isinstance(item, (NodeTrace, DragTrace))
-    ]
+class PortHandler:
+    """Start a new connection drag or prepare detachment from a port."""
+
+    def try_handle(
+        self,
+        event: QGraphicsSceneMouseEvent,
+        state: "DefaultInteractionState",
+    ) -> bool:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+
+        port = ItemResolver.resolve_port_at(state.canvas, event.scenePos())
+        if port is None:
+            return False
+
+        # Summary ports on minimised nodes cannot start drags
+        if getattr(port, "is_summary_port", False):
+            return False
+
+        # Input port with existing connection → prepare detachment
+        if not port.is_output and port.connected_traces:
+            trace = port.connected_traces[0]
+            source = trace.source
+            if source:
+                state.request_transition(
+                    "connection_drag",
+                    start_port=source,
+                    pending_detach_port=port,
+                    pending_detach_trace=trace,
+                )
+                event.accept()
+                return True
+
+        # Start new connection drag
+        state.request_transition("connection_drag", start_port=port)
+        event.accept()
+        return True
 
 
-class DefaultInteractionState(CanvasInteractionState):
+class NodeButtonHandler:
+    """Handle presses on header buttons (minimise, state slider).
+
+    Headers must expose ``get_minimize_btn_rect()`` and
+    ``get_state_slider_rect()``.  Legacy ``_min_btn_rect`` /
+    ``_state_icon_rect`` attributes are no longer supported.
     """
-    Handles selection, movement, grid snapping, and connection dragging.
-    
-    Performance Optimizations (v12):
-    - Cached shake parameters (no property lookups in on_mouse_move)
-    - StyleManager observer pattern (cache updates on style changes)
-    - Delta-based shake detection (more robust, less overhead)
-    - Eliminated all dynamic imports and hasattr checks from hot paths
+
+    _HIT_PAD_BTN = 5
+    _HIT_PAD_SLIDER = 3
+
+    def try_handle(
+        self,
+        event: QGraphicsSceneMouseEvent,
+        state: "DefaultInteractionState",
+    ) -> bool:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+
+        node = ItemResolver.resolve_node_at(state.canvas, event.scenePos())
+        if node is None:
+            return False
+
+        local_pos = node.mapFromScene(event.scenePos())
+        header = node.header
+        uid = get_node_uid(node)
+
+        # ── Minimise button ───────────────────────────────────────────
+        if hasattr(header, "get_minimize_btn_rect"):
+            btn = header.get_minimize_btn_rect()
+            if not btn.isEmpty():
+                hit = btn.adjusted(
+                    -self._HIT_PAD_BTN, -self._HIT_PAD_BTN,
+                    self._HIT_PAD_BTN, self._HIT_PAD_BTN,
+                )
+                if hit.contains(local_pos):
+                    from weave.canvas.undo_commands import ToggleMinimizeCommand
+
+                    node.toggle_minimize()
+                    state._push_cmd(
+                        ToggleMinimizeCommand([(uid, node.is_minimized)])
+                    )
+                    return True
+
+        # ── State slider ──────────────────────────────────────────────
+        if hasattr(header, "get_state_slider_rect"):
+            slider = header.get_state_slider_rect()
+            if not slider.isEmpty():
+                hit = slider.adjusted(
+                    -self._HIT_PAD_SLIDER, -self._HIT_PAD_SLIDER,
+                    self._HIT_PAD_SLIDER, self._HIT_PAD_SLIDER,
+                )
+                if hit.contains(local_pos):
+                    from weave.canvas.undo_commands import NodePropertyCommand
+
+                    old = getattr(node, "_state", None)
+                    node.cycle_state()
+                    new = getattr(node, "_state", None)
+                    state._push_cmd(
+                        NodePropertyCommand(
+                            [(uid, old, new)], "set_state", "Cycle state"
+                        )
+                    )
+                    return True
+
+        return False
+
+
+# ============================================================================
+# DEFAULT INTERACTION STATE
+# ============================================================================
+
+class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
+    """Idle state: selection, movement, grid snapping, shake-to-disconnect.
+
+    Mouse-press logic is decomposed into an ordered handler chain
+    (``_press_handlers``).  Adding new interaction categories is a matter
+    of inserting a new handler — not patching a monolithic method.
     """
-    
+
     def __init__(self, canvas):
         super().__init__(canvas)
-        
-        # ===== CACHED STYLE PARAMETERS =====
-        # These are updated via _sync_style_cache() instead of property lookups
-        self._shake_enabled: bool = False
-        self._shake_timeout_ms: int = 500
-        self._shake_threshold: float = 50.0
-        self._shake_min_changes: int = 4
-        
-        # Initialize cache from StyleManager
-        self._sync_style_cache()
-        
-        # ===== SHAKE DETECTION =====
+
+        # ── Style cache (via mixin) ───────────────────────────────────
+        self._init_style_cache()
+
+        # ── Shake detection ───────────────────────────────────────────
         self._shake_recognizer = OptimizedShakeRecognizer(
             threshold=self._shake_threshold,
             min_changes=self._shake_min_changes,
             timeout_ms=self._shake_timeout_ms,
-            debug=False  # Set to True for debugging
         )
-        
-        # ===== DRAG STATE TRACKING =====
+
+        # ── Drag state ────────────────────────────────────────────────
         self._is_dragging = False
         self._drag_started_pos: Optional[QPointF] = None
-        self._last_mouse_pos: Optional[QPointF] = None  # For delta calculation
-        self._drag_start_positions: dict = {}  # {id(node): QPointF} — undo detection
-        
-        # ===== PROXY WIDGET INTERACTION =====
-        # When a click targets an interactive widget (QComboBox, QSpinBox …),
-        # _yield_to_proxy() temporarily clears ItemIsMovable on the parent
-        # node so that QGraphicsScene's default mousePressEvent does not
-        # initiate a drag — which would steal focus from the popup and
-        # close it immediately.  The flag is restored on mouse release.
+        self._last_mouse_pos: Optional[QPointF] = None
+        self._drag_start_positions: dict = {}
+
+        # ── Proxy widget interaction ──────────────────────────────────
         self._suppressed_movable_node: Optional[QGraphicsItem] = None
-        
-        # ===== SUBSCRIBE TO STYLE UPDATES =====
-        # When StyleManager emits style_changed for CANVAS category, update cache
-        if STYLEMANAGER_AVAILABLE:
-            try:
-                manager = StyleManager.instance()
-                manager.style_changed.connect(self._on_style_changed)
-            except Exception as e:
-                log.warning(f"Failed to subscribe to StyleManager: {e}")
-    
-    def _sync_style_cache(self):
-        """
-        Update cached style parameters from StyleManager.
 
-        This method is called:
-        1. During __init__ to populate initial values
-        2. When StyleManager.style_changed signal fires for CANVAS category
-        3. When canvas properties change (if canvas has shake_to_disconnect property)
+        # ── Handler chain (priority order) ────────────────────────────
+        self._press_handlers: list[InteractionHandler] = [
+            ProxyWidgetHandler(),
+            PortHandler(),
+            NodeButtonHandler(),
+        ]
 
-        Performance: O(1) - Direct attribute access, no hasattr or imports
-        """
-        # First priority: Check if canvas exposes shake_to_disconnect directly
-        if hasattr(self.canvas, 'shake_to_disconnect'):
-            self._shake_enabled = self.canvas.shake_to_disconnect
+    # ------------------------------------------------------------------
+    # Style-mixin hook
+    # ------------------------------------------------------------------
 
-        # Always pull detailed shake parameters from StyleManager when available.
-        # The canvas property only exposes the on/off toggle, not thresholds, so
-        # we always query StyleManager for the numeric settings regardless.
-        if STYLEMANAGER_AVAILABLE:
-            try:
-                manager = StyleManager.instance()
-                schema = manager.get_schema(StyleCategory.CANVAS)
+    def _on_style_cache_updated(self) -> None:
+        """Push refreshed values into the shake recogniser."""
+        rec = getattr(self, "_shake_recognizer", None)
+        if rec is not None:
+            rec.threshold = self._shake_threshold
+            rec.min_changes = self._shake_min_changes
+            rec.timeout_ms = self._shake_timeout_ms
 
-                if schema:
-                    # Only override _shake_enabled from schema if canvas doesn't expose it
-                    if not hasattr(self.canvas, 'shake_to_disconnect'):
-                        self._shake_enabled = getattr(schema, 'shake_to_disconnect', False)
-                    self._shake_timeout_ms = getattr(schema, 'shake_time_window_ms', 500)
-                    self._shake_threshold = float(getattr(schema, 'min_stroke_length', 50))
-                    self._shake_min_changes = getattr(schema, 'min_direction_changes', 4)
+    # ==================================================================
+    # WIDGET-EDITING API  (base class contract)
+    # ==================================================================
 
-                    # Update recognizer if it already exists (re-sync calls)
-                    if hasattr(self, '_shake_recognizer'):
-                        self._shake_recognizer.threshold = self._shake_threshold
-                        self._shake_recognizer.min_changes = self._shake_min_changes
-                        self._shake_recognizer.timeout_ms = self._shake_timeout_ms
+    @property
+    def suppressed_node(self) -> Optional[QGraphicsItem]:
+        """The node whose ``ItemIsMovable`` was cleared for widget focus."""
+        return self._suppressed_movable_node
 
-            except Exception as e:
-                log.debug(f"Style cache sync failed: {e}")
-        elif not hasattr(self.canvas, 'shake_to_disconnect'):
-            # Fallback: no StyleManager and no canvas property
-            self._shake_enabled = False
+    def exit_widget_editing(self) -> None:
+        """Restore the suppressed node and clear widget-editing state."""
+        self._restore_suppressed_node()
 
-        log.debug(
-            f"Shake cache sync: enabled={self._shake_enabled}, "
-            f"threshold={self._shake_threshold}, min_changes={self._shake_min_changes}, "
-            f"timeout={self._shake_timeout_ms}ms, "
-            f"StyleManager={'yes' if STYLEMANAGER_AVAILABLE else 'NO'}, "
-            f"canvas.shake_to_disconnect={getattr(self.canvas, 'shake_to_disconnect', '<missing>')}"
-        )
-    
-    def _on_style_changed(self, category, changes: dict):
-        """
-        Callback for StyleManager.style_changed signal.
-        
-        Only updates cache if CANVAS category changed and shake-related keys modified.
-        """
-        if category == StyleCategory.CANVAS:
-            shake_keys = {
-                'shake_to_disconnect', 
-                'shake_time_window_ms', 
-                'min_stroke_length',
-                'min_direction_changes'
-            }
-            
-            if any(key in changes for key in shake_keys):
-                self._sync_style_cache()
-                log.debug("Shake parameters updated from StyleManager")
-    
-    # ── Interactive proxy-widget detection ─────────────────────────────
+    # ==================================================================
+    # PROXY-WIDGET HELPERS
+    # ==================================================================
 
     def _is_interactive_widget_click(self, scene_pos: QPointF) -> bool:
-        """
-        Returns True if *scene_pos* lands on an interactive child widget
-        (QComboBox, QSpinBox, QLineEdit …) inside a node's WidgetCore.
-
-        Goes through the node → WidgetCore → is_interactive_at() path,
-        which correctly maps scene → widget coordinates and checks the
-        deepest child under the cursor.  Returns False for clicks on
-        empty canvas, header, ports, body background, labels, or any
-        non-interactive area — so normal canvas interaction is unaffected.
-        """
+        """True if *scene_pos* hits an interactive widget inside a node."""
         node = ItemResolver.resolve_node_at(self.canvas, scene_pos)
         if node is None:
             return False
-
-        core = getattr(node, '_widget_core', None)
+        core = getattr(node, "_widget_core", None)
         if core is None:
-            log.warning(f"No weave core found on node {node}")
             return False
-
         return core.is_interactive_at(scene_pos)
 
     def _yield_to_proxy(self, scene_pos: QPointF) -> bool:
-        """
-        Handle a click that landed on an interactive widget inside a node.
+        """Activate or focus the widget at *scene_pos*.
 
-        Two strategies are tried in order:
-
-        1. **Direct activation** (popup widgets like ProxySafeComboBox):
-           Calls ``WidgetCore.activate_at(scene_pos)`` which finds the
-           widget, computes the correct global screen position through
-           the proxy → scene → view → screen coordinate chain, and
-           calls ``widget.show_popup(global_pos)`` directly.
-           Returns **True** — the event is fully consumed.
-
-           This is necessary because ``QGraphicsScene.mousePressEvent``
-           delivers mouse events to the topmost *parent* item (the node),
-           whose ``QGraphicsItem.mousePressEvent`` accepts the event and
-           becomes the mouse grabber.  The proxy and its embedded
-           QPushButton never receive the press or the subsequent release,
-           so ``QPushButton.clicked`` never fires through normal routing.
-
-        2. **Proxy focus path** (non-popup widgets like QSpinBox, QLineEdit):
-           Sets focus on the proxy, suppresses ``ItemIsMovable`` on the
-           parent node, and returns **False** so that ``Canvas`` calls
-           ``super().mousePressEvent(event)`` which lets Qt route the
-           event through the proxy to the embedded widget.  These widgets
-           don't spawn popups so the proxy routing works for them.
+        Strategy 1 — direct activation (popup widgets): fully consumed.
+        Strategy 2 — proxy focus (spinbox, line-edit): returns False so
+        Qt's default routing delivers the event to the proxy.
         """
         node = ItemResolver.resolve_node_at(self.canvas, scene_pos)
         if node is None:
             return False
 
-        core = getattr(node, '_widget_core', None)
+        core = getattr(node, "_widget_core", None)
         if core is None:
-            log.warning(f"No weave core found on node {node}")
             return False
 
-        # ── Strategy 1: Direct activation for popup widgets ──────────
-        # Bypasses Qt event delivery entirely.  activate_at() returns
-        # True only for widgets that expose a show_popup() method.
         if core.activate_at(scene_pos):
-            return True   # event fully consumed — popup is open
+            return True  # popup opened — event consumed
 
-        # ── Strategy 2: Proxy focus path for normal widgets ──────────
         proxy = core.get_proxy()
         if proxy is not None:
             proxy.setFocus(Qt.FocusReason.MouseFocusReason)
 
-        # Temporarily suppress node dragging so QGraphicsScene's default
-        # mousePressEvent doesn't start a move operation on the node.
-        # The flag is restored on the next mouse release.
         if node.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable:
             node.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
             self._suppressed_movable_node = node
 
-        return False   # let Qt's native event router handle delivery
+        return False  # let Qt route to the proxy
 
-    # ── Event handlers ────────────────────────────────────────────────
-
-    def _ensure_node_selected(self, scene_pos: QPointF, event: QGraphicsSceneMouseEvent) -> None:
-        """
-        Ensure the node under *scene_pos* is selected before a widget
-        interaction begins.
-
-        If the node is already selected, this is a no-op.  Otherwise the
-        node is selected (respecting Ctrl for additive selection) exactly
-        as Qt's default ``mousePressEvent`` would do.  This guarantees
-        that clicking directly on a widget inside an unselected node
-        selects the node *and* activates the widget in a single click.
-        """
+    def _ensure_node_selected(
+        self, scene_pos: QPointF, event: QGraphicsSceneMouseEvent
+    ) -> None:
         node = ItemResolver.resolve_node_at(self.canvas, scene_pos)
         if node is None or node.isSelected():
             return
-
-        # Ctrl held → additive selection; otherwise exclusive
         if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             self.canvas.clearSelection()
         node.setSelected(True)
 
-    def on_mouse_press(self, event: QGraphicsSceneMouseEvent) -> bool:
-        """
-        Handle mouse press events.
-        
-        PATCHED: Added proxy widget detection to allow interactive widgets
-                 like dropdowns and spinboxes to receive click events properly.
-        PATCHED: Node is now selected before yielding to the widget so that
-                 clicking a widget inside an unselected node selects the node
-                 and activates the widget in one click.
-        """
-        # ──── Interactive-widget fast-path ─────────────────────────
-        if self._is_interactive_widget_click(event.scenePos()):
-            self._ensure_node_selected(event.scenePos(), event)
-            return self._yield_to_proxy(event.scenePos())
-        # ──── END proxy detection ──────────────────────────────────
-
-        # ── Exiting widget-editing mode ───────────────────────────
-        # The user clicked somewhere that is NOT an interactive widget
-        # (empty canvas, node header, port, etc.).  If a previous
-        # interaction left us in widget-editing mode, clean it up now
-        # so normal canvas behaviour resumes immediately.
-        if self._suppressed_movable_node is not None:
+    def _restore_suppressed_node(self) -> None:
+        """Restore ItemIsMovable on a node we suppressed for widget focus."""
+        node = self._suppressed_movable_node
+        if node is not None:
             try:
-                self._suppressed_movable_node.setFlag(
+                node.setFlag(
                     QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True
                 )
             except RuntimeError:
                 pass  # node already deleted
             self._suppressed_movable_node = None
 
-        # Clear proxy focus so canvas shortcuts become active again
+    # ==================================================================
+    # MOUSE PRESS  (handler chain — Review §3)
+    # ==================================================================
+
+    def on_mouse_press(self, event: QGraphicsSceneMouseEvent) -> bool:
+        """Delegate to the handler chain; fall through to drag setup."""
+
+        # ── Run handler chain ─────────────────────────────────────────
+        for handler in self._press_handlers:
+            if handler.try_handle(event, self):
+                return True
+
+        # ── No handler consumed → clean up widget-editing mode ────────
+        if self._suppressed_movable_node is not None:
+            self._restore_suppressed_node()
+
         focus_item = self.canvas.focusItem()
         if isinstance(focus_item, QGraphicsProxyWidget):
             focus_item.clearFocus()
 
-        log.debug("DefaultInteractionState.on_mouse_press: Initializing drag state")
-        
-        # Reset shake and drag tracking.
-        # _is_dragging stays False until we confirm that no port or button
-        # consumed the press — only then will Qt's default handler start a
-        # node drag, and only then does shake tracking make sense.
+        # ── Prepare drag tracking ─────────────────────────────────────
         self._shake_recognizer.reset()
         self._is_dragging = False
         self._drag_started_pos = None
         self._last_mouse_pos = None
-        
+
         if event.button() != Qt.MouseButton.LeftButton:
             return False
-            
-        # Check for port interaction
-        port = ItemResolver.resolve_port_at(self.canvas, event.scenePos())
-        if port is not None:
-            return self._handle_port_press(port, event)
-        
-        # Check for node button interaction
-        if self._handle_node_button_press(event):
-            return True
-        
-        # No port or button consumed the press — Qt's default handler will
-        # initiate a node drag via ItemIsMovable.  Enable shake tracking.
+
         self._is_dragging = True
 
-        # Snapshot positions of all selected movable nodes so we can detect
-        # actual movement on release and create an undo checkpoint.
+        # Snapshot positions for undo
         self._drag_start_positions = {
             id(item): item.pos()
-            for item in self.canvas.selectedItems()
-            if (item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
-            and not isinstance(item, (NodeTrace, DragTrace))
+            for item in get_movable_nodes(self.canvas.selectedItems())
         }
-        return False
-    
-    def _handle_port_press(self, port: NodePort, event: QGraphicsSceneMouseEvent) -> bool:
-        """Handle press on a port - either start new drag or prepare detachment."""
-        # Deferred import to break the DefaultInteractionState ↔ ConnectionDragState cycle.
-        from weave.canvas.states.connection_drag_state import ConnectionDragState
-        # Summary ports on minimized nodes must not allow connection dragging.
-        if getattr(port, 'is_summary_port', False):
-            return False
 
-        # Input port with existing connection - prepare for detachment
-        if not port.is_output and port.connected_traces:
-            trace = port.connected_traces[0]
-            original_source = trace.source
-            
-            if original_source:
-                self.canvas.set_state(ConnectionDragState(
-                    self.canvas, 
-                    original_source,
-                    pending_detach_port=port,
-                    pending_detach_trace=trace
-                ))
-                event.accept()
-                return True
-        
-        # Start new connection drag
-        self.canvas.set_state(ConnectionDragState(self.canvas, port))
-        event.accept()
-        return True
-    
-    def _handle_node_button_press(self, event: QGraphicsSceneMouseEvent) -> bool:
-        """Handle press on node header buttons (minimize, state slider)."""
-        from weave.canvas.undo_commands import NodePropertyCommand
+        # Also capture the node directly under the cursor (it may not
+        # be in selectedItems yet because Qt hasn't processed the press).
+        item_under = ItemResolver.resolve_node_at(
+            self.canvas, event.scenePos()
+        )
+        if (
+            item_under is not None
+            and id(item_under) not in self._drag_start_positions
+            and (item_under.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+            and not isinstance(item_under, (NodeTrace, DragTrace))
+        ):
+            self._drag_start_positions[id(item_under)] = item_under.pos()
 
-        node = ItemResolver.resolve_node_at(self.canvas, event.scenePos())
-        
-        if node is None:
-            return False
-        
-        local_pos = node.mapFromScene(event.scenePos())
-        header = node.header
-        uid = get_node_uid(node)
-        
-        # Check minimize button
-        if hasattr(header, 'get_minimize_btn_rect'):
-            btn_rect = header.get_minimize_btn_rect()
-            if not btn_rect.isEmpty():
-                hit_box = btn_rect.adjusted(-5, -5, 5, 5)
-                if hit_box.contains(local_pos):
-                    old_min = getattr(node, '_minimized', False)
-                    node.toggle_minimize()
-                    new_min = getattr(node, '_minimized', not old_min)
-                    self._push_cmd(NodePropertyCommand(
-                        [(uid, old_min, new_min)],
-                        'toggle_minimize', 'Toggle minimize',
-                    ))
-                    return True
-        
-        # Legacy minimize button support
-        elif hasattr(header, '_min_btn_rect'):
-            hit_box = header._min_btn_rect.adjusted(-5, -5, 5, 5)
-            if hit_box.contains(local_pos):
-                old_min = getattr(node, '_minimized', False)
-                node.toggle_minimize()
-                new_min = getattr(node, '_minimized', not old_min)
-                self._push_cmd(NodePropertyCommand(
-                    [(uid, old_min, new_min)],
-                    'toggle_minimize', 'Toggle minimize',
-                ))
-                return True
-        
-        # Check state slider
-        if hasattr(header, 'get_state_slider_rect'):
-            slider_rect = header.get_state_slider_rect()
-            if not slider_rect.isEmpty():
-                hit_box = slider_rect.adjusted(-3, -3, 3, 3)
-                if hit_box.contains(local_pos):
-                    old_state = getattr(node, '_state', None)
-                    node.cycle_state()
-                    new_state = getattr(node, '_state', None)
-                    self._push_cmd(NodePropertyCommand(
-                        [(uid, old_state, new_state)],
-                        'set_state', 'Cycle state',
-                    ))
-                    return True
-        
-        # Legacy state icon support
-        if hasattr(header, '_state_icon_rect'):
-            hit_box = header._state_icon_rect.adjusted(-5, -5, 5, 5)
-            if hit_box.contains(local_pos):
-                old_state = getattr(node, '_state', None)
-                node.cycle_state()
-                new_state = getattr(node, '_state', None)
-                self._push_cmd(NodePropertyCommand(
-                    [(uid, old_state, new_state)],
-                    'set_state', 'Cycle state',
-                ))
-                return True
-        
-        return False
-    
-    def _handle_double_click_interactions(self, event: QGraphicsSceneMouseEvent) -> bool:
-        """Handle non-title double-click interactions including cloning and port clearing."""
-        # Clone: Ctrl + Left Double Click
-        if (event.modifiers() & Qt.KeyboardModifier.ControlModifier and
-            event.button() == Qt.MouseButton.LeftButton):
-            
-            target_node = ItemResolver.resolve_node_at(self.canvas, event.scenePos())
-            
-            if target_node is not None:
-                self._execute_clone(target_node)
-                return True
-    
-        # Port Clear: Left Double Click
-        port = ItemResolver.resolve_port_at(self.canvas, event.scenePos())
-        if port is not None and event.button() == Qt.MouseButton.LeftButton:
-            from weave.canvas.undo_commands import RemoveConnectionsCommand, _get_port_lists
-            conn_tuples = []
-            traces_to_remove = []
-            if hasattr(port, 'is_output') and hasattr(port, 'connected_traces'):
-                target_traces = list(port.connected_traces) if port.is_output else (
-                    [port.connected_traces[0]] if port.connected_traces else []
-                )
-                for trace in target_traces:
-                    if not trace:
-                        continue
-                    src = getattr(trace, 'source', None)
-                    dst = getattr(trace, 'target', None)
-                    if src and dst:
-                        src_node = getattr(src, 'node', None)
-                        dst_node = getattr(dst, 'node', None)
-                        if src_node and dst_node:
-                            _, out = _get_port_lists(src_node)
-                            in_list, _ = _get_port_lists(dst_node)
-                            try:
-                                conn_tuples.append((
-                                    get_node_uid(src_node),
-                                    out.index(src),
-                                    get_node_uid(dst_node),
-                                    in_list.index(dst),
-                                ))
-                            except ValueError:
-                                pass
-                    traces_to_remove.append(trace)
+        return False  # let Qt handle selection / drag initiation
 
-            for trace in traces_to_remove:
-                ConnectionFactory.remove(trace)
+    # ==================================================================
+    # MOUSE MOVE  (performance-critical)
+    # ==================================================================
 
-            if conn_tuples:
-                self._push_cmd(RemoveConnectionsCommand(conn_tuples))
-            return True
-        
-        return False
-    
-    def on_mouse_double_click(self, event: QGraphicsSceneMouseEvent) -> bool:
-        """Handle mouse double click."""
-        # ──── Interactive-widget fast-path ─────────────────────────
-        if self._is_interactive_widget_click(event.scenePos()):
-            self._ensure_node_selected(event.scenePos(), event)
-            return self._yield_to_proxy(event.scenePos())
-        # ──── END proxy detection ──────────────────────────────────
-
-        # Check for title editing first
-        node = ItemResolver.resolve_node_at(self.canvas, event.scenePos())
-        
-        if node is not None and hasattr(node, 'header') and hasattr(node.header, '_title'):
-            scene_pos = event.scenePos()
-            local_in_node = node.mapFromScene(scene_pos)
-            local_in_header = node.header.mapFromParent(local_in_node)
-            local_in_title = node.header._title.mapFromParent(local_in_header)
-            
-            if node.header._title.contains(local_in_title):
-                node.header._title.unlock_interaction()
-                event.accept()
-                return True
-        
-        # Handle cloning or port clearing
-        return self._handle_double_click_interactions(event)
-    
-    def _execute_clone(self, target_node: QGraphicsItem) -> None:
-        """Execute cloning via CanvasCommandsMixin which handles undo."""
-        # Route through cmd_duplicate so undo commands are created
-        provider = getattr(self.canvas, '_context_menu_provider', None)
-        if provider is not None:
-            # Temporarily ensure target is selected for cmd_duplicate logic
-            if target_node.isSelected():
-                provider.cmd_duplicate_selected()
-            else:
-                provider.cmd_duplicate(target_node)
-    
     def on_mouse_move(self, event: QGraphicsSceneMouseEvent) -> bool:
-        """
-        Handle mouse movement - PERFORMANCE OPTIMIZED.
-        
-        Key optimizations:
-        - Uses cached self._shake_enabled instead of property lookup
-        - Calculates delta from previous position (no absolute coordinate dependency)
-        - No dynamic imports or hasattr checks in hot path
-        
-        Performance: O(1) - All operations are constant time
-        """
-        # ── Widget-editing mode ───────────────────────────────────────
-        # When the user is interacting with an embedded widget (e.g.
-        # click-dragging to select text in a QLineEdit / QTextEdit),
-        # return False immediately so that Canvas.mouseMoveEvent calls
-        # super() which routes the move through the proxy to the widget.
         if self._suppressed_movable_node is not None:
-            return False
+            return False  # let Qt route move to the proxy widget
 
-        # Only process shake during active left-button drag
         if not (self._is_dragging and (event.buttons() & Qt.MouseButton.LeftButton)):
-            # Reset state if not dragging
             self._drag_started_pos = None
             self._last_mouse_pos = None
             return False
-        
-        # PERFORMANCE CRITICAL PATH: Use cached flag instead of property
+
         if not self._shake_enabled:
             return False
-        
-        curr_pos = event.scenePos()
-        
-        # Initialize drag tracking on first move
+
+        curr = event.scenePos()
+
         if self._drag_started_pos is None:
-            self._drag_started_pos = curr_pos
-            self._last_mouse_pos = curr_pos
+            self._drag_started_pos = curr
+            self._last_mouse_pos = curr
             self._shake_recognizer.reset()
             return False
-        
-        # Check minimum movement to confirm real drag (not just click)
-        delta_from_start = curr_pos - self._drag_started_pos
-        if delta_from_start.manhattanLength() <= 3.0:
+
+        if (curr - self._drag_started_pos).manhattanLength() <= 3.0:
             return False
-        
-        # PERFORMANCE CRITICAL: Calculate delta from last position
+
         if self._last_mouse_pos is not None:
-            delta = curr_pos - self._last_mouse_pos
-            
-            # Update shake recognizer with delta (not absolute position)
+            delta = curr - self._last_mouse_pos
             if self._shake_recognizer.update(delta):
                 log.info("Shake gesture detected!")
                 self._trigger_shake_disconnect()
-                return True  # Consume event
-        
-        self._last_mouse_pos = curr_pos
-        return False
-        
-    def apply_grid_snapping(self, event: QGraphicsSceneMouseEvent) -> None:
-        """Apply grid snapping and update traces for movable selected items."""
-        if not (event.buttons() & Qt.MouseButton.LeftButton):
-            return
-        
-        movable_items = [
-            item for item in self.canvas.selectedItems() 
-            if item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable
-        ]
-        
-        if not movable_items:
-            return
-        
-        # Determine effective snapping state (considering Ctrl toggle)
-        effective_snapping_enabled = self.canvas.snapping_enabled
-        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            effective_snapping_enabled = not self.canvas.snapping_enabled
-        
-        # Apply grid snapping if enabled
-        if effective_snapping_enabled:
-            self.canvas._orchestrator.snap_items_to_grid(
-                movable_items, 
-                self.canvas.grid_spacing
-            )
-        else:
-            # Update traces even without snapping
-            for item in movable_items:
-                self._update_node_traces(item)
-    
-    def _update_node_traces(self, node: QGraphicsItem) -> None:
-        """Update all traces connected to a node's ports."""
-        ports = getattr(node, 'inputs', []) + getattr(node, 'outputs', [])
-        for port in ports:
-            for trace in getattr(port, 'connected_traces', []):
-                trace.update_path()
-    
-    def on_mouse_release(self, event: QGraphicsSceneMouseEvent) -> bool:
-        """Handle mouse release - reset drag and shake state."""
-        log.debug("DefaultInteractionState.on_mouse_release: Resetting all states")
-        
-        # Restore movable flag if we suppressed it for a widget click
-        node = self._suppressed_movable_node
-        if node is not None:
-            try:
-                node.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
-            except RuntimeError:
-                pass  # node may have been deleted
-            self._suppressed_movable_node = None
+                return True
 
-        # ── Undo command if nodes actually moved ──────────────────
+        self._last_mouse_pos = curr
+        return False
+
+    # ==================================================================
+    # MOUSE RELEASE
+    # ==================================================================
+
+    def on_mouse_release(self, event: QGraphicsSceneMouseEvent) -> bool:
+        self._restore_suppressed_node()
+
+        # ── Undo command for moved nodes ──────────────────────────────
         if self._is_dragging and self._drag_start_positions:
             from weave.canvas.undo_commands import MoveNodesCommand
+
             moves = {}
             for item in self.canvas.selectedItems():
                 old_pos = self._drag_start_positions.get(id(item))
@@ -648,232 +418,226 @@ class DefaultInteractionState(CanvasInteractionState):
                     moves[uid] = (old_pos, item.pos())
             if moves:
                 self._push_cmd(MoveNodesCommand(moves))
-        
+
         self._shake_recognizer.reset()
         self._is_dragging = False
         self._drag_started_pos = None
         self._last_mouse_pos = None
         self._drag_start_positions = {}
         return False
-    
-    def _trigger_shake_disconnect(self):
-        """
-        Execute shake-to-disconnect operation.
-        
-        Disconnects all traces from nodes that were being dragged.
-        """
-        from weave.canvas.undo_commands import RemoveConnectionsCommand, _get_port_lists
-        log.info("Shake gesture detected - Disconnecting nodes")
 
-        movable_nodes = []
+    # ==================================================================
+    # DOUBLE CLICK
+    # ==================================================================
 
-        # Primary: resolve the node under the original press position
-        if self._drag_started_pos is not None:
-            node_under_cursor = ItemResolver.resolve_node_at(
-                self.canvas, self._drag_started_pos
+    def on_mouse_double_click(self, event: QGraphicsSceneMouseEvent) -> bool:
+        # Interactive widget fast-path
+        if self._is_interactive_widget_click(event.scenePos()):
+            self._ensure_node_selected(event.scenePos(), event)
+            return self._yield_to_proxy(event.scenePos())
+
+        # Title editing
+        node = ItemResolver.resolve_node_at(self.canvas, event.scenePos())
+        if node is not None and hasattr(node, "header") and hasattr(node.header, "_title"):
+            local_title = node.header._title.mapFromParent(
+                node.header.mapFromParent(node.mapFromScene(event.scenePos()))
             )
-            if (node_under_cursor is not None
-                    and node_under_cursor.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable
-                    and not isinstance(node_under_cursor, (NodeTrace, DragTrace))):
-                movable_nodes = [node_under_cursor]
+            if node.header._title.contains(local_title):
+                node.header._title.unlock_interaction()
+                event.accept()
+                return True
 
-        # Fallback: use selected movable nodes
-        if not movable_nodes:
-            movable_nodes = [
-                item for item in self.canvas.selectedItems()
-                if (item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable) and
-                   not isinstance(item, (NodeTrace, DragTrace))
-            ]
-        
-        if not movable_nodes:
-            log.debug("No movable nodes for shake disconnect")
-            return
-        
-        # Capture connections BEFORE removing
-        conn_tuples = []
-        traces_to_remove = set()
-        seen = set()
+        return self._handle_double_click_interactions(event)
 
-        for node in movable_nodes:
-            for port_attr in ('inputs', 'outputs'):
-                for port in getattr(node, port_attr, []):
-                    if hasattr(port, 'connected_traces'):
-                        for trace in list(port.connected_traces):
-                            if id(trace) in seen:
-                                continue
-                            seen.add(id(trace))
-                            traces_to_remove.add(trace)
-                            src = getattr(trace, 'source', None)
-                            dst = getattr(trace, 'target', None)
-                            if src and dst:
-                                src_node = getattr(src, 'node', None)
-                                dst_node = getattr(dst, 'node', None)
-                                if src_node and dst_node:
-                                    _, out = _get_port_lists(src_node)
-                                    in_list, _ = _get_port_lists(dst_node)
-                                    try:
-                                        conn_tuples.append((
-                                            get_node_uid(src_node),
-                                            out.index(src),
-                                            get_node_uid(dst_node),
-                                            in_list.index(dst),
-                                        ))
-                                    except ValueError:
-                                        pass
+    def _handle_double_click_interactions(
+        self, event: QGraphicsSceneMouseEvent
+    ) -> bool:
+        """Clone (Ctrl+dbl-click) or clear port connections (dbl-click)."""
+        # Clone
+        if (
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            target = ItemResolver.resolve_node_at(self.canvas, event.scenePos())
+            if target is not None:
+                self._execute_clone(target)
+                return True
 
-        # Execute removal
-        disconnect_count = 0
-        for trace in traces_to_remove:
-            ConnectionFactory.remove(trace)
-            disconnect_count += 1
-                
-        if disconnect_count:
-            log.info(f"Shake disconnected {disconnect_count} traces")
-            print(f"✓ Shake disconnected {disconnect_count} connections")
-            if conn_tuples:
-                self._push_cmd(RemoveConnectionsCommand(conn_tuples))
-
-    def keyPressEvent(self, event: QKeyEvent) -> bool:
-        """
-        Handle keyboard shortcuts for canvas operations.
-
-        All command logic is delegated to :class:`CanvasCommandsMixin` via
-        ``canvas._context_menu_provider``.
-
-        Focus guard
-        -----------
-        When a ``QGraphicsProxyWidget`` holds focus (i.e. the user is
-        interacting with an embedded widget such as a ``QLineEdit``,
-        ``QTextEdit``, ``QComboBox``, or ``QSpinBox``), **all** shortcut
-        processing is skipped and the method returns ``False`` so that
-        Qt's normal event routing delivers the key to the widget.
-
-        Without this guard, keys like Backspace and Delete are consumed
-        by the state machine before the proxy can forward them, causing
-        the scene to delete nodes / connections instead of editing text.
-
-        Shortcuts:
-        - Delete:             Delete selected nodes
-        - Backspace:          Disconnect all traces from selected nodes
-        - Ctrl+D:             Duplicate selected nodes
-        - Ctrl+A:             Select all nodes
-        - Ctrl+N:             New canvas
-        - Ctrl+O:             Open file
-        - Ctrl+S:             Save file
-        - Ctrl+Shift+S:       Save As  (checked BEFORE Ctrl+S to avoid shadowing)
-        - Ctrl+Z:             Undo
-        - Ctrl+Shift+Z:       Redo  (checked BEFORE bare Ctrl+Z to avoid shadowing)
-        - Ctrl+Shift+C:       Clear canvas
-        - Alt+[1-9]:          Open recent file by index
-        """
-        # ── Focus guard: yield to embedded widgets ─────────────────────
-        # When the user is interacting with an embedded widget inside a
-        # node, all shortcut processing is skipped.  The primary guard
-        # lives in Canvas.keyPressEvent (which also force-accepts the
-        # event); this is a defence-in-depth layer.
-        #
-        # Three independent signals are checked:
-        # 1. _suppressed_movable_node is set (widget interaction active)
-        # 2. A QGraphicsProxyWidget holds keyboard focus
-        # 3. A QGraphicsTextItem with TextEditorInteraction flags holds
-        #    keyboard focus (e.g. EditableTitle in editing mode)
-        if self._suppressed_movable_node is not None:
-            return False
-        focus_item = self.canvas.focusItem()
-        if isinstance(focus_item, QGraphicsProxyWidget):
-            return False
-        if isinstance(focus_item, QGraphicsTextItem):
-            if focus_item.textInteractionFlags() & Qt.TextInteractionFlag.TextEditable:
-                return False
-        # ── End focus guard ────────────────────────────────────────────
-
-        modifiers = event.modifiers()
-        key = event.key()
-        ctrl  = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
-        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
-        alt   = bool(modifiers & Qt.KeyboardModifier.AltModifier)
-
-        # ── Shortcuts that don't need the provider ─────────────────
-        if key == Qt.Key.Key_Delete:
-            self._cmd('cmd_delete_selected')
-            return True
-
-        if key == Qt.Key.Key_Backspace:
-            self._cmd('cmd_disconnect_selected')
-            return True
-
-        if key == Qt.Key.Key_D and ctrl:
-            self._cmd('cmd_duplicate_selected')
-            return True
-
-        if key == Qt.Key.Key_A and ctrl:
-            self._cmd('cmd_select_all')
-            return True
-
-        # ── File shortcuts ──────────────────────────────────────────
-        # IMPORTANT: Ctrl+Shift+S must be checked before Ctrl+S alone,
-        # because Ctrl+S also matches when Shift is held.
-        if key == Qt.Key.Key_S and ctrl and shift:
-            self._cmd('cmd_save_as')
-            return True
-
-        if key == Qt.Key.Key_S and ctrl:
-            self._cmd('cmd_save')
-            return True
-
-        if key == Qt.Key.Key_N and ctrl:
-            self._cmd('cmd_new')
-            return True
-
-        if key == Qt.Key.Key_O and ctrl:
-            self._cmd('cmd_open')
-            return True
-
-        if key == Qt.Key.Key_C and ctrl and shift:
-            self._cmd('cmd_clear_canvas')
-            return True
-
-        # ── Undo / Redo ────────────────────────────────────────────
-        # IMPORTANT: Ctrl+Shift+Z must be checked before Ctrl+Z alone,
-        # because Ctrl+Z also matches when Shift is held.
-        if key == Qt.Key.Key_Z and ctrl and shift:
-            self._cmd('cmd_redo')
-            return True
-
-        if key == Qt.Key.Key_Z and ctrl:
-            self._cmd('cmd_undo')
-            return True
-
-        # ── Recent files (Alt+1 … Alt+9) ───────────────────────────
-        if alt and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
-            index = key - Qt.Key.Key_1  # 0-based
-            self._cmd('cmd_open_recent_by_index', index)
+        # Port clear
+        port = ItemResolver.resolve_port_at(self.canvas, event.scenePos())
+        if port is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._clear_port_connections(port)
             return True
 
         return False
 
-    def _cmd(self, method_name: str, *args):
-        """
-        Call ``method_name(*args)`` on the canvas's ContextMenuProvider.
+    def _execute_clone(self, target_node: QGraphicsItem) -> None:
+        provider = getattr(self.canvas, "_context_menu_provider", None)
+        if provider is None:
+            return
+        if target_node.isSelected():
+            provider.cmd_duplicate_selected()
+        else:
+            provider.cmd_duplicate(target_node)
 
-        The provider inherits from :class:`CanvasCommandsMixin` so all
-        ``cmd_*`` methods are available there.  Failing gracefully keeps
-        shortcuts silent when the provider isn't set up yet.
-        """
+    def _clear_port_connections(self, port: NodePort) -> None:
+        """Remove connections from *port* and push an undo command."""
+        from weave.canvas.undo_commands import RemoveConnectionsCommand
+
+        traces = list(port.connected_traces) if port.is_output else (
+            [port.connected_traces[0]] if port.connected_traces else []
+        )
+        tuples = build_connection_tuples(traces)
+        for trace in traces:
+            ConnectionFactory.remove(trace)
+        if tuples:
+            self._push_cmd(RemoveConnectionsCommand(tuples))
+
+    # ==================================================================
+    # GRID SNAPPING
+    # ==================================================================
+
+    def apply_grid_snapping(self, event: QGraphicsSceneMouseEvent) -> None:
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+
+        movable = [
+            item
+            for item in self.canvas.selectedItems()
+            if item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+        ]
+        if not movable:
+            return
+
+        effective = self.canvas.snapping_enabled
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            effective = not effective
+
+        if effective:
+            self.canvas._orchestrator.snap_items_to_grid(
+                movable, self.canvas.grid_spacing
+            )
+        else:
+            for item in movable:
+                self._update_node_traces(item)
+
+    @staticmethod
+    def _update_node_traces(node: QGraphicsItem) -> None:
+        for port in getattr(node, "inputs", []) + getattr(node, "outputs", []):
+            for trace in getattr(port, "connected_traces", []):
+                trace.update_path()
+
+    # ==================================================================
+    # SHAKE DISCONNECT
+    # ==================================================================
+
+    def _trigger_shake_disconnect(self) -> None:
+        from weave.canvas.undo_commands import RemoveConnectionsCommand
+
+        # Resolve target nodes
+        nodes: list[QGraphicsItem] = []
+        if self._drag_started_pos is not None:
+            under = ItemResolver.resolve_node_at(
+                self.canvas, self._drag_started_pos
+            )
+            if under is not None and under in get_movable_nodes([under]):
+                nodes = [under]
+        if not nodes:
+            nodes = get_movable_nodes(self.canvas.selectedItems())
+        if not nodes:
+            return
+
+        # Collect unique traces
+        traces: set = set()
+        for node in nodes:
+            for attr in ("inputs", "outputs"):
+                for port in getattr(node, attr, []):
+                    for trace in list(getattr(port, "connected_traces", [])):
+                        traces.add(trace)
+
+        tuples = build_connection_tuples(traces)
+
+        removed = 0
+        for trace in traces:
+            ConnectionFactory.remove(trace)
+            removed += 1
+
+        if removed:
+            log.info(f"Shake disconnected {removed} traces")
+            if tuples:
+                self._push_cmd(RemoveConnectionsCommand(tuples))
+
+    # ==================================================================
+    # KEYBOARD
+    # ==================================================================
+
+    def keyPressEvent(self, event: QKeyEvent) -> bool:
+        mod = event.modifiers()
+        key = event.key()
+        ctrl = bool(mod & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mod & Qt.KeyboardModifier.ShiftModifier)
+        alt = bool(mod & Qt.KeyboardModifier.AltModifier)
+
+        # ── Undo / Redo: always fire, regardless of widget focus ──────
+        # Must come before the focus guard so that Ctrl+Z / Ctrl+Shift+Z
+        # work even when a proxy widget or editable text item has focus.
+        if ctrl and not alt and key == Qt.Key.Key_Z:
+            self._cmd("cmd_redo" if shift else "cmd_undo")
+            return True
+
+        # ── Focus guard: yield all other keys to embedded widgets ─────
+        if self._suppressed_movable_node is not None:
+            return False
+        focus = self.canvas.focusItem()
+        if isinstance(focus, QGraphicsProxyWidget):
+            return False
+        if isinstance(focus, QGraphicsTextItem):
+            if focus.textInteractionFlags() & Qt.TextInteractionFlag.TextEditable:
+                return False
+
+        # Shortcuts — compound modifiers checked first to avoid shadowing
+        _SHORTCUTS: list[tuple] = [
+            (Qt.Key.Key_Delete, False, False, False, "cmd_delete_selected"),
+            (Qt.Key.Key_Backspace, False, False, False, "cmd_disconnect_selected"),
+            (Qt.Key.Key_D, True, False, False, "cmd_duplicate_selected"),
+            (Qt.Key.Key_A, True, False, False, "cmd_select_all"),
+            (Qt.Key.Key_S, True, True, False, "cmd_save_as"),
+            (Qt.Key.Key_S, True, False, False, "cmd_save"),
+            (Qt.Key.Key_N, True, False, False, "cmd_new"),
+            (Qt.Key.Key_O, True, False, False, "cmd_open"),
+            (Qt.Key.Key_C, True, True, False, "cmd_clear_canvas"),
+        ]
+
+        for sc_key, sc_ctrl, sc_shift, sc_alt, cmd_name in _SHORTCUTS:
+            if key == sc_key and ctrl == sc_ctrl and shift == sc_shift and alt == sc_alt:
+                self._cmd(cmd_name)
+                return True
+
+        # Recent files: Alt+1 … Alt+9
+        if alt and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+            self._cmd("cmd_open_recent_by_index", key - Qt.Key.Key_1)
+            return True
+
+        return False
+
+    # ==================================================================
+    # COMMAND HELPERS
+    # ==================================================================
+
+    def _cmd(self, method_name: str, *args) -> None:
         provider: Optional[CanvasCommandsMixin] = getattr(
-            self.canvas, '_context_menu_provider', None
+            self.canvas, "_context_menu_provider", None
         )
         if provider is None:
-            log.debug(f"_cmd({method_name}): no _context_menu_provider on canvas")
+            log.debug(f"_cmd({method_name}): no provider")
             return
         fn = getattr(provider, method_name, None)
         if fn is None:
-            log.warning(f"_cmd: provider has no method '{method_name}'")
+            log.warning(f"_cmd: provider missing '{method_name}'")
             return
         fn(*args)
 
     def _push_cmd(self, cmd) -> None:
-        """Push an undo command via the canvas's ContextMenuProvider."""
-        provider = getattr(self.canvas, '_context_menu_provider', None)
-        if provider is not None and hasattr(provider, '_undo_manager'):
+        provider = getattr(self.canvas, "_context_menu_provider", None)
+        if provider is not None and hasattr(provider, "_undo_manager"):
             provider._undo_manager.push(cmd)

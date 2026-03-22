@@ -6,21 +6,15 @@ Copyright (c) 2026 opticsWolf
 
 SPDX-License-Identifier: Apache-2.0
 
-Canvas v12 - Performance Optimized
-Integrates optimized connection dragging, port interaction, and context menu
-with streamlined event handling and cached style access.
+Canvas v13 - Refactored State Machine Integration
+Integrates the decoupled state machine with factory-based transitions,
+chain-of-responsibility event handling, and shared utilities.
 
-Performance Optimizations (v12):
-1. Cached style properties - no StyleManager.get() calls in properties/hot paths
-2. Observer pattern for style updates - cache refreshed only when styles change  
-3. Optimized drawBackground - uses cached grid settings instead of get_all()
-4. Compatible with optimized qt_canvasstates (v12)
-
-Refactoring Changes from v10:
-1. Removed _apply_grid_snapping() - now invoked by DefaultInteractionState
-2. Removed _handle_clone_trigger() - DefaultInteractionState calls NodeManager directly
-3. Removed _resolve_node_for_item() - consolidated into ItemResolver utility
-4. Canvas is now a pure passive container for scene management
+Changes from v12:
+1. StateFactory created at init — states never import each other
+2. set_state simplified — lifecycle methods guaranteed by ABC
+3. get_movable_nodes used as canonical filter (no inline duplication)
+4. Removed hasattr guards on guaranteed ABC methods
 
 Responsibilities:
 - Scene setup and configuration
@@ -46,7 +40,8 @@ from weave.canvas.canvas_nodemanager import NodeManager
 from weave.canvas.canvas_menu import ContextMenuProvider
 
 from weave.canvas.canvas_states import (
-    CanvasInteractionState, DefaultInteractionState, ConnectionDragState
+    CanvasInteractionState, DefaultInteractionState, ConnectionDragState,
+    create_state_factory, get_movable_nodes,
 )
 
 from weave.portutils import PortUtils, ConnectionFactory
@@ -65,25 +60,20 @@ class Canvas(QGraphicsScene):
     """
     High-performance node graph canvas with state-machine-based interaction.
     
-    Performance Optimizations (v12):
-    - Cached style parameters updated via observer pattern
-    - Properties return cached values (O(1)) instead of StyleManager.get() (O(N))
-    - drawBackground uses cached grid settings
-    - Reduced overhead in high-frequency rendering
-    
     This class is a pure passive container. All interaction logic is
-    delegated to the state machine (DefaultInteractionState, ConnectionDragState).
+    delegated to the state machine via a StateFactory that decouples
+    states from each other (no mutual imports).
     
     Architectural Role:
-    - Hosts the state machine
+    - Hosts the state machine and its StateFactory
     - Provides access to scene infrastructure (_orchestrator, _node_manager)
     - Exposes connection helpers for ConnectionDragState
     - Handles rendering and configuration
     
-    Integration with StyleManager:
-    - Subscribes to CANVAS category style changes 
-    - Updates background color and layout properties dynamically
-    - Caches grid pen and style parameters for performance
+    Performance:
+    - Cached style parameters updated via observer pattern
+    - Properties return cached values (O(1)) instead of StyleManager.get()
+    - drawBackground uses cached grid settings
     """
 
     # Signals
@@ -153,8 +143,9 @@ class Canvas(QGraphicsScene):
         self._context_menu_provider = ContextMenuProvider(self)
         self._grid_renderer = GridRenderer()
 
-        # State Machine
-        self._current_state: CanvasInteractionState = DefaultInteractionState(self)
+        # State Machine — factory-based transitions (states never import each other)
+        self.state_factory = create_state_factory()
+        self._current_state: CanvasInteractionState = self.state_factory.create("default", self)
 
         # Re-entrancy guard: set True while inside super().mousePressEvent()
         # to prevent re-entrant mouseMoveEvent calls from moving nodes.
@@ -313,13 +304,9 @@ class Canvas(QGraphicsScene):
 
     def set_state(self, state: CanvasInteractionState) -> None:
         """Transition to a new interaction state."""
-        if hasattr(self._current_state, 'on_exit'):
-            self._current_state.on_exit()
-        
+        self._current_state.on_exit()
         self._current_state = state
-        
-        if hasattr(self._current_state, 'on_enter'):
-            self._current_state.on_enter()
+        self._current_state.on_enter()
 
     # ==========================================================================
     # CONFIGURATION API - now using cached properties
@@ -591,7 +578,7 @@ class Canvas(QGraphicsScene):
 
         Popup fix:
             When a widget interaction has suppressed node dragging
-            (_suppressed_movable_node is set), grid snapping is skipped
+            (suppressed_node is set), grid snapping is skipped
             entirely.  Repositioning a node while a combo-box popup is
             open would detach the popup from the widget visually.
         """
@@ -609,15 +596,14 @@ class Canvas(QGraphicsScene):
         super().mouseMoveEvent(event)
         
         # Skip snapping while a widget has suppressed node movement
-        if getattr(self._current_state, '_suppressed_movable_node', None) is not None:
+        if self._current_state.suppressed_node is not None:
             # Force proxy repaint so text-selection highlight updates
             # in real time during click-drag inside a text field.
             self._update_editing_proxy()
             return
         
         # Apply grid snapping AFTER default behavior moved the items
-        if hasattr(self._current_state, 'apply_grid_snapping'):
-            self._current_state.apply_grid_snapping(event)
+        self._current_state.apply_grid_snapping(event)
 
     # ==========================================================================
     # KEYBOARD EVENT HANDLING
@@ -701,7 +687,7 @@ class Canvas(QGraphicsScene):
 
         Detection uses three independent signals (any is sufficient):
 
-        1. The current state's ``_suppressed_movable_node`` is set,
+        1. The current state's ``suppressed_node`` property is set,
            meaning ``_yield_to_proxy()`` has temporarily disabled node
            dragging so the widget can receive mouse events.
         2. A ``QGraphicsProxyWidget`` is the scene's current focus item,
@@ -711,7 +697,7 @@ class Canvas(QGraphicsScene):
            editing an inline text item such as the node title.
         """
         # Signal 1: state machine flagged a widget interaction
-        if getattr(self._current_state, '_suppressed_movable_node', None) is not None:
+        if self._current_state.suppressed_node is not None:
             return True
         # Signal 2: a proxy widget currently holds keyboard focus
         focus = self.focusItem()
@@ -734,7 +720,7 @@ class Canvas(QGraphicsScene):
         current focus item.
         """
         # Path 1: via the node whose movability was suppressed
-        node = getattr(self._current_state, '_suppressed_movable_node', None)
+        node = self._current_state.suppressed_node
         if node is not None:
             core = getattr(node, '_widget_core', None)
             if core is not None:
@@ -786,21 +772,13 @@ class Canvas(QGraphicsScene):
         """
         Leave widget-editing mode.
 
-        * Restores the ``ItemIsMovable`` flag on the node whose movability
-          was suppressed by ``_yield_to_proxy()``.
+        * Delegates to the current state's ``exit_widget_editing()`` which
+          restores the ``ItemIsMovable`` flag on the suppressed node.
         * Clears keyboard focus from the ``QGraphicsProxyWidget`` or
           ``QGraphicsTextItem`` so that subsequent key events reach the
           canvas shortcut handler again.
         """
-        # Restore movable flag
-        state = self._current_state
-        node = getattr(state, '_suppressed_movable_node', None)
-        if node is not None:
-            try:
-                node.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
-            except RuntimeError:
-                pass  # node already deleted
-            state._suppressed_movable_node = None
+        self._current_state.exit_widget_editing()
 
         # Clear focus from proxy or inline text item
         focus_item = self.focusItem()
@@ -811,11 +789,7 @@ class Canvas(QGraphicsScene):
         """
         Duplicate all selected movable nodes with their internal traces.
         """
-        selected_nodes = [
-            item for item in self.selectedItems()
-            if (item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
-            and not isinstance(item, (NodeTrace, DragTrace))
-        ]
+        selected_nodes = get_movable_nodes(self.selectedItems())
         
         if selected_nodes:
             self._node_manager.clone_nodes(selected_nodes)
@@ -824,11 +798,8 @@ class Canvas(QGraphicsScene):
         """
         Select all movable nodes in the scene (excludes traces and fixed items).
         """
-        for item in self.items():
-            # Only select movable items that are not traces
-            if (item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable
-                and not isinstance(item, (NodeTrace, DragTrace))):
-                item.setSelected(True)
+        for item in get_movable_nodes(self.items()):
+            item.setSelected(True)
 
     # ==========================================================================
     # CONNECTION HELPERS (used by ConnectionDragState)
@@ -836,6 +807,8 @@ class Canvas(QGraphicsScene):
 
     def _create_connection(self, start: NodePort, end: NodePort) -> Optional[NodeTrace]:
         """Create a connection and emit signal."""
+        from weave.canvas.states.state_utils import build_connection_tuples
+
         result = ConnectionFactory.create(
             self, start, end,
             validate=True,
@@ -844,24 +817,12 @@ class Canvas(QGraphicsScene):
         if result:
             self.connection_created.emit(start, end)
             # Push undo command for the new connection.
-            from weave.canvas.undo_commands import AddConnectionCommand, _get_port_lists
+            from weave.canvas.undo_commands import AddConnectionCommand
             provider = getattr(self, '_context_menu_provider', None)
             if provider is not None and hasattr(provider, '_undo_manager'):
-                src_node = getattr(start, 'node', None)
-                dst_node = getattr(end, 'node', None)
-                if src_node and dst_node:
-                    _, out = _get_port_lists(src_node)
-                    in_list, _ = _get_port_lists(dst_node)
-                    try:
-                        conn = (
-                            get_node_uid(src_node),
-                            out.index(start),
-                            get_node_uid(dst_node),
-                            in_list.index(end),
-                        )
-                        provider._undo_manager.push(AddConnectionCommand(conn))
-                    except ValueError:
-                        pass
+                tuples = build_connection_tuples([result])
+                if tuples:
+                    provider._undo_manager.push(AddConnectionCommand(tuples[0]))
         return result
 
     def _set_global_port_dimming(self, active: bool, source_port: Optional[NodePort]) -> None:
@@ -889,9 +850,7 @@ class Canvas(QGraphicsScene):
         for item in selected:
             self._orchestrator.bring_to_front(item)
         
-        if hasattr(self._current_state, 'on_selection_changed'):
-            self._current_state.on_selection_changed(selected)
-            
+        self._current_state.on_selection_changed(selected)
         self.selection_changed_custom.emit(selected)
 
     # ==========================================================================

@@ -167,6 +167,15 @@ class NodeManager:
             # Ensure visibility by bringing to front
             self._z_order_manager.bring_to_front(node)
 
+        # Notify listeners (e.g. UndoManager) about cloned nodes.
+        # clone_nodes bypasses the canvas-level add_node that normally
+        # emits node_added, so emit it explicitly here so that undo
+        # tracking, widget-core wiring, and baseline snapshots are set
+        # up for the clones.
+        if hasattr(self._scene, 'node_added'):
+            for node in new_nodes:
+                self._scene.node_added.emit(node)
+
         log.debug(f"Clone complete: {len(new_nodes)} nodes created")
         return new_nodes
 

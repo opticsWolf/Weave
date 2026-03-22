@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 from enum import IntEnum, auto
 import math
 import numpy as np
-from typing import List, Union
+from typing import List, Union, Optional
 from PySide6.QtCore import QRectF, QPointF, QLineF
 from PySide6.QtGui import QPainter, QPen
 
