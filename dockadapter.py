@@ -178,6 +178,7 @@ class NodeDockAdapter(QDockWidget):
         # Forward panel signals
         self._panel.node_bound.connect(self.node_bound)
         self._panel.node_unbound.connect(self.node_unbound)
+        self._panel.node_unbound.connect(self._on_node_unbound)
 
         # When the static node is lost, close this dock
         self._panel.linked_node_lost.connect(self._on_linked_node_lost)
@@ -759,6 +760,25 @@ class NodeDockAdapter(QDockWidget):
             self._sync_to_current_selection()
 
     # ──────────────────────────────────────────────────────────────────────
+    # Dynamic-mode: node unbound (e.g. pinned node deleted)
+    # ──────────────────────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_node_unbound(self) -> None:
+        """The panel's node was unbound.
+
+        For dynamic docks this can happen when a pinned node is deleted.
+        The panel has already cleared itself and reset ``is_pinned`` to
+        False, so we re-sync to whatever is currently selected on the
+        canvas — the dock stays open and resumes following selection.
+
+        Static docks never reach this path because node deletion
+        triggers ``linked_node_lost`` → ``_on_linked_node_lost`` instead.
+        """
+        if self._mode == DockMode.DYNAMIC and self._selection_scene is not None:
+            self._sync_to_current_selection()
+
+    # ──────────────────────────────────────────────────────────────────────
     # Title sync — static dock title follows node name (change #1)
     # ──────────────────────────────────────────────────────────────────────
 
@@ -773,7 +793,12 @@ class NodeDockAdapter(QDockWidget):
 
     @Slot()
     def _on_linked_node_lost(self) -> None:
-        """The statically pinned node has been deleted — close the dock."""
+        """The statically bound (mirror) node has been deleted — close the dock.
+
+        This only fires for **static** docks.  Dynamic (inspector) docks
+        whose pinned node is deleted receive ``node_unbound`` instead
+        and stay open — see ``_on_node_unbound``.
+        """
         log.debug("Static dock: linked node deleted — closing dock.")
         self._unbind_from_selection()
         self.close()

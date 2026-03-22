@@ -498,8 +498,8 @@ def setup_default_ports():
             casts_to={
                 41: lambda x: x.tolist(),                                          # NdArray -> List
                 42: lambda x: tuple(x.tolist()),                                   # NdArray -> Tuple
-                11: lambda x: float(x) if x.size == 1 else float(x.flat[0]),      # NdArray -> Float
-                12: lambda x: int(x) if x.size == 1 else int(x.flat[0]),          # NdArray -> Int
+                #11: lambda x: float(x) if x.size == 1 else float(x.flat[0]),      # NdArray -> Float
+                #12: lambda x: int(x) if x.size == 1 else int(x.flat[0]),          # NdArray -> Int
                 30: lambda x: str(x),                                              # NdArray -> String
             }
         )
