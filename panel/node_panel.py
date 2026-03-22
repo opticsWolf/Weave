@@ -431,8 +431,28 @@ class NodePanel(QWidget):
 
     @Slot()
     def _on_linked_node_destroyed(self) -> None:
-        log.debug("Static panel: linked node destroyed.")
+        """The watched node's C++ side is being destroyed.
 
+        Behaviour depends on how the panel was bound:
+
+        **Static (mirror) panel** — the panel's sole reason for existing
+        is gone.  Emit ``linked_node_lost`` so the parent dock closes.
+
+        **Dynamic (inspector) panel, pinned** — the pinned target is
+        gone, but the inspector dock should stay open.  Clear the
+        mirrors, reset to the "No node selected" state, and let the
+        dock resume following canvas selection.  ``node_unbound`` is
+        emitted (not ``linked_node_lost``) so the dock does *not* close.
+        """
+        log.debug(
+            "Panel: linked node destroyed (static=%s, pinned=%s).",
+            self._static, self._pinned,
+        )
+
+        # Snapshot before we clear state.
+        was_static = self._static
+
+        # ── Scene-level signal cleanup ────────────────────────────────
         watching = self._watching_lifetime
         self._watching_lifetime = False
 
@@ -452,12 +472,43 @@ class NodePanel(QWidget):
                     except (RuntimeError, TypeError):
                         pass
 
+        # ── WidgetCore signal cleanup ─────────────────────────────────
+        # The node is being destroyed so we must disconnect our slots
+        # from its WidgetCore *now*, before the C++ object is gone.
+        node = self._node
+        wc = getattr(node, "_widget_core", None) if node is not None else None
+        if wc is not None and _cpp_is_valid(node):
+            for sig_name, slot in [
+                ("value_changed", self._on_node_value_changed),
+                ("port_value_written", self._on_node_value_changed),
+                ("port_enabled_changed", self._on_port_enabled_changed),
+                ("widget_registered", self._on_widget_registered),
+                ("widget_unregistered", self._on_widget_unregistered),
+                ("widget_visibility_changed",
+                 self._on_widget_visibility_changed),
+            ]:
+                try:
+                    getattr(wc, sig_name).disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+
+        if node is not None and _cpp_is_valid(node):
+            if hasattr(node, "state_changed"):
+                try:
+                    node.state_changed.disconnect(self._on_node_state_changed)
+                except (RuntimeError, TypeError):
+                    pass
+            if hasattr(node, "title_changed"):
+                try:
+                    node.title_changed.disconnect(self._on_node_title_changed)
+                except (RuntimeError, TypeError):
+                    pass
+
+        # ── Tear down UI ──────────────────────────────────────────────
         self._tear_down_mirrors()
         self._node = None
         self._static = False
         self._pinned = False
-        self._header.set_title("[deleted]")
-        self._header.set_state_text("")
         self._header.set_pin_visible(False)
         self._header.set_pin_checked(False)
 
@@ -465,7 +516,16 @@ class NodePanel(QWidget):
         self._form.addRow(self._placeholder)
         self._placeholder.show()
 
-        self.linked_node_lost.emit()
+        if was_static:
+            # ── Mirror panel: the dock should close ───────────────────
+            self._header.set_title("[deleted]")
+            self._header.set_state_text("")
+            self.linked_node_lost.emit()
+        else:
+            # ── Inspector panel (was pinned): stay open, resume ───────
+            self._header.set_title("")
+            self._header.set_state_text("")
+            self.node_unbound.emit()
 
     @Slot(QGraphicsItem)
     def _on_scene_node_removed(self, item: QGraphicsItem) -> None:
@@ -976,6 +1036,63 @@ class NodePanel(QWidget):
             self.dock_title_changed.emit(new_title)
         else:
             self._header.set_title(new_title)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Keyboard — forward undo/redo to canvas
+    # ──────────────────────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event) -> None:
+        """Intercept Ctrl+Z / Ctrl+Shift+Z and forward to the canvas
+        undo manager.
+
+        Panel widgets are standard ``QWidget`` trees, not
+        ``QGraphicsProxyWidget``.  When a panel spinbox or combo has
+        focus, keyboard events go to the panel — the canvas scene's
+        ``keyPressEvent`` (in ``DefaultInteractionState``) never sees
+        them.  We catch undo/redo here and delegate to the scene's
+        ``CanvasCommandsMixin`` so the shortcuts work regardless of
+        where focus is.
+
+        All other keys are forwarded to the default handler so normal
+        widget editing (typing in a spinbox, arrow keys, etc.) is not
+        affected.
+        """
+        from PySide6.QtCore import Qt
+
+        mod = event.modifiers()
+        key = event.key()
+        ctrl = bool(mod & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mod & Qt.KeyboardModifier.ShiftModifier)
+        alt = bool(mod & Qt.KeyboardModifier.AltModifier)
+
+        if ctrl and not alt and key == Qt.Key.Key_Z:
+            provider = self._find_command_provider()
+            if provider is not None:
+                if shift:
+                    provider.cmd_redo()
+                else:
+                    provider.cmd_undo()
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
+
+    def _find_command_provider(self):
+        """Locate the ``CanvasCommandsMixin`` for undo/redo dispatch.
+
+        Walks: bound node → scene → ``_context_menu_provider``.
+        Returns ``None`` if any step fails.
+        """
+        node = self._node
+        if node is None:
+            return None
+        try:
+            scene = node.scene()
+        except RuntimeError:
+            return None
+        if scene is None:
+            return None
+        return getattr(scene, "_context_menu_provider", None)
 
     # ──────────────────────────────────────────────────────────────────────
     # Helpers
