@@ -166,7 +166,7 @@ class NumpyArrayNode(ActiveNode):
         self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
-        # ── Dims spinbox (internal — no port, but registered for mirroring)
+        # ── Dims spinbox (Now bidirectional to allow input port)
         self._spin_dims = QSpinBox()
         self._spin_dims.setRange(1, self.MAX_DIMS)
         self._spin_dims.setValue(initial_dims)
@@ -174,9 +174,13 @@ class NumpyArrayNode(ActiveNode):
         form.addRow("Dims:", self._spin_dims)
         self._widget_core.register_widget(
             "dims", self._spin_dims,
-            role="internal", datatype="int", default=1,
+            role="bidirectional", datatype="int", default=1,
             add_to_layout=False,
         )
+
+        # Add the input port for Dims
+        self.add_input("dims", "int")
+        self.inputs[-1]._auto_disable = True  # Allows manual override when disconnected
 
         # ── Separator ─────────────────────────────────────────────────
         form.addRow(self._make_separator())
@@ -374,6 +378,21 @@ class NumpyArrayNode(ActiveNode):
         spinbox (read via WidgetCore) is the fallback.
         """
         try:
+            # ── Determine Rank (Number of Dimensions) ─────────────────────
+            # Check upstream first, then fallback to widget value
+            upstream_dims = inputs.get("dims")
+            if upstream_dims is not None:
+                new_dims = max(1, min(self.MAX_DIMS, int(upstream_dims)))
+            else:
+                val = self._widget_core.get_port_value("dims")
+                new_dims = int(val) if val is not None else 1
+
+            # If the rank changed via port, sync the UI rows
+            if new_dims != self._current_dims:
+                # We use signals blocked to prevent infinite loops during compute
+                with self._widget_core.suppress_signals():
+                    self._set_dims(new_dims)
+
             # ── Shape ─────────────────────────────────────────────────
             shape: List[int] = []
             for d in range(self._current_dims):
