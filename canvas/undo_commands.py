@@ -21,6 +21,7 @@ Stored data per command type
 Command                         Data stored
 ==============================  =========================================
 ``MoveNodesCommand``            ``{uuid: (old_pos, new_pos)}`` dict
+``ResizeNodeCommand``           node uuid, old_w, old_h, new_w, new_h
 ``WidgetValueCommand``          node uuid, port name, old value, new value
 ``NodePropertyCommand``         node uuid, getter/setter names, old, new
 ``AddNodeCommand``              class name, ``get_state()`` dict snapshot
@@ -172,6 +173,48 @@ class MoveNodesCommand(UndoCommand):
     def description(self) -> str:
         n = len(self._moves)
         return f"Move {n} node{'s' if n != 1 else ''}"
+
+
+# ======================================================================
+# Resize
+# ======================================================================
+
+class ResizeNodeCommand(UndoCommand):
+    """A single node was resized from old dimensions to new dimensions.
+
+    Stored data: ``(uuid_str, old_w, old_h, new_w, new_h)``
+    """
+
+    def __init__(
+        self,
+        node_uid: str,
+        old_w: float,
+        old_h: float,
+        new_w: float,
+        new_h: float,
+    ) -> None:
+        self._uid = node_uid
+        self._old_w = old_w
+        self._old_h = old_h
+        self._new_w = new_w
+        self._new_h = new_h
+
+    def undo(self, canvas) -> None:
+        self._apply(canvas, self._old_w, self._old_h)
+
+    def redo(self, canvas) -> None:
+        self._apply(canvas, self._new_w, self._new_h)
+
+    def _apply(self, canvas, w: float, h: float) -> None:
+        node = _find_node(canvas, self._uid)
+        if node is None:
+            return
+        node.apply_resize(w, h)
+
+    @property
+    def description(self) -> str:
+        return "Resize node"
+
 
 
 # ======================================================================
