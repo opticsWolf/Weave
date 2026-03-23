@@ -32,6 +32,7 @@ THEMES: Dict[str, Dict[StyleCategory, Dict[str, Any]]] = {
                ],
             'header_gradient_shift': 20,
             'header_bottom_line_shift': -30,
+            'body_gradient_shift': -5,
             'hl_title_bright': -25,
             "body_bg": [250, 252, 255, 255],
             "outline_color": [180, 185, 190, 255],

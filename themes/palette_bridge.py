@@ -72,6 +72,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QFrame,
     QGroupBox,
+    QLabel,
     QScrollArea,
     QSplitter,
     QTabWidget,
@@ -157,10 +158,16 @@ def _force_transparent(widget: QWidget) -> None:
     inside the event filter — calling ``setStyleSheet`` inside a
     ``PaletteChange`` handler triggers another ``PaletteChange``,
     causing infinite recursion.
+
+    ``QLabel`` is skipped for the stylesheet step: it inherits ``QFrame``
+    so it matches the container list, but setting a stylesheet on it
+    overrides ``QPalette`` entirely — the label loses its themed text
+    colour.  The two attribute calls alone are sufficient for transparency.
     """
     widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     widget.setAutoFillBackground(False)
-    widget.setStyleSheet(_CONTAINER_STYLESHEET)
+    if not isinstance(widget, QLabel):
+        widget.setStyleSheet(_CONTAINER_STYLESHEET)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
