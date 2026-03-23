@@ -217,8 +217,11 @@ class CountdownTimerNode(ThreadedManualNode):
         Checks ``is_compute_cancelled()`` every iteration so the node
         responds promptly to the Stop button.
 
-        Live values are pushed to the main thread via ``progress_updated``
-        rather than touching Qt widgets directly from the worker.
+        Live values are pushed to downstream nodes via
+        ``emit_intermediate()`` (which updates the output cache on the
+        main thread without leaving COMPUTING state), while the UI
+        widgets (progress bar, status label) are updated via the
+        ``progress_updated`` signal.
         """
         duration: float = inputs.get("duration", 10.0)
         _dbg(f"compute: starting, duration={duration:.1f}s")
@@ -234,7 +237,14 @@ class CountdownTimerNode(ThreadedManualNode):
             remaining = max(0.0, duration - elapsed)
             progress  = min(1.0, elapsed / duration)
 
-            # Marshal UI update + output cache refresh to main thread
+            # Push live data to downstream nodes (cache + data_updated)
+            self.emit_intermediate({
+                "remaining": float(remaining),
+                "progress":  float(progress),
+                "finished":  False,
+            })
+
+            # Marshal UI widget updates to main thread
             self.progress_updated.emit(remaining, progress)
 
             if elapsed >= duration:
@@ -250,20 +260,16 @@ class CountdownTimerNode(ThreadedManualNode):
     @Slot(float, float)
     def _on_live_update(self, remaining: float, progress: float) -> None:
         """
-        Receive live tick data on the main thread and update UI + output
-        cache so downstream nodes see continuously refreshed values.
+        Receive live tick data on the main thread and update UI widgets.
+
+        Cache propagation to downstream nodes is handled by
+        ``emit_intermediate()`` inside ``compute()`` — this slot only
+        refreshes the visual controls (status label + progress bar).
         """
-        # Update display
         mins = int(remaining) // 60
         secs = remaining % 60
         self._label_status.setText(f"{mins:02d}:{secs:05.2f} left")
         self._progress_bar.setValue(int(progress * 1000))
-
-        # Refresh output cache so downstream nodes see live data
-        self._cached_values["remaining"] = float(remaining)
-        self._cached_values["progress"]  = float(progress)
-        self._cached_values["finished"]  = False
-        self.data_updated.emit()
 
     # ── Passthrough / bypass ──────────────────────────────────────────────
 
