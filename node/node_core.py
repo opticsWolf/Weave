@@ -36,7 +36,7 @@ from PySide6.QtGui import (
 )
 
 # Import node components (unchanged from original)
-from weave.node.node_components import NodeBody, NodeHeader
+from weave.node.node_components import NodeBody, NodeHeader, NodeWidgetHost
 from weave.node.node_subcomponents import ResizeHandle
 from weave.node.node_port import NodePort
 
@@ -135,10 +135,12 @@ class Node(NodeConfigMixin, NodePortsMixin, NodePulseAnimMixin, NodeGeometryMixi
         # 2. UI Components
         self.header = NodeHeader(self, title)
         self.body = NodeBody(self)
-        self.handle = ResizeHandle(self, self._on_handle_resize)
+        self.widget_host = NodeWidgetHost(self)
+        self.handle = ResizeHandle(self)
 
         self.header.setPos(0, 0)
         self.body.setPos(0, self.header.get_height())
+        self.widget_host.setPos(0, self.header.get_height())
 
         # Ports
         self.inputs: List[NodePort] = []
@@ -479,6 +481,8 @@ class Node(NodeConfigMixin, NodePortsMixin, NodePulseAnimMixin, NodeGeometryMixi
             self._total_height = self.header.get_height()
             self._set_ports_visible(False)
             self.body.setVisible(False)
+            if hasattr(self, 'widget_host') and self.widget_host is not None:
+                self.widget_host.setVisible(False)
             self.handle.setVisible(False)
             self._summary_input.setVisible(True)
             self._summary_output.setVisible(True)

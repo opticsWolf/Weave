@@ -413,7 +413,7 @@ class NodePortsMixin:
         if widget.layout():
             widget.layout().activate()
 
-        self.body.set_content(widget)
+        self.widget_host.set_content(widget)
 
         if hasattr(widget, 'set_node') and hasattr(widget, 'get_port_definitions'):
             widget.set_node(self)

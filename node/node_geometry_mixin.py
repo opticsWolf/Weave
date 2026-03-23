@@ -15,7 +15,7 @@ Handles:
 - Port layout positioning (input_rect / output_rect based)
 - Minimize / maximize animation (toggle, value-changed, finished)
 - Computing pulse animation (start / stop / tick)
-- Resize handle callback
+- Resize: apply_resize (geometry-only, called by canvas state machine)
 
 Style Integration:
     All visual properties are resolved through StyleManager.get() with their
@@ -231,8 +231,8 @@ class NodeGeometryMixin:
             bottom_area_h = 0.0
 
         widget_min_w, widget_min_h = (
-            self.body.get_content_min_size()
-            if hasattr(self.body, 'get_content_min_size')
+            self.widget_host.get_content_min_size()
+            if hasattr(self, 'widget_host') and self.widget_host is not None
             else (0, 0)
         )
 
@@ -524,7 +524,14 @@ class NodeGeometryMixin:
         self.body.setPos(0, header_h)
         if hasattr(self.body, 'update_layout'):
             self.body.update_layout(
-                self._width, total_body_h, input_rect, output_rect, widget_y, widget_h_alloc
+                self._width, total_body_h, input_rect, output_rect,
+            )
+
+        # Position and size the widget host (sibling of body in node coords)
+        if hasattr(self, 'widget_host') and self.widget_host is not None:
+            self.widget_host.setPos(0, header_h)
+            self.widget_host.update_layout(
+                widget_y, widget_h_alloc, self._width,
             )
         self.handle.setPos(self._width, self._total_height)
 
@@ -726,6 +733,8 @@ class NodeGeometryMixin:
         if not target_minimized:
             self._set_ports_visible(True)
             self.body.setVisible(True)
+            if hasattr(self, 'widget_host') and self.widget_host is not None:
+                self.widget_host.setVisible(True)
             self.handle.setVisible(True)
             if hasattr(self.header, '_recalculate_layout'):
                 self.header._recalculate_layout()
@@ -787,6 +796,8 @@ class NodeGeometryMixin:
         if self.is_minimized:
             self._set_ports_visible(False)
             self.body.setVisible(False)
+            if hasattr(self, 'widget_host') and self.widget_host is not None:
+                self.widget_host.setVisible(False)
             self.handle.setVisible(False)
 
             if self.inputs:
@@ -835,14 +846,14 @@ class NodeGeometryMixin:
     # Resize Handle Callback
     # ------------------------------------------------------------------
 
-    def _on_handle_resize(self, target_w: float, target_h: float, is_ctrl: bool):
-        """Callback from resize handle."""
-        scene = self.scene()
-        grid = getattr(scene, "grid_spacing", 10) if scene else 10
+    def apply_resize(self, target_w: float, target_h: float) -> None:
+        """Apply a resize to the given dimensions (clamped to min size).
 
-        target_w = round(target_w / grid) * grid
-        target_h = round(target_h / grid) * grid
-
+        This is the single geometry-update entry point used by the canvas
+        state machine during a resize drag.  Snapping and undo are the
+        caller's responsibility — this method only enforces min-size
+        constraints and updates the visual layout.
+        """
         min_w, min_h = self.calculate_min_size()
         target_w = max(target_w, min_w)
         target_h = max(target_h, min_h)

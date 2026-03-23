@@ -8,11 +8,11 @@ SPDX-License-Identifier: Apache-2.0
 """
 
 import math
-from typing import Optional, Callable, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 from PySide6.QtWidgets import (
     QGraphicsItem, QWidget,
     QGraphicsTextItem, QStyleOptionGraphicsItem, QGraphicsObject,
-    QGraphicsSceneHoverEvent, QGraphicsSceneMouseEvent
+    QGraphicsSceneHoverEvent,
 )
 from PySide6.QtCore import Qt, QRectF, QPointF, Property, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import (
@@ -475,57 +475,88 @@ class EditableTitle(QGraphicsTextItem):
         super().keyPressEvent(event)
         
 class ResizeHandle(QGraphicsObject):
-    def __init__(self, node: 'Node', callback: Callable[[float, float, bool], None]):
+    """Visual resize handle — hit-test and paint only.
+
+    Input processing (mouse press / move / release) is delegated to the
+    canvas state machine (``ResizeHandleHandler`` in DefaultInteractionState).
+    This mirrors the pattern used by ``StateSlider`` and ``MinimizeButton``.
+
+    The state machine calls :meth:`set_active` to control the visual
+    highlight during a resize drag.
+    """
+
+    def __init__(self, node: 'Node'):
         super().__init__(node)
         self._node = node
-        self._callback = callback
         self._hovered = False
-        self._resizing = False
-        
+
+        # Set by the canvas state machine during an active resize drag
+        # so the handle paints in its "active" / hover style.
+        self._active = False
+
         self._path = QPainterPath()
         self._rect = QRectF()
-        
-        self._drag_start_screen_pos = QPointF()
-        self._drag_start_size = (0, 0)
-        
+
         self.setAcceptHoverEvents(True)
+        # The handle does not process mouse buttons itself — the state
+        # machine intercepts presses via scene-level hit testing.
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
         self.setZValue(10)
 
         # Initialize geometry
         self.update_config()
 
+    # ------------------------------------------------------------------
+    # State-machine API
+    # ------------------------------------------------------------------
+
+    def set_active(self, active: bool) -> None:
+        """Called by the state machine to toggle the active-resize visual."""
+        if self._active != active:
+            self._active = active
+            self.update()
+
+    def contains_scene_pos(self, scene_pos: QPointF) -> bool:
+        """Return *True* if *scene_pos* falls within the handle's hit shape."""
+        local = self.mapFromScene(scene_pos)
+        return self.shape().contains(local)
+
+    # ------------------------------------------------------------------
+    # Geometry
+    # ------------------------------------------------------------------
+
     def _recalculate_geometry(self) -> None:
         cfg = self._node._config
         shift = cfg['resize_handle_offset'] / math.sqrt(2)
         r = cfg['resize_handle_radius']
-        
+
         # New property: defines length of straight extensions
         extend = cfg.get('resize_handle_extend', 0.0)
-        
+
         self._path = QPainterPath()
         vis_rect = QRectF(shift - r, shift - r, 2*r, 2*r)
-        
+
         # 1. Move to the top of the upward extension (X is right-bound, Y goes up)
         self._path.moveTo(shift + r, shift - extend)
-        
-        # 2. The arcTo command implicitly draws a line from the current position 
+
+        # 2. The arcTo command implicitly draws a line from the current position
         # (the top of our extension) down to the start angle (0 degrees / 3 o'clock)
         # and then sweeps the quarter circle to -90 degrees (6 o'clock).
         self._path.arcTo(vis_rect, 0, -90)
-        
+
         # 3. Draw the line extending to the left from the end of the arc
         self._path.lineTo(shift - extend, shift + r)
-        
+
         margin = cfg['resize_handle_hover_width']
         total_r = r + margin
-        
+
         # 4. Expand the bounding rect to account for the new extensions
         min_x = min(shift - total_r, shift - extend - margin)
         min_y = min(shift - total_r, shift - extend - margin)
         max_x = shift + total_r
         max_y = shift + total_r
-        
+
         self._rect = QRectF(min_x, min_y, max_x - min_x, max_y - min_y)
 
     def update_config(self) -> None:
@@ -551,18 +582,18 @@ class ResizeHandle(QGraphicsObject):
 
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget: Optional[QWidget] = None) -> None:
         cfg = self._node._config
-        
-        if self._hovered or self._resizing:
+
+        if self._hovered or self._active:
             color = cfg['resize_handle_hover_color']
             width = cfg['resize_handle_hover_width']
         else:
             color = cfg['resize_handle_color']
             width = cfg['resize_handle_width']
-            
+
         pen = QPen(color, width)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        
+
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(self._path)
@@ -578,33 +609,3 @@ class ResizeHandle(QGraphicsObject):
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
         super().hoverLeaveEvent(event)
-
-    def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._resizing = True
-            self._drag_start_screen_pos = event.screenPos()
-            if self._node:
-                self._drag_start_size = (self._node._width, self._node._total_height)
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        if self._resizing:
-            delta = event.screenPos() - self._drag_start_screen_pos
-            base_w, base_h = self._drag_start_size
-            target_w = base_w + delta.x()
-            target_h = base_h + delta.y()
-            is_ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
-            self._callback(target_w, target_h, is_ctrl)
-            event.accept()
-        else:
-            super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._resizing = False
-            self.update()
-            event.accept()
-        else:
-            super().mouseReleaseEvent(event)

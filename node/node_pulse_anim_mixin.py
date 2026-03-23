@@ -165,6 +165,7 @@ class NodePulseAnimMixin:
         ``_computing_pulse_anim`` setup that previously lived there.
         """
         self._computing_pulse_phase: float = 0.0
+        self._pulse_active: bool = False
         self._active_waveform_key: str = self._config.get(
             'pulse_waveform', 'breathe'
         )
@@ -225,10 +226,18 @@ class NodePulseAnimMixin:
             )
             self._apply_pulse_timing()
 
+            self._pulse_active = True
             self._computing_pulse_anim.start()
 
     def _stop_computing_pulse(self) -> None:
-        """Stop the pulse animation and clear the phase."""
+        """Stop the pulse animation and clear the phase.
+
+        The ``_pulse_active`` flag is cleared **before** calling ``stop()``
+        so that any ``valueChanged`` signal emitted synchronously during
+        the stop (or still queued from the event loop) is discarded by
+        ``_on_pulse_tick`` and cannot re-set a non-zero phase.
+        """
+        self._pulse_active = False
         if self._computing_pulse_anim.state() == QVariantAnimation.State.Running:
             self._computing_pulse_anim.stop()
         self._computing_pulse_phase = 0.0
@@ -239,8 +248,13 @@ class NodePulseAnimMixin:
     # ------------------------------------------------------------------
 
     def _on_pulse_tick(self, value) -> None:
-        """Convert the raw 0→1 sawtooth into the selected waveform shape."""
-        if value is None:
+        """Convert the raw 0→1 sawtooth into the selected waveform shape.
+
+        Guarded by ``_pulse_active`` so that stale or queued ticks that
+        arrive after ``_stop_computing_pulse`` are silently discarded,
+        preventing the phase from being re-set to a non-zero value.
+        """
+        if value is None or not self._pulse_active:
             return
 
         t = float(value)

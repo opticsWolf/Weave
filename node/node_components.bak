@@ -474,14 +474,13 @@ class NodeWidgetHost(QGraphicsItem):
     """
 
     __slots__ = (
-        '_node', '_proxy', '_widget', '_saved_z', '_rect',
+        '_node', '_proxy', '_widget', '_saved_z',
     )
 
     def __init__(self, parent: 'Node'):
         super().__init__(parent)
         self._node = parent
         self._saved_z: Optional[float] = None
-        self._rect = QRectF()
 
         self._proxy = NodeProxyWidget(self)
         self._widget = QWidget()
@@ -516,9 +515,6 @@ class NodeWidgetHost(QGraphicsItem):
             widget_h:   Available height for the widget.
             body_width: Full width of the body.
         """
-        if self.scene():
-            self.prepareGeometryChange()
-        self._rect = QRectF(10, widget_y, max(0, body_width - 20), max(0, widget_h))
         self._proxy.setPos(10, widget_y)
         self._proxy.resize(max(0, body_width - 20), max(0, widget_h))
 
@@ -547,20 +543,11 @@ class NodeWidgetHost(QGraphicsItem):
         if self._saved_z is not None:
             self.setZValue(self._saved_z)
             self._saved_z = None
-        # Force Qt to re-query boundingRect so the stale popup area
-        # no longer intercepts hit-testing.
-        self.prepareGeometryChange()
 
     # ── QGraphicsItem boilerplate ────────────────────────────────────
 
     def boundingRect(self) -> QRectF:
-        return self._rect
-
-    def shape(self) -> QPainterPath:
-        """Constrain hit-testing to the actual widget area."""
-        path = QPainterPath()
-        path.addRect(self._rect)
-        return path
+        return self.childrenBoundingRect()
 
     def paint(self, painter, option, widget=None):
         pass  # Transparent — no visual output
