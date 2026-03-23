@@ -180,6 +180,39 @@ class NodeButtonHandler:
         return False
 
 
+class ResizeHandleHandler:
+    """Intercept presses on a node's resize handle and begin a resize drag.
+
+    The handle itself is a passive paint/hit-test object (same pattern as
+    ``StateSlider``).  This handler detects the hit, snapshots the
+    pre-resize dimensions, and hands control to the state's move/release
+    cycle which applies snapping and pushes an undo command.
+    """
+
+    def try_handle(
+        self,
+        event: QGraphicsSceneMouseEvent,
+        state: "DefaultInteractionState",
+    ) -> bool:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+
+        node = ItemResolver.resolve_node_at(state.canvas, event.scenePos())
+        if node is None or not hasattr(node, "handle"):
+            return False
+
+        # Minimised nodes cannot be resized
+        if getattr(node, "is_minimized", False):
+            return False
+
+        if not node.handle.contains_scene_pos(event.scenePos()):
+            return False
+
+        state._begin_resize(node, event)
+        event.accept()
+        return True
+
+
 # ============================================================================
 # DEFAULT INTERACTION STATE
 # ============================================================================
@@ -211,6 +244,11 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
         self._last_mouse_pos: Optional[QPointF] = None
         self._drag_start_positions: dict = {}
 
+        # ── Resize state ──────────────────────────────────────────────
+        self._resize_node: Optional[QGraphicsItem] = None
+        self._resize_start_scene_pos: Optional[QPointF] = None
+        self._resize_start_size: tuple = (0.0, 0.0)
+
         # ── Proxy widget interaction ──────────────────────────────────
         self._suppressed_movable_node: Optional[QGraphicsItem] = None
 
@@ -218,6 +256,7 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
         self._press_handlers: list[InteractionHandler] = [
             ProxyWidgetHandler(),
             PortHandler(),
+            ResizeHandleHandler(),
             NodeButtonHandler(),
         ]
 
@@ -311,6 +350,46 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
             self._suppressed_movable_node = None
 
     # ==================================================================
+    # RESIZE HELPERS
+    # ==================================================================
+
+    def _begin_resize(
+        self, node: QGraphicsItem, event: QGraphicsSceneMouseEvent
+    ) -> None:
+        """Snapshot pre-resize state — called by ``ResizeHandleHandler``."""
+        self._resize_node = node
+        self._resize_start_scene_pos = event.scenePos()
+        self._resize_start_size = (node._width, node._total_height)
+        node.handle.set_active(True)
+
+    def _end_resize(self) -> None:
+        """Clear resize tracking state and deactivate the handle visual."""
+        node = self._resize_node
+        if node is not None and hasattr(node, "handle"):
+            try:
+                node.handle.set_active(False)
+            except RuntimeError:
+                pass  # node deleted during drag
+        self._resize_node = None
+        self._resize_start_scene_pos = None
+        self._resize_start_size = (0.0, 0.0)
+
+    # ==================================================================
+    # SNAP RESOLUTION (shared by drag and resize)
+    # ==================================================================
+
+    def _resolve_effective_snap(self, event: QGraphicsSceneMouseEvent) -> bool:
+        """Return the effective snap state, accounting for Shift toggle.
+
+        This is the single source of truth — used by both node movement
+        and resize so they can never diverge.
+        """
+        effective = self.canvas.snapping_enabled
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            effective = not effective
+        return effective
+
+    # ==================================================================
     # MOUSE PRESS  (handler chain — Review §3)
     # ==================================================================
 
@@ -370,6 +449,15 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
         if self._suppressed_movable_node is not None:
             return False  # let Qt route move to the proxy widget
 
+        # ── Resize branch ─────────────────────────────────────────────
+        if self._resize_node is not None:
+            if not (event.buttons() & Qt.MouseButton.LeftButton):
+                self._end_resize()
+                return False
+            self._apply_resize_move(event)
+            return True
+
+        # ── Drag / shake branch ───────────────────────────────────────
         if not (self._is_dragging and (event.buttons() & Qt.MouseButton.LeftButton)):
             self._drag_started_pos = None
             self._last_mouse_pos = None
@@ -399,12 +487,48 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
         self._last_mouse_pos = curr
         return False
 
+    def _apply_resize_move(self, event: QGraphicsSceneMouseEvent) -> None:
+        """Compute target size from the scene-space delta and apply it."""
+        node = self._resize_node
+        if node is None:
+            return
+
+        delta = event.scenePos() - self._resize_start_scene_pos
+        base_w, base_h = self._resize_start_size
+        target_w = base_w + delta.x()
+        target_h = base_h + delta.y()
+
+        if self._resolve_effective_snap(event):
+            grid = getattr(self.canvas, "grid_spacing", 10)
+            target_w = round(target_w / grid) * grid
+            target_h = round(target_h / grid) * grid
+
+        node.apply_resize(target_w, target_h)
+
     # ==================================================================
     # MOUSE RELEASE
     # ==================================================================
 
     def on_mouse_release(self, event: QGraphicsSceneMouseEvent) -> bool:
         self._restore_suppressed_node()
+
+        # ── Resize undo ───────────────────────────────────────────────
+        if self._resize_node is not None:
+            node = self._resize_node
+            old_w, old_h = self._resize_start_size
+            new_w, new_h = node._width, node._total_height
+
+            if abs(new_w - old_w) > 0.1 or abs(new_h - old_h) > 0.1:
+                from weave.canvas.undo_commands import ResizeNodeCommand
+
+                uid = get_node_uid(node)
+                if uid:
+                    self._push_cmd(
+                        ResizeNodeCommand(uid, old_w, old_h, new_w, new_h)
+                    )
+
+            self._end_resize()
+            return True
 
         # ── Undo command for moved nodes ──────────────────────────────
         if self._is_dragging and self._drag_start_positions:
@@ -509,11 +633,7 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
         if not movable:
             return
 
-        effective = self.canvas.snapping_enabled
-        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            effective = not effective
-
-        if effective:
+        if self._resolve_effective_snap(event):
             self.canvas._orchestrator.snap_items_to_grid(
                 movable, self.canvas.grid_spacing
             )
