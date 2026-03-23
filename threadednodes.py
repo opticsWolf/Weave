@@ -287,6 +287,7 @@ class ThreadedNode(BaseControlNode):
     compute_cancelled = Signal()
     compute_error     = Signal(str)
     compute_progress  = Signal(int)
+    _intermediate_signal = Signal(object)  # internal bridge for emit_intermediate
 
     def __init__(self, title: str = "Threaded Node", **kwargs: Any) -> None:
         super().__init__(title, **kwargs)
@@ -298,6 +299,12 @@ class ThreadedNode(BaseControlNode):
         self._thread_pool: QThreadPool = QThreadPool.globalInstance()
         self._pending_dirty: bool = False
         self._pre_compute_state: Optional[NodeState] = None
+
+        # ── Intermediate results bridge ──
+        self._intermediate_signal.connect(
+            self._on_intermediate_results,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     # ──────────────────────────────────────────────────────────────
     # CANCELLATION API  (usable from any thread)
@@ -340,6 +347,76 @@ class ThreadedNode(BaseControlNode):
         worker = self._current_worker
         if worker is not None:
             worker.signals.progress.emit(max(0, min(100, percent)))
+
+    # ──────────────────────────────────────────────────────────────
+    # INTERMEDIATE RESULTS  (call from inside compute())
+    # ──────────────────────────────────────────────────────────────
+
+    def emit_intermediate(self, results: Dict[str, Any]) -> None:
+        """
+        Push intermediate output values to downstream nodes while the
+        worker is still running.
+
+        Safe to call from the **worker thread**.  The data is marshalled
+        to the main thread via a queued signal where the cache is updated
+        and ``data_updated`` is emitted — the node stays in COMPUTING
+        state and the pulse animation continues uninterrupted.
+
+        Args:
+            results: A dict mapping output-port names to their current
+                     intermediate values.  Only the ports present in the
+                     dict are updated; other cached values are untouched.
+
+        Example (inside ``compute()``)::
+
+            for step in range(total_steps):
+                if self.is_compute_cancelled():
+                    return {"progress": 0.0, "finished": False}
+
+                partial = step / total_steps
+                self.emit_intermediate({"progress": partial})
+
+                do_work(step)
+
+            return {"progress": 1.0, "finished": True}
+        """
+        self._intermediate_signal.emit(results)
+
+    @Slot(object)
+    def _on_intermediate_results(self, results: object) -> None:
+        """Apply intermediate results on the main thread.
+
+        Updates only the ports present in *results* so that the existing
+        cache for other ports is preserved.  Marks downstream nodes dirty
+        so they re-evaluate against the fresh cache values.
+
+        Does **not** alter the node state, dirty flag, or pulse
+        animation — the node remains in COMPUTING for the entire
+        duration of the background task.
+
+        Back-pressure note: downstream nodes that are already dirty
+        (haven't finished their own evaluation yet) silently absorb
+        the ``set_dirty`` call — no work is duplicated.  When they do
+        evaluate, ``_gather_inputs`` reads the latest cache value.
+        """
+        if not self._is_computing or not isinstance(results, dict):
+            return
+
+        import time as _time
+        timestamp = _time.time()
+        for port_name, value in results.items():
+            self._cached_values[port_name] = CacheEntry(
+                value=value,
+                is_valid=True,
+                timestamp=timestamp,
+                source_state=NodeState.COMPUTING,
+            )
+
+        # Notify downstream so they pick up the new cache values
+        self._mark_downstream_dirty("intermediate_update")
+
+        if hasattr(self, 'data_updated'):
+            self.data_updated.emit()
 
     # ──────────────────────────────────────────────────────────────
     # WIDGET SNAPSHOT HOOK  (override in subclass)
@@ -625,6 +702,7 @@ class ThreadedManualNode(BaseControlNode):
     compute_cancelled = Signal()
     compute_error     = Signal(str)
     compute_progress  = Signal(int)
+    _intermediate_signal = Signal(object)  # internal bridge for emit_intermediate
 
     def __init__(self, title: str = "Threaded Manual", **kwargs: Any) -> None:
         super().__init__(title, **kwargs)
@@ -635,6 +713,12 @@ class ThreadedManualNode(BaseControlNode):
         self._current_worker: Optional[ComputeWorker] = None
         self._thread_pool: QThreadPool = QThreadPool.globalInstance()
         self._pre_compute_state: Optional[NodeState] = None
+
+        # ── Intermediate results bridge ──
+        self._intermediate_signal.connect(
+            self._on_intermediate_results,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     # ──────────────────────────────────────────────────────────────
     # PUBLIC API
@@ -681,6 +765,61 @@ class ThreadedManualNode(BaseControlNode):
         worker = self._current_worker
         if worker is not None:
             worker.signals.progress.emit(max(0, min(100, percent)))
+
+    def emit_intermediate(self, results: Dict[str, Any]) -> None:
+        """
+        Push intermediate output values to downstream nodes while the
+        worker is still running.
+
+        Safe to call from the **worker thread**.  The data is marshalled
+        to the main thread via a queued signal where the cache is updated
+        and ``data_updated`` is emitted — the node stays in COMPUTING
+        state and the pulse animation continues uninterrupted.
+
+        Args:
+            results: A dict mapping output-port names to their current
+                     intermediate values.  Only the ports present in the
+                     dict are updated; other cached values are untouched.
+
+        Example (inside ``compute()``)::
+
+            for step in range(total_steps):
+                if self.is_compute_cancelled():
+                    return {"status": "cancelled"}
+
+                self.emit_intermediate({"progress": step / total_steps})
+                do_work(step)
+
+            return {"progress": 1.0, "status": "done"}
+        """
+        self._intermediate_signal.emit(results)
+
+    @Slot(object)
+    def _on_intermediate_results(self, results: object) -> None:
+        """Apply intermediate results on the main thread.
+
+        Updates only the ports present in *results*.  Marks downstream
+        nodes dirty so they re-evaluate against the fresh cache values.
+        Does **not** alter node state, dirty flag, or pulse animation.
+        """
+        if not self._is_computing or not isinstance(results, dict):
+            return
+
+        import time as _time
+        timestamp = _time.time()
+        for port_name, value in results.items():
+            self._cached_values[port_name] = CacheEntry(
+                value=value,
+                is_valid=True,
+                timestamp=timestamp,
+                source_state=NodeState.COMPUTING,
+            )
+
+        # Notify downstream so they pick up the new cache values
+        self._mark_downstream_dirty("intermediate_update")
+
+        if hasattr(self, 'data_updated'):
+            self.data_updated.emit()
 
     def snapshot_widget_inputs(self) -> Dict[str, Any]:
         """

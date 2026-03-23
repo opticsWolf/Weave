@@ -766,18 +766,24 @@ class NodeDockAdapter(QDockWidget):
     @Slot()
     def _on_node_unbound(self) -> None:
         """The panel's node was unbound.
-
+    
         For dynamic docks this can happen when a pinned node is deleted.
         The panel has already cleared itself and reset ``is_pinned`` to
         False, so we re-sync to whatever is currently selected on the
         canvas — the dock stays open and resumes following selection.
-
+    
         Static docks never reach this path because node deletion
         triggers ``linked_node_lost`` → ``_on_linked_node_lost`` instead.
         """
         if self._mode == DockMode.DYNAMIC and self._selection_scene is not None:
-            self._sync_to_current_selection()
-
+            # Defer — just like _on_selection_changed does — so that this
+            # slot cannot re-enter bind_node while a bind is already in
+            # progress (e.g. the outer bind_node calls _unbind_internal
+            # which emits node_unbound, which would otherwise trigger a
+            # synchronous _sync_to_current_selection in the middle of the
+            # outer bind, causing _build_mirrors to run twice).
+            QTimer.singleShot(0, self._sync_to_current_selection)
+            
     # ──────────────────────────────────────────────────────────────────────
     # Title sync — static dock title follows node name (change #1)
     # ──────────────────────────────────────────────────────────────────────
