@@ -86,17 +86,28 @@ class NodePortsMixin:
         return self._add_port(name, datatype, is_output=True, desc=desc)
 
     def _add_port(self, name: str, datatype: str, is_output: bool, desc: str = "") -> NodePort:
-        """Add a port with duplicate-name validation."""
+        """Add a port, returning the existing one if a duplicate exists.
+
+        Idempotent: if a port with the same name already exists on the
+        same side, it is returned directly and no signal is emitted.
+        """
         port_list = self.outputs if is_output else self.inputs
-        if any(p.name == name for p in port_list):
-            side = "Output" if is_output else "Input"
-            raise ValueError(
-                f"{side} port '{name}' already exists on node "
-                f"'{self._get_title_text()}'"
+        existing = next((p for p in port_list if p.name == name), None)
+        if existing is not None:
+            log.debug(
+                f"_add_port: {'output' if is_output else 'input'} port "
+                f"'{name}' already exists on '{self._get_title_text()}' "
+                f"— returning existing"
             )
+            return existing
 
         port = NodePort(self, name, datatype, is_output, desc)
         port_list.append(port)
+
+        log.debug(
+            f"_add_port: created {'output' if is_output else 'input'} "
+            f"'{name}' on '{self._get_title_text()}'"
+        )
 
         self.auto_resize()
         self.update_geometry()
@@ -150,6 +161,11 @@ class NodePortsMixin:
             ``True`` if the port was found and removed, ``False`` otherwise.
         """
         # 1. Resolve -------------------------------------------------------
+        port_label = port if isinstance(port, str) else getattr(port, 'name', '?')
+        log.debug(
+            f"remove_port ENTER: '{port_label}' is_output={is_output} "
+            f"on '{self._get_title_text()}'"
+        )
         if isinstance(port, str):
             resolved = self.find_port(port, is_output=is_output)
             if resolved is None:
@@ -265,9 +281,13 @@ class NodePortsMixin:
         :meth:`remove_ports`; the caller is responsible for the final
         geometry pass.
         """
+        trace_count = len(getattr(port, 'connected_traces', []))
+        log.debug(
+            f"_detach_port: '{port.name}' on '{self._get_title_text()}' "
+            f"(traces={trace_count})"
+        )
+
         # 2. Disconnect traces --------------------------------------------
-        #    Snapshot — remove_from_scene mutates connected_traces via
-        #    NodePort.remove_trace(), so iterate over a copy.
         for trace in list(getattr(port, 'connected_traces', [])):
             try:
                 if hasattr(trace, 'remove_from_scene'):
