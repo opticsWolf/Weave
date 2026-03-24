@@ -6,11 +6,11 @@ Copyright (c) 2026 opticsWolf
 
 SPDX-License-Identifier: Apache-2.0
 
-threaded_display_node.py
+generic_display_node.py
 ------------------------
 A ThreadedNode display sink that runs ValueConverter off the main thread.
 
-``ThreadedSmartDisplayNode`` is a drop-in replacement for
+``GenericDisplayNode`` is a drop-in replacement for
 ``SmartDisplayNode`` for cases where the incoming data is large (e.g. a
 big NumPy array or a deep dict) and the conversion work would
 noticeably stall the UI if it ran synchronously.
@@ -41,7 +41,7 @@ Architecture
     upstream node
          │  data (any)
          ▼
-    ThreadedSmartDisplayNode
+    GenericDisplayNode
       ├── compute()          [worker thread]
       │     ValueConverter.convert(value)  →  _pending_text
       │     return {}                      (no output ports)
@@ -456,7 +456,7 @@ class ValueConverter:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ThreadedSmartDisplayNode
+# GenericDisplayNode
 # ══════════════════════════════════════════════════════════════════════════════
 
 @register_node
@@ -582,15 +582,15 @@ class GenericDisplayNode(ThreadedNode):
         try:
             np = sys.modules.get("numpy")
             if np is not None and isinstance(value, np.ndarray):
-                return ThreadedSmartDisplayNode._fmt_bytes(value.nbytes)
+                return GenericDisplayNode._fmt_bytes(value.nbytes)
             if isinstance(value, (list, tuple, set, frozenset, dict)):
                 n = len(value)
                 return f"{n:,} item{'s' if n != 1 else ''}"
             if isinstance(value, (bytes, bytearray)):
-                return ThreadedSmartDisplayNode._fmt_bytes(len(value))
+                return GenericDisplayNode._fmt_bytes(len(value))
             if isinstance(value, str):
                 return f"{len(value):,} char{'s' if len(value) != 1 else ''}"
-            return ThreadedSmartDisplayNode._fmt_bytes(sys.getsizeof(value))
+            return GenericDisplayNode._fmt_bytes(sys.getsizeof(value))
         except Exception:
             return ""
 
@@ -628,7 +628,7 @@ class GenericDisplayNode(ThreadedNode):
             value = inputs.get("data")
             self._pending_text = self._build_display_text(value)
         except Exception as exc:
-            log.error(f"Exception in ThreadedSmartDisplayNode.compute: {exc}")
+            log.error(f"Exception in GenericDisplayNode.compute: {exc}")
             self._pending_text = f"<error: {exc}>"
 
         # Sink node — no output ports to populate.
@@ -653,7 +653,7 @@ class GenericDisplayNode(ThreadedNode):
                 except RuntimeError:
                     pass  # Widget already deleted during scene teardown
         except Exception as exc:
-            log.error(f"Exception in ThreadedSmartDisplayNode.on_evaluate_finished: {exc}")
+            log.error(f"Exception in GenericDisplayNode.on_evaluate_finished: {exc}")
         finally:
             super().on_evaluate_finished()
 

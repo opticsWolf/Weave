@@ -47,7 +47,6 @@ Design notes
 from __future__ import annotations
 
 import math
-import numpy as np
 from typing import Any, ClassVar, Dict, List, Optional
 
 from PySide6.QtCore import Signal, Slot
@@ -61,7 +60,7 @@ from PySide6.QtWidgets import (
 
 from weave.basenode import ActiveNode
 from weave.noderegistry import register_node
-from weave.widgetcore import PortRole, WidgetCore
+from weave.widgetcore import WidgetCore
 
 from weave.logger import get_logger
 
@@ -138,9 +137,7 @@ class IntInputNode(ActiveNode):
             default=0,
         )
 
-        for pd in self._widget_core.get_port_definitions():
-            if pd.role in (PortRole.OUTPUT, PortRole.BIDIRECTIONAL):
-                self.add_output(pd.name, pd.datatype, pd.description)
+        self.add_output("value", "int")
 
         self._widget_core.value_changed.connect(self._on_core_changed)
         self.set_content_widget(self._widget_core)
@@ -251,9 +248,7 @@ class FloatInputNode(ActiveNode):
             default=0.0,
         )
 
-        for pd in self._widget_core.get_port_definitions():
-            if pd.role in (PortRole.OUTPUT, PortRole.BIDIRECTIONAL):
-                self.add_output(pd.name, pd.datatype, pd.description)
+        self.add_output("value", "float")
 
         self._widget_core.value_changed.connect(self._on_core_changed)
         self.set_content_widget(self._widget_core)
@@ -355,9 +350,7 @@ class StringInputNode(ActiveNode):
             default="",
         )
 
-        for pd in self._widget_core.get_port_definitions():
-            if pd.role in (PortRole.OUTPUT, PortRole.BIDIRECTIONAL):
-                self.add_output(pd.name, pd.datatype, pd.description)
+        self.add_output("text", "string")
 
         self._widget_core.value_changed.connect(self._on_core_changed)
         self.set_content_widget(self._widget_core)
@@ -461,9 +454,7 @@ class TextBoxInputNode(ActiveNode):
             setter=lambda v: self._editor.setPlainText(str(v)),
         )
 
-        for pd in self._widget_core.get_port_definitions():
-            if pd.role in (PortRole.OUTPUT, PortRole.BIDIRECTIONAL):
-                self.add_output(pd.name, pd.datatype, pd.description)
+        self.add_output("text", "string")
 
         # textChanged has no arguments — use a lambda shim
         self._editor.textChanged.connect(lambda: self._on_core_changed("text"))
@@ -722,7 +713,7 @@ class TextListNode(ActiveNode):
                 self._parse_lines(self._editor.toPlainText())
             )
         except Exception as exc:
-            log.error(f"Exception in SimpleListNode._on_editor_changed: {exc}")
+            log.error(f"Exception in TextListNode._on_editor_changed: {exc}")
 
     # ── Computation ──────────────────────────────────────────────────
 
@@ -732,7 +723,7 @@ class TextListNode(ActiveNode):
             result = self._parse_lines(self._editor.toPlainText())
             return {"list": result}
         except Exception as exc:
-            log.error(f"Exception in SimpleListNode.compute: {exc}")
+            log.error(f"Exception in TextListNode.compute: {exc}")
             return {"list": []}
 
     def cleanup(self) -> None:

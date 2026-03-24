@@ -79,7 +79,7 @@ from PySide6.QtWidgets import (
 
 from weave.threadednodes import ThreadedNode
 from weave.noderegistry import register_node
-from weave.widgetcore import PortRole, WidgetCore
+from weave.widgetcore import WidgetCore
 
 from weave.logger import get_logger
 

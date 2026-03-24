@@ -87,7 +87,7 @@ from PySide6.QtWidgets import (
 
 from weave.basenode import ActiveNode
 from weave.noderegistry import register_node
-from weave.widgetcore import PortRole, WidgetCore
+from weave.widgetcore import WidgetCore
 from weave.node.node_enums import VerticalSizePolicy
 
 from weave.logger import get_logger
@@ -476,7 +476,7 @@ class NumpyArrayNode(ActiveNode):
         stale_dim_ports = [p for p in list(self.inputs)
                            if p.name.startswith("dim_")]
         if stale_dim_ports:
-            self.remove_ports(stale_dim_ports, is_output=False)
+            self.remove_ports(stale_dim_ports)
 
         # ── 2. Tear down stale dim widget bindings from __init__ ──────
         form: QFormLayout = self._widget_core.layout()
