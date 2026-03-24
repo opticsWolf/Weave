@@ -110,6 +110,17 @@ def _get_port_lists(node) -> Tuple[list, list]:
     return in_list, out_list
 
 
+def _batch_trigger_compute(input_ports: list) -> None:
+    """Fire set_dirty once per unique downstream node."""
+    from weave.portutils import ConnectionFactory
+    seen: set = set()
+    for port in input_ports:
+        node = getattr(port, 'node', None)
+        if node is not None and id(node) not in seen:
+            seen.add(id(node))
+            ConnectionFactory._trigger_compute(port)
+
+
 # ======================================================================
 # Base class
 # ======================================================================
@@ -450,7 +461,8 @@ class RemoveNodesCommand(UndoCommand):
                 node.restore_state(state)
             canvas.add_node(node, pos)
 
-        # 2. Re-create connections
+        # 2. Re-create connections (deferred compute)
+        affected: list = []
         for src_uuid, src_idx, dst_uuid, dst_idx in self._connections:
             src_node = _find_node(canvas, src_uuid)
             dst_node = _find_node(canvas, dst_uuid)
@@ -459,10 +471,13 @@ class RemoveNodesCommand(UndoCommand):
             _in, out = _get_port_lists(src_node)
             in2, _out2 = _get_port_lists(dst_node)
             if src_idx < len(out) and dst_idx < len(in2):
-                ConnectionFactory.create(
+                trace = ConnectionFactory.create(
                     canvas, out[src_idx], in2[dst_idx],
-                    validate=False, trigger_compute=True,
+                    validate=False, trigger_compute=False,
                 )
+                if trace is not None:
+                    affected.append(in2[dst_idx])
+        _batch_trigger_compute(affected)
 
     def redo(self, canvas) -> None:
         # Remove in reverse order
@@ -529,13 +544,18 @@ class AddConnectionCommand(UndoCommand):
 # ======================================================================
 
 class RemoveConnectionsCommand(UndoCommand):
-    """One or more connections were removed."""
+    """One or more connections were removed.
+
+    Undo/redo defer per-trace compute triggers and batch once per
+    downstream node.
+    """
 
     def __init__(self, connections: List[ConnectionTuple]) -> None:
         self._connections = connections
 
     def undo(self, canvas) -> None:
         from weave.portutils import ConnectionFactory
+        affected: list = []
         for src_uuid, src_idx, dst_uuid, dst_idx in self._connections:
             src_node = _find_node(canvas, src_uuid)
             dst_node = _find_node(canvas, dst_uuid)
@@ -544,13 +564,17 @@ class RemoveConnectionsCommand(UndoCommand):
             _, out = _get_port_lists(src_node)
             in_list, _ = _get_port_lists(dst_node)
             if src_idx < len(out) and dst_idx < len(in_list):
-                ConnectionFactory.create(
+                trace = ConnectionFactory.create(
                     canvas, out[src_idx], in_list[dst_idx],
-                    validate=False, trigger_compute=True,
+                    validate=False, trigger_compute=False,
                 )
+                if trace is not None:
+                    affected.append(in_list[dst_idx])
+        _batch_trigger_compute(affected)
 
     def redo(self, canvas) -> None:
         from weave.portutils import ConnectionFactory
+        affected: list = []
         for src_uuid, _src_idx, dst_uuid, dst_idx in self._connections:
             dst_node = _find_node(canvas, dst_uuid)
             if dst_node is None:
@@ -558,8 +582,11 @@ class RemoveConnectionsCommand(UndoCommand):
             in_list, _ = _get_port_lists(dst_node)
             if dst_idx >= len(in_list):
                 continue
-            for trace in list(getattr(in_list[dst_idx], 'connected_traces', [])):
-                ConnectionFactory.remove(trace, trigger_compute=True)
+            dst_port = in_list[dst_idx]
+            for trace in list(getattr(dst_port, 'connected_traces', [])):
+                ConnectionFactory.remove(trace, trigger_compute=False)
+            affected.append(dst_port)
+        _batch_trigger_compute(affected)
 
     @property
     def description(self) -> str:
@@ -654,7 +681,8 @@ class RemovePortCommand(UndoCommand):
         else:
             node.add_input(self._port_name, self._datatype, self._port_desc)
 
-        # 2. Re-create connections
+        # 2. Re-create connections (deferred compute)
+        affected: list = []
         for src_uuid, src_idx, dst_uuid, dst_idx in self._connections:
             src_node = _find_node(canvas, src_uuid)
             dst_node = _find_node(canvas, dst_uuid)
@@ -663,10 +691,13 @@ class RemovePortCommand(UndoCommand):
             _, out = _get_port_lists(src_node)
             in_list, _ = _get_port_lists(dst_node)
             if src_idx < len(out) and dst_idx < len(in_list):
-                ConnectionFactory.create(
+                trace = ConnectionFactory.create(
                     canvas, out[src_idx], in_list[dst_idx],
-                    validate=False, trigger_compute=True,
+                    validate=False, trigger_compute=False,
                 )
+                if trace is not None:
+                    affected.append(in_list[dst_idx])
+        _batch_trigger_compute(affected)
 
     def redo(self, canvas) -> None:
         node = _find_node(canvas, self._node_uuid)

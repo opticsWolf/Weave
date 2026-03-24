@@ -63,8 +63,12 @@ def create_state_factory() -> StateFactory:
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def disconnect_selected_nodes(canvas) -> int:
+def disconnect_selected_nodes(canvas, undo_manager=None) -> int:
     """Disconnect all traces from selected movable nodes.
+
+    Uses deferred compute triggers and wraps the operation in an
+    explicit macro (if *undo_manager* is provided) so all downstream
+    state changes are bundled into one undo step.
 
     Returns the number of traces removed.
     """
@@ -77,20 +81,47 @@ def disconnect_selected_nodes(canvas) -> int:
         return 0
 
     traces_to_remove: set = set()
+    affected_input_ports: list = []
     for node in nodes:
         for attr in ("inputs", "outputs"):
             for port in getattr(node, attr, []):
                 for trace in list(getattr(port, "connected_traces", [])):
-                    traces_to_remove.add(trace)
+                    if trace not in traces_to_remove:
+                        traces_to_remove.add(trace)
+                        target = getattr(trace, "target", None)
+                        if target is not None:
+                            affected_input_ports.append(target)
+
+    if not traces_to_remove:
+        return 0
+
+    if undo_manager:
+        undo_manager.begin_macro(
+            f"Disconnect {len(traces_to_remove)} traces")
 
     removed = 0
     for trace in traces_to_remove:
         try:
-            ConnectionFactory.remove(trace, trigger_compute=True)
+            ConnectionFactory.remove(trace, trigger_compute=False)
             removed += 1
         except RuntimeError as exc:
             log.debug(f"Trace already removed: {exc}")
         except Exception as exc:
             log.warning(f"Unexpected error disconnecting trace: {exc}")
+
+    # Single batch recompute per downstream node
+    if removed:
+        seen: set = set()
+        for port in affected_input_ports:
+            node = getattr(port, "node", None)
+            if node is not None and id(node) not in seen:
+                seen.add(id(node))
+                if hasattr(node, "set_dirty"):
+                    node.set_dirty("disconnect")
+                elif hasattr(node, "evaluate"):
+                    node.evaluate()
+
+    if undo_manager:
+        undo_manager.end_macro()
 
     return removed
