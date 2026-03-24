@@ -109,8 +109,8 @@ class CanvasCommandsMixin:
         style_manager = StyleManager.instance()
         current_theme = style_manager.current_theme
         if current_theme:
-            style_manager.apply_theme(current_theme)
-
+            style_manager.apply_theme_and_prefs(current_theme)
+            
         self._canvas.update()
         self._undo_manager.clear()
         log.info("New canvas created with default settings")
