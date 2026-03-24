@@ -208,10 +208,11 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
                 raise ValueError(f"Invalid role '{role}'") from e
 
         if port_name in self._bindings:
-            raise ValueError(
-                f"Port name '{port_name}' is already registered in this "
-                f"WidgetCore.  Use unregister_widget() first."
+            log.debug(
+                f"register_widget: '{port_name}' already registered — "
+                f"returning (idempotent)"
             )
+            return
 
         binding = WidgetBinding(
             port_name=port_name,
@@ -238,7 +239,12 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
 
         def _on_change(*_args, _pn=pn):
             if not self._suppress_depth:
+                log.debug(f"_on_change → value_changed.emit('{_pn}')"
+                          f"  suppress_depth={self._suppress_depth}")
                 self.value_changed.emit(_pn)
+            else:
+                log.debug(f"_on_change SUPPRESSED: '{_pn}'  "
+                          f"suppress_depth={self._suppress_depth}")
 
         connect_change_signal(binding, _on_change)
         widget.installEventFilter(self)
@@ -366,8 +372,11 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         """
         binding = self._bindings.get(port_name)
         if binding is None:
+            log.debug(f"apply_port_value: '{port_name}' not bound — skipped")
             return
 
+        log.debug(f"apply_port_value: '{port_name}' = {value!r} "
+                  f"(suppress_depth will be {self._suppress_depth + 1})")
         try:
             self._suppress_depth += 1
             if binding.setter is not None:
