@@ -511,7 +511,24 @@ class StyleManager(QObject):
     def available_themes(self) -> List[str]:
         return list(THEMES.keys())
     
-    def apply_theme(self, theme_name: str) -> bool:
+    def apply_theme(self, theme_name: str, *, persist_workspace: bool = False) -> bool:
+        """Apply *theme_name* and broadcast the result to all subscribers.
+
+        Parameters
+        ----------
+        theme_name:
+            Name of the theme to apply (must be registered in ``THEMES``).
+        persist_workspace:
+            When ``True`` (user-initiated switch), the theme's ``grid_type``
+            and ``connection_type`` values are written to QSettings so that
+            the next session starts with those values instead of the stale
+            workspace prefs from the previous theme.  Snapping is also
+            persisted because it was already preserved in-memory.
+
+            Leave ``False`` for internal calls (``_boot``, ``showEvent``)
+            where workspace prefs are either not yet loaded or are about
+            to be layered on top by ``_apply_workspace_prefs_silent()``.
+        """
         if theme_name not in THEMES:
             return False
 
@@ -556,6 +573,18 @@ class StyleManager(QObject):
         # Persist so the next session starts with this theme.
         self._persist_theme(theme_name)
 
+        # For user-initiated switches, overwrite the stale workspace pref
+        # keys (grid_type, connection_type, snapping) so that the next
+        # boot's _apply_workspace_prefs_silent() reads the new theme's
+        # values instead of silently reverting to the previous theme's
+        # settings.
+        if persist_workspace:
+            self.persist_workspace_prefs()
+            _debug_print(
+                f"apply_theme('{theme_name}'): persisted workspace prefs "
+                f"(grid_type, connection_type, snapping) for new theme"
+            )
+
         return True
 
     def apply_theme_and_prefs(self, theme_name: str) -> bool:
@@ -566,8 +595,9 @@ class StyleManager(QObject):
         the full theme + workspace state must be broadcast together.
 
         For user-initiated theme switches (menu clicks), use
-        ``apply_theme()`` directly — the new theme's grid/trace
-        defaults should take effect, not the user's old overrides.
+        ``apply_theme(theme_name, persist_workspace=True)`` directly —
+        the new theme's grid/trace defaults take effect and are persisted
+        so the next session restores them correctly.
         """
         if not self.apply_theme(theme_name):
             return False
@@ -950,7 +980,7 @@ class StyleManager(QObject):
         if overrides:
             self.register_theme(name, overrides)
             if apply:
-                self.apply_theme(name)
+                self.apply_theme(name, persist_workspace=True)
             return True
         return False
     
@@ -993,6 +1023,11 @@ class StyleManager(QObject):
                             if isinstance(cat_data, dict):
                                 self.update(cat, **cat_data)
                 self._current_theme = theme_name
+                # The full-state path bypasses apply_theme(), so we must
+                # explicitly persist the theme name and the workspace prefs
+                # (grid_type, connection_type, snapping) that were just loaded.
+                self._persist_theme(theme_name)
+                self.persist_workspace_prefs()
                 return True
             else:
                 return self.import_theme(theme_name, data, apply=apply)
