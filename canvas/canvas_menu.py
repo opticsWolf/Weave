@@ -759,7 +759,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         All we need here is a viewport repaint so new visuals are flushed.
         """
         manager = StyleManager.instance()
-        if not manager.apply_theme(theme_name):
+        if not manager.apply_theme(theme_name, persist_workspace=True):
             log.warning(f"apply_theme('{theme_name}') returned False – theme may be unknown.")
             return
 
