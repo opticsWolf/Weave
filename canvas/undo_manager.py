@@ -6,38 +6,28 @@ Copyright (c) 2026 opticsWolf
 
 SPDX-License-Identifier: Apache-2.0
 
-UndoManager — Command-pattern undo/redo for the node graph
-============================================================
+UndoManager — Command-pattern undo/redo with compute-fence tracking
+====================================================================
 
-Macro-based cascade tracking
------------------------------
-Every user action (widget edit, disconnect, delete) may trigger a
-cascade of secondary effects: port additions/removals, downstream
-evaluations, auto-disable widget value changes.  All commands pushed
-during one cascade are collected into a **macro** and wrapped as a
-single ``CompoundCommand``, so one Ctrl+Z reverses the entire cascade.
+Compute fence
+-------------
+``BaseControlNode.set_dirty`` increments ``scene._eval_fence`` when
+scheduling a deferred ``evaluate``, and ``_fenced_evaluate`` decrements
+it when the evaluate callback completes.  This gives the undo manager
+an exact count of in-flight evaluations — no tick-counting, no timers.
 
-Auto-macros
-~~~~~~~~~~~
-When ``value_changed`` fires on any widget, the undo manager auto-opens
-a macro before pushing the ``WidgetValueCommand``.  All subsequent
-commands from the same cascade (downstream widget changes from evaluate,
-etc.) go into the same macro.  A debounce mechanism keeps the macro
-open until the cascade settles — checked via ``QTimer.singleShot(0)``
-with a stability test (did the macro grow since the last check?).
+Macro cascade tracking
+----------------------
+Every ``push()`` auto-opens a macro.  The macro stays open while
+``scene._eval_fence > 0`` (evaluations pending) OR while new commands
+keep arriving.  Once the fence drains and the macro is stable for 1
+additional tick (to catch widget updates that fire from within the
+last evaluate), the macro is finalized into a ``CompoundCommand``.
 
-Explicit macros
-~~~~~~~~~~~~~~~
-Canvas-level bulk operations (shake/backspace disconnect) call
-``begin_macro()`` / ``end_macro()`` explicitly.  ``end_macro()``
-schedules the same debounce close, covering deferred evaluations.
-
-Port lifecycle
-~~~~~~~~~~~~~~
-``port_added`` / ``port_removed`` signals do **not** push commands.
-Port changes are always side-effects of a primary action whose
-command handles undo/redo by re-triggering the node's own handlers.
-Port slots only manage widget baselines.
+Restore guard
+-------------
+During ``undo()`` / ``redo()``, ``_restoring`` stays True until the
+fence drains and no more deferred activity has occurred.
 
 Debug logging
 ~~~~~~~~~~~~~
@@ -68,7 +58,7 @@ def _dbg(msg: str) -> None:
 
 
 class UndoManager:
-    """Command-stack undo/redo for the node canvas with macro support."""
+    """Command-stack undo/redo with compute-fence-based macro support."""
 
     def __init__(
         self,
@@ -83,9 +73,6 @@ class UndoManager:
         self._undo_stack: deque[UndoCommand] = deque(maxlen=max_steps)
         self._redo_stack: List[UndoCommand] = []
         self._restoring: bool = False
-        self._restore_activity: int = 0       # bumped by deferred cascades
-        self._restore_last_activity: int = 0  # snapshot for stability check
-        self._restore_stable_ticks: int = 0   # must be stable for 2 ticks
 
         # Merge window
         self._merge_window_ms = merge_window_ms
@@ -96,16 +83,17 @@ class UndoManager:
 
         # Widget-core wiring
         self._connected_cores: Dict[int, Tuple[Any, Any]] = {}
-        self._port_slots: Dict[int, Tuple[Any, Any]] = {}
+        self._port_slots: Dict[int, Tuple[Any, Any, Any]] = {}
         self._widget_baselines: Dict[Tuple[str, str], Any] = {}
 
         # ── Macro state ──────────────────────────────────────────────
         self._in_macro: bool = False
         self._macro_label: str = ""
         self._macro_stack: List[UndoCommand] = []
-        self._macro_close_scheduled: bool = False
-        self._macro_last_size: int = 0
-        self._macro_stable_ticks: int = 0  # must be stable for 2 ticks
+        self._macro_check_scheduled: bool = False
+
+        # ── Restore state ────────────────────────────────────────────
+        self._restore_check_scheduled: bool = False
 
         if hasattr(canvas, 'node_added'):
             canvas.node_added.connect(self._on_node_added)
@@ -113,25 +101,27 @@ class UndoManager:
             canvas.node_removed.connect(self._on_node_removed)
 
     # ==================================================================
+    # Fence accessor
+    # ==================================================================
+
+    def _eval_fence(self) -> int:
+        """Read the scene-level pending-evaluation counter."""
+        return getattr(self._canvas, '_eval_fence', 0)
+
+    # ==================================================================
     # Public API
     # ==================================================================
 
     def push(self, cmd: UndoCommand) -> None:
-        """Record a command.  Goes into the macro if one is open.
-
-        If no macro is open, one is auto-opened so that any deferred
-        side-effects (downstream evaluations from ``set_dirty``) are
-        bundled into the same undo step.  This covers ALL code paths
-        — widget changes, disconnects, deletions — without requiring
-        each caller to manually open a macro.
-        """
+        """Record a command.  Auto-opens a macro to capture cascades."""
         if self._restoring:
             _dbg(f"push BLOCKED (_restoring): {cmd.description}")
             return
 
-        _dbg(f"push: {cmd.description}  macro={self._in_macro}")
+        _dbg(f"push: {cmd.description}  macro={self._in_macro}  "
+             f"fence={self._eval_fence()}")
 
-        # Auto-open a macro for ANY command if none is open
+        # Auto-open a macro for ANY command
         if not self._in_macro:
             # Try merge first (rapid widget edits)
             if self._merge_open and self._undo_stack:
@@ -144,7 +134,7 @@ class UndoManager:
 
         self._macro_stack.append(cmd)
         _dbg(f"  → macro stack (depth={len(self._macro_stack)})")
-        self._schedule_macro_close()
+        self._schedule_macro_check()
 
     # ==================================================================
     # Macro API
@@ -159,19 +149,15 @@ class UndoManager:
         self._in_macro = True
         self._macro_label = label
         self._macro_stack = []
-        self._macro_close_scheduled = False
-        self._macro_last_size = 0
-        self._macro_stable_ticks = 0
+        self._macro_check_scheduled = False
         _dbg(f"begin_macro: '{label}'")
 
     def end_macro(self) -> None:
-        """Signal that the explicit macro body is done.
-        Schedules a debounce close to capture deferred evaluations.
-        """
+        """Signal that the explicit macro body is done."""
         if not self._in_macro:
             return
-        _dbg(f"end_macro: scheduling close for '{self._macro_label}'")
-        self._schedule_macro_close()
+        _dbg(f"end_macro: scheduling check for '{self._macro_label}'")
+        self._schedule_macro_check()
 
     def _begin_auto_macro(self, label: str) -> None:
         """Open a macro automatically from push()."""
@@ -181,57 +167,62 @@ class UndoManager:
         self._in_macro = True
         self._macro_label = label
         self._macro_stack = []
-        self._macro_close_scheduled = False
-        self._macro_last_size = 0
-        self._macro_stable_ticks = 0
+        self._macro_check_scheduled = False
         _dbg(f"auto_macro OPEN: '{label}'")
 
-    def _schedule_macro_close(self) -> None:
-        """Record size, reset stability counter, schedule check."""
-        self._macro_last_size = len(self._macro_stack)
-        self._macro_stable_ticks = 0  # new command arrived → reset
-        if not self._macro_close_scheduled:
-            self._macro_close_scheduled = True
+    def _schedule_macro_check(self) -> None:
+        """Schedule a fence+stability check on the next tick."""
+        if not self._macro_check_scheduled:
+            self._macro_check_scheduled = True
             QTimer.singleShot(0, self._try_close_macro)
 
     def _try_close_macro(self) -> None:
-        """Close the macro only after 2 consecutive stable ticks.
-
-        Deferred evaluations from ``set_dirty`` also use
-        ``QTimer.singleShot(0)``.  A single stable check would race
-        with them.  Two ticks guarantees that any evaluate scheduled
-        in the same tick as the command has already fired.
-        """
-        self._macro_close_scheduled = False
+        """Close the macro when fence==0 and stable for 1 extra tick."""
+        self._macro_check_scheduled = False
         if not self._in_macro:
             return
 
-        current_size = len(self._macro_stack)
-        _dbg(f"_try_close_macro: size={current_size}, "
-             f"last={self._macro_last_size}, "
-             f"stable_ticks={self._macro_stable_ticks}")
+        fence = self._eval_fence()
+        size = len(self._macro_stack)
 
-        if current_size > self._macro_last_size:
-            _dbg("  → grew, resetting stability")
-            self._macro_stable_ticks = 0
-            self._schedule_macro_close()
-            return
+        _dbg(f"_try_close_macro: fence={fence}, size={size}")
 
-        self._macro_stable_ticks += 1
-        if self._macro_stable_ticks < 2:
-            _dbg("  → stable tick 1/2, rechecking")
-            self._macro_last_size = current_size
-            self._macro_close_scheduled = True
+        if fence > 0:
+            _dbg("  → fence > 0, rescheduling")
+            self._macro_check_scheduled = True
             QTimer.singleShot(0, self._try_close_macro)
             return
 
-        _dbg("  → stable tick 2/2, finalizing")
+        # Fence is 0 — do one more tick to catch widget updates
+        # that fire from within the last evaluate.
+        _dbg("  → fence=0, one more stability check")
+        self._macro_check_scheduled = True
+        QTimer.singleShot(0, lambda: self._macro_final_check(size))
+
+    def _macro_final_check(self, prev_size: int) -> None:
+        """Second check: if macro didn't grow and fence still 0, close."""
+        self._macro_check_scheduled = False
+        if not self._in_macro:
+            return
+
+        fence = self._eval_fence()
+        size = len(self._macro_stack)
+
+        _dbg(f"_macro_final_check: fence={fence}, size={size}, "
+             f"prev={prev_size}")
+
+        if fence > 0 or size > prev_size:
+            _dbg("  → grew or fence>0, restarting")
+            self._schedule_macro_check()
+            return
+
+        _dbg("  → stable, finalizing")
         self._finalize_macro()
 
     def _finalize_macro(self) -> None:
         """Wrap collected commands into CompoundCommand and push."""
         self._in_macro = False
-        self._macro_close_scheduled = False
+        self._macro_check_scheduled = False
         children = self._macro_stack
         self._macro_stack = []
         label = self._macro_label
@@ -284,8 +275,7 @@ class UndoManager:
 
         cmd = self._undo_stack.pop()
         self._restoring = True
-        self._restore_activity = 0
-        self._restore_stable_ticks = 0
+        self._restore_check_scheduled = False
         _dbg(f"undo START: {cmd.description}")
         try:
             cmd.undo(self._canvas)
@@ -309,8 +299,7 @@ class UndoManager:
 
         cmd = self._redo_stack.pop()
         self._restoring = True
-        self._restore_activity = 0
-        self._restore_stable_ticks = 0
+        self._restore_check_scheduled = False
         _dbg(f"redo START: {cmd.description}")
         try:
             cmd.redo(self._canvas)
@@ -325,40 +314,45 @@ class UndoManager:
             self._schedule_restore_check()
 
     def _schedule_restore_check(self) -> None:
-        """Schedule a stability check for the restore guard."""
-        self._restore_last_activity = self._restore_activity
-        QTimer.singleShot(0, self._try_finish_restore)
+        """Schedule a fence check for restore completion."""
+        if not self._restore_check_scheduled:
+            self._restore_check_scheduled = True
+            QTimer.singleShot(0, self._try_finish_restore)
 
     def _try_finish_restore(self) -> None:
-        """Clear _restoring only after 2 consecutive stable ticks.
-
-        Same pattern as macro close.  Activity is bumped by
-        ``_on_value_changed`` and port slots whenever they fire during
-        a restore, telling us the cascade is still running.
-        """
+        """Clear _restoring when fence==0 + 1 stable tick."""
+        self._restore_check_scheduled = False
         if not self._restoring:
             return
 
-        current = self._restore_activity
-        _dbg(f"_try_finish_restore: activity={current}, "
-             f"last={self._restore_last_activity}, "
-             f"stable={self._restore_stable_ticks}")
+        fence = self._eval_fence()
+        _dbg(f"_try_finish_restore: fence={fence}")
 
-        if current > self._restore_last_activity:
-            _dbg("  → activity detected, resetting stability")
-            self._restore_stable_ticks = 0
-            self._restore_last_activity = current
+        if fence > 0:
+            _dbg("  → fence > 0, rescheduling")
+            self._restore_check_scheduled = True
             QTimer.singleShot(0, self._try_finish_restore)
             return
 
-        self._restore_stable_ticks += 1
-        if self._restore_stable_ticks < 2:
-            _dbg("  → stable tick 1/2, rechecking")
-            self._restore_last_activity = current
-            QTimer.singleShot(0, self._try_finish_restore)
+        # Fence is 0 — one more tick for deferred widget updates
+        _dbg("  → fence=0, one more check")
+        self._restore_check_scheduled = True
+        QTimer.singleShot(0, self._restore_final_check)
+
+    def _restore_final_check(self) -> None:
+        """Second check: if fence still 0, clear restore."""
+        self._restore_check_scheduled = False
+        if not self._restoring:
             return
 
-        _dbg("  → stable tick 2/2, finalizing")
+        fence = self._eval_fence()
+        _dbg(f"_restore_final_check: fence={fence}")
+
+        if fence > 0:
+            _dbg("  → fence > 0 again, restarting")
+            self._schedule_restore_check()
+            return
+
         self._restoring = False
         self.snapshot_widget_baselines()
         _dbg("_finish_restore: _restoring=False, baselines refreshed")
@@ -375,9 +369,9 @@ class UndoManager:
         self._close_merge_window()
         self._in_macro = False
         self._macro_stack.clear()
-        self._macro_close_scheduled = False
-        self._macro_stable_ticks = 0
+        self._macro_check_scheduled = False
         self._restoring = False
+        self._restore_check_scheduled = False
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._disconnect_all_cores()
@@ -445,13 +439,13 @@ class UndoManager:
             if hasattr(node, 'port_added'):
                 pa_slot = self._make_port_added_slot(node_uuid, wc)
                 node.port_added.connect(pa_slot)
-                self._port_slots[id(node)] = (pa_slot, None)
+                self._port_slots[id(node)] = (node, pa_slot, None)
 
             if hasattr(node, 'port_removed'):
                 pr_slot = self._make_port_removed_slot(node_uuid)
                 node.port_removed.connect(pr_slot)
-                existing = self._port_slots.get(id(node), (None, None))
-                self._port_slots[id(node)] = (existing[0], pr_slot)
+                existing = self._port_slots.get(id(node), (node, None, None))
+                self._port_slots[id(node)] = (node, existing[1], pr_slot)
 
             _dbg(f"_wire_node: {node_uuid[:8]} "
                  f"bindings={list(wc.bindings().keys())}")
@@ -463,18 +457,13 @@ class UndoManager:
     # ------------------------------------------------------------------
 
     def _make_widget_slot(self, node_uuid: str, wc):
-        """Return a slot that pushes WidgetValueCommands and auto-opens
-        macros to capture cascading side-effects.
-        """
+        """Push WidgetValueCommands into the current macro."""
         def _on_value_changed(port_name: str = ""):
             if not port_name:
                 return
             if self._restoring:
-                # Cascade still active — signal to _try_finish_restore
-                self._restore_activity += 1
                 _dbg(f"value_changed BLOCKED (_restoring): "
-                     f"{node_uuid[:8]}:{port_name}  "
-                     f"activity={self._restore_activity}")
+                     f"{node_uuid[:8]}:{port_name}")
                 return
 
             key = (node_uuid, port_name)
@@ -484,18 +473,17 @@ class UndoManager:
                 return
 
             old_value = self._widget_baselines.get(key)
-
             if old_value is None:
                 self._widget_baselines[key] = new_value
                 _dbg(f"value_changed: {node_uuid[:8]}:{port_name} "
-                     f"— no baseline, stored {new_value!r}")
+                     f"— no baseline, stored")
                 return
 
             if old_value == new_value:
                 return
 
             _dbg(f"value_changed: {node_uuid[:8]}:{port_name} "
-                 f"{old_value!r} → {new_value!r}")
+                 f"{repr(old_value)[:40]} → {repr(new_value)[:40]}")
 
             cmd = WidgetValueCommand(node_uuid, port_name,
                                      old_value, new_value)
@@ -510,8 +498,6 @@ class UndoManager:
             port_name = getattr(port, 'name', '')
             if not port_name or wc is None:
                 return
-            if self._restoring:
-                self._restore_activity += 1
             try:
                 if hasattr(wc, 'has_binding') and wc.has_binding(port_name):
                     val = wc.get_port_value(port_name)
@@ -529,8 +515,6 @@ class UndoManager:
             port_name = getattr(port, 'name', '')
             if not port_name:
                 return
-            if self._restoring:
-                self._restore_activity += 1
             removed = self._widget_baselines.pop(
                 (node_uuid, port_name), None)
             if removed is not None:
@@ -550,6 +534,20 @@ class UndoManager:
             except (RuntimeError, TypeError):
                 pass
         self._connected_cores.clear()
+
+        for node_ref, pa_slot, pr_slot in self._port_slots.values():
+            if node_ref is None:
+                continue
+            if pa_slot is not None and hasattr(node_ref, 'port_added'):
+                try:
+                    node_ref.port_added.disconnect(pa_slot)
+                except (RuntimeError, TypeError):
+                    pass
+            if pr_slot is not None and hasattr(node_ref, 'port_removed'):
+                try:
+                    node_ref.port_removed.disconnect(pr_slot)
+                except (RuntimeError, TypeError):
+                    pass
         self._port_slots.clear()
 
     def _on_node_added(self, node) -> None:
@@ -567,7 +565,7 @@ class UndoManager:
                 pass
         port_entry = self._port_slots.pop(id(node), None)
         if port_entry is not None:
-            pa_slot, pr_slot = port_entry
+            _node_ref, pa_slot, pr_slot = port_entry
             if pa_slot is not None and hasattr(node, 'port_added'):
                 try:
                     node.port_added.disconnect(pa_slot)

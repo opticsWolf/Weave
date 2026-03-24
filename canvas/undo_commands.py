@@ -268,20 +268,27 @@ class WidgetValueCommand(UndoCommand):
         # signal handlers drive side-effects (e.g. a count spinbox's
         # valueChanged → _on_count_changed → port creation/removal).
         #
-        # set_port_value blocks ALL signals, which is correct for normal
-        # upstream data pushes but breaks undo/redo because the node's
-        # internal handlers never run.
-        #
         # apply_port_value suppresses only WidgetCore's value_changed
         # (preventing the undo manager from re-recording), while letting
         # QSpinBox.valueChanged etc. propagate to the node's own slots.
-        # The undo manager's _restoring flag is also True as a secondary
-        # guard.
         if hasattr(wc, 'apply_port_value'):
             wc.apply_port_value(self.port_name, value)
         else:
-            # Fallback for older WidgetCore without apply_port_value
             wc.set_port_value(self.port_name, value)
+
+        # Explicitly mark the node dirty so downstream nodes re-evaluate.
+        # apply_port_value suppresses WidgetCore.value_changed, which is
+        # the only trigger for set_dirty on simple value nodes (e.g.
+        # IntInputNode).  Without this, undoing a value change on an
+        # upstream node leaves downstream nodes stale — they never
+        # recompute because set_dirty was never called.
+        #
+        # For nodes with native signal handlers (e.g. MultiFloatOutputNode
+        # _on_count_changed), set_dirty may fire twice (once from the
+        # handler, once here) — but NodeDataFlow.set_dirty short-circuits
+        # on already-dirty nodes, so the duplicate is harmless.
+        if hasattr(node, 'set_dirty'):
+            node.set_dirty("undo_redo")
 
     def try_merge(self, other: UndoCommand) -> bool:
         if (
