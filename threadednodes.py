@@ -644,24 +644,27 @@ class ThreadedNode(BaseControlNode):
         if self._pending_dirty:
             self._pending_dirty = False
             self._is_dirty = True
-            QTimer.singleShot(0, self._safe_evaluate)
+            if not self._eval_pending:
+                self._eval_pending = True
+                self._increment_eval_fence()
+                QTimer.singleShot(0, self._fenced_evaluate)
 
     def set_dirty(self, reason: str = "value_change") -> None:
         """
-        Override: if currently computing, cancel and schedule re-eval
-        instead of evaluating immediately.
-        """
-        already_dirty = self._is_dirty
+        Override: if currently computing, cancel and schedule re-eval.
 
-        # Mark dirty via the mixin (propagates downstream)
+        Uses ``_eval_pending`` to prevent duplicate fence increments
+        from repeated ``set_dirty`` calls on the same node.
+        """
         NodeDataFlow.set_dirty(self, reason)
 
         if self._is_computing:
-            # Don't dispatch a new eval — just queue re-eval after cancel
             self._pending_dirty = True
             self.cancel_compute()
-        elif not self._manual_mode and not already_dirty:
-            QTimer.singleShot(0, self._safe_evaluate)
+        elif not self._manual_mode and not self._eval_pending:
+            self._eval_pending = True
+            self._increment_eval_fence()
+            QTimer.singleShot(0, self._fenced_evaluate)
 
     # ── Cleanup ───────────────────────────────────────────────────
 
@@ -839,7 +842,15 @@ class ThreadedManualNode(BaseControlNode):
     # ──────────────────────────────────────────────────────────────
 
     def evaluate(self, visited: Optional[Set[int]] = None) -> None:
-        """Dispatch compute() to the thread pool."""
+        """Dispatch compute() to the thread pool.
+
+        When called from ``_fenced_evaluate``, the fence has already been
+        incremented.  For the synchronous passthrough path, the fence is
+        decremented normally in ``_fenced_evaluate``'s finally block.
+        For the threaded path, we set ``_fence_held = True`` so
+        ``_fenced_evaluate`` knows NOT to decrement — the fence is held
+        until the worker callback decrements it in ``_decrement_worker_fence``.
+        """
         # ── Guards ────────────────────────────────────────────────
         if self._state == NodeState.DISABLED:
             return
@@ -847,7 +858,7 @@ class ThreadedManualNode(BaseControlNode):
         if self._is_computing:
             return
 
-        # Passthrough runs synchronously
+        # Passthrough runs synchronously — fence handled normally
         if self._state == NodeState.PASSTHROUGH:
             super().evaluate(visited)
             return
@@ -871,8 +882,6 @@ class ThreadedManualNode(BaseControlNode):
         if _HAS_COMPUTING_STATE:
             try:
                 super(BaseControlNode, self).set_state(NodeState.COMPUTING)
-                # Pulse animation bypassed the normal set_state path —
-                # start it explicitly.
                 if hasattr(self, '_start_computing_pulse'):
                     self._start_computing_pulse()
             except Exception:
@@ -894,9 +903,42 @@ class ThreadedManualNode(BaseControlNode):
 
         self._current_worker = worker
 
+        # Tell _fenced_evaluate not to decrement — we hold the fence
+        # until the worker callback fires.
+        self._fence_held = True
+
         # ── Dispatch ──────────────────────────────────────────────
         self.compute_started.emit()
         self._thread_pool.start(worker)
+
+    def _fenced_evaluate(self) -> None:
+        """Override: hold the fence for threaded evaluations.
+
+        Clears ``_eval_pending`` first so new ``set_dirty`` calls
+        during evaluate can schedule a fresh cycle.
+
+        For synchronous paths (passthrough, disabled, already-computing
+        bail-outs), decrement the fence normally.  For threaded dispatch,
+        ``evaluate()`` sets ``_fence_held = True`` and the fence is
+        decremented later in the worker callbacks.
+        """
+        self._eval_pending = False
+        self._fence_held = False
+        try:
+            if self._is_dirty:
+                self._safe_evaluate()
+        finally:
+            if not self._fence_held:
+                self._decrement_eval_fence()
+
+    def _decrement_worker_fence(self) -> None:
+        """Decrement the fence after a threaded worker completes.
+
+        Called from _on_worker_finished, _on_worker_error,
+        _on_worker_cancelled.
+        """
+        self._fence_held = False
+        self._decrement_eval_fence()
 
     # ──────────────────────────────────────────────────────────────
     # WORKER CALLBACKS  (main thread)
@@ -943,6 +985,7 @@ class ThreadedManualNode(BaseControlNode):
         finally:
             self._is_computing = False
             self._current_worker = None
+            self._decrement_worker_fence()
             self.compute_finished.emit()
 
     @Slot(str)
@@ -957,6 +1000,7 @@ class ThreadedManualNode(BaseControlNode):
         self._restore_pre_compute_state()
         self._is_computing = False
         self._current_worker = None
+        self._decrement_worker_fence()
         self.compute_error.emit(error_msg)
 
     @Slot()
@@ -965,6 +1009,7 @@ class ThreadedManualNode(BaseControlNode):
         self._restore_pre_compute_state()
         self._is_computing = False
         self._current_worker = None
+        self._decrement_worker_fence()
         self.compute_cancelled.emit()
 
     # ──────────────────────────────────────────────────────────────

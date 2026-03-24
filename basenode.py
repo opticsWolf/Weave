@@ -490,13 +490,13 @@ class BaseControlNode(Node, NodeDataFlow):
         Node.__init__(self, title, **kwargs)
         NodeDataFlow.__init__(self)
         
-        # Removed: self.unique_id: str = str(_uuid.uuid4())  # REMOVED
-        # UUID is now handled at the Node level in node_core.py
-
         # Apply the class-level vertical size policy to the instance.
-        # Node.__init__ sets GROW_ONLY as default; the subclass ClassVar
-        # overrides it here so each node type can declare its preference.
         self._vertical_size_policy = type(self).vertical_size_policy
+
+        # Per-node flag: True when a _fenced_evaluate is scheduled but
+        # hasn't fired yet.  Prevents duplicate fence increments from
+        # repeated set_dirty calls on the same node.
+        self._eval_pending: bool = False
         
         # Wire port lifecycle signals to dataflow/widget cleanup.
         self.port_removed.connect(self._on_port_removed)
@@ -641,38 +641,92 @@ class BaseControlNode(Node, NodeDataFlow):
         
         # DISABLED -> anything else: Restore and re-evaluate
         if old_state == NodeState.DISABLED:
-            # Cache was preserved, now mark dirty to recompute
             self._is_dirty = True
-            if not self._manual_mode:
-                QTimer.singleShot(0, self._safe_evaluate)
+            if not self._manual_mode and not self._eval_pending:
+                self._eval_pending = True
+                self._increment_eval_fence()
+                QTimer.singleShot(0, self._fenced_evaluate)
         
         # anything -> DISABLED: Already preserved, notify downstream
         elif new_state == NodeState.DISABLED:
-            # Downstream needs fresh data (which will be disabled values)
             self._mark_downstream_dirty("upstream_disabled")
         
         # NORMAL <-> PASSTHROUGH: Clear cache and re-evaluate
         elif (old_state == NodeState.NORMAL and new_state == NodeState.PASSTHROUGH) or \
              (old_state == NodeState.PASSTHROUGH and new_state == NodeState.NORMAL):
-            # Clear the cache to avoid mixing compute() and passthrough results
             self._cached_values.clear()
             self._is_dirty = True
-            if not self._manual_mode:
-                QTimer.singleShot(0, self._safe_evaluate)
+            if not self._manual_mode and not self._eval_pending:
+                self._eval_pending = True
+                self._increment_eval_fence()
+                QTimer.singleShot(0, self._fenced_evaluate)
 
     def _safe_evaluate(self) -> None:
         """Evaluate with safety checks for Qt deletion."""
         if self._is_scene_valid():
             self.evaluate()
 
+    # ------------------------------------------------------------------
+    # Eval fence — tracks pending deferred evaluations for undo manager
+    # ------------------------------------------------------------------
+
+    def _increment_eval_fence(self) -> None:
+        """Increment the scene-level pending-evaluation counter.
+
+        Called when ``QTimer.singleShot(0, _fenced_evaluate)`` is
+        scheduled.  The undo manager checks this counter to know when
+        all deferred evaluations have completed.
+        """
+        try:
+            scene = self.scene()
+            if scene is not None:
+                scene._eval_fence = getattr(scene, '_eval_fence', 0) + 1
+        except RuntimeError:
+            pass
+
+    def _decrement_eval_fence(self) -> None:
+        """Decrement the scene-level pending-evaluation counter."""
+        try:
+            scene = self.scene()
+            if scene is not None:
+                scene._eval_fence = max(
+                    0, getattr(scene, '_eval_fence', 0) - 1)
+        except RuntimeError:
+            pass
+
+    def _fenced_evaluate(self) -> None:
+        """Run evaluate if still dirty, always decrement the fence.
+
+        Clears ``_eval_pending`` first so that a ``set_dirty`` triggered
+        from *within* evaluate (e.g. compute → _set_count → set_dirty)
+        can schedule a fresh evaluate + fence increment.
+        """
+        self._eval_pending = False
+        try:
+            if self._is_dirty:
+                self._safe_evaluate()
+        finally:
+            self._decrement_eval_fence()
+
     def set_dirty(self, reason: str = "value_change") -> None:
-        """Overrides Logic.set_dirty for Qt-specific behavior."""
-        already_dirty = self._is_dirty
-        
+        """Overrides Logic.set_dirty for Qt-specific behavior.
+
+        Increments the eval fence and schedules ``_fenced_evaluate``
+        only if this node doesn't already have a pending evaluate
+        (``_eval_pending``).  This prevents infinite fence pumping
+        from recursive ``_mark_downstream_dirty`` cascades while
+        still ensuring every evaluate cycle is tracked by the fence.
+
+        The fence is the mechanism the undo manager uses to know when
+        all deferred evaluations have completed — the macro stays open
+        while ``fence > 0``.
+        """
         NodeDataFlow.set_dirty(self, reason)
 
-        if not self._manual_mode and not already_dirty:
-            QTimer.singleShot(0, self._safe_evaluate)
+        if not self._manual_mode and not self._eval_pending:
+            self._eval_pending = True
+            self._increment_eval_fence()
+            QTimer.singleShot(0, self._fenced_evaluate)
         elif self._manual_mode:
             self.update()
 
