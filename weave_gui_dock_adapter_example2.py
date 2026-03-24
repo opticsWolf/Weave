@@ -17,7 +17,8 @@ Demonstrates a **fully-docked** layout (Pattern 2):
 import sys
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMainWindow, QDockWidget, QWidget
-
+import os
+os.environ["WEAVE_UNDO_DEBUG"] = "1"
 
 def main():
     app = QApplication.instance() or QApplication(sys.argv)
