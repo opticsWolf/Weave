@@ -33,15 +33,9 @@ from PySide6.QtGui import (
 )
 
 # ------------------------------------------------------------------------------
-# NEW IMPORTS: Icon Painters & Enum
+# Icon Provider & Button Enum
 # ------------------------------------------------------------------------------
-from weave.canvas.canvas_minimap_icons import (
-    MinimapButton, 
-    IconReset, 
-    IconFit, 
-    IconPin, 
-    IconSnap
-)
+from weave.canvas.canvas_icon_provider import MinimapButton, get_minimap_icon_provider
 
 # Import StyleManager for centralized styling
 from weave.stylemanager import StyleManager, StyleCategory
@@ -93,13 +87,8 @@ class CanvasMinimap(QGraphicsView):
         if config:
             self.set_config(**config)
 
-        # 2. Initialize Icon Painters
-        self._icon_painters = {
-            MinimapButton.RESET: IconReset(),
-            MinimapButton.FIT: IconFit(),
-            MinimapButton.PIN: IconPin(),
-            MinimapButton.SNAP: IconSnap()
-        }
+        # 2. Initialize Icon Provider
+        self._icon_provider = get_minimap_icon_provider()
 
         # Interaction State — restore persisted corner, fall back to TOP_RIGHT
         persisted_corner = self._style_manager.get_minimap_corner()
@@ -524,28 +513,8 @@ class CanvasMinimap(QGraphicsView):
         painter.restore()
 
     def _draw_minimized_icon(self, painter: QPainter):
-        """Draws a simple 'Map' icon when minimized."""
-        vp_rect = self.viewport().rect()
-        c = vp_rect.center()
-        
-        pen = QPen(self._config['text_color'], 2)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-
-        # Draw a small grid/map symbol
-        w = vp_rect.width() * 0.5
-        h = vp_rect.height() * 0.5
-        r = QRectF(c.x() - w/2, c.y() - h/2, w, h)
-        
-        painter.drawRoundedRect(r, 2, 2)
-        
-        # Dots inside
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self._config['text_color'])
-        dot_size = 3
-        painter.drawEllipse(r.center(), dot_size/2, dot_size/2)
-        painter.drawEllipse(QPointF(r.left() + 4, r.top() + 4), dot_size/2, dot_size/2)
-        painter.drawEllipse(QPointF(r.right() - 4, r.bottom() - 4), dot_size/2, dot_size/2)
+        """Draws the minimap SVG icon when the widget is in minimized/icon-only state."""
+        self._icon_provider.draw_minimized(painter, self.viewport().rect(), self._config)
 
     def _draw_zoom_label(self, painter: QPainter):
         """Draw zoom percentage label."""
@@ -601,18 +570,17 @@ class CanvasMinimap(QGraphicsView):
             painter.setPen(pen_symbol)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             
-            # Determine specific state for the icon painter
+            # Determine state for the icon provider
             state = False
             if btn_type == MinimapButton.PIN:
-                # IconPin expects: True = Pinned (Active Color), False = Unpinned (Slanted)
-                # Logic: auto_hide_enabled=False -> Pinned
+                # state=True  → "pin"   icon, active colour  (auto-hide off = pinned)
+                # state=False → "unpin" icon, border colour  (auto-hide on  = unpinned)
                 state = not self._auto_hide_enabled
             elif btn_type == MinimapButton.SNAP:
                 state = is_snapping
 
-            # 3. Delegate to Icon Painter
-            if btn_type in self._icon_painters:
-                self._icon_painters[btn_type].paint(painter, rect, self._config, state)
+            # 3. Delegate to Icon Provider
+            self._icon_provider.draw_button(painter, rect, self._config, btn_type, state)
 
             painter.restore()
 
