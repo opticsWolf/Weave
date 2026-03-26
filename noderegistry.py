@@ -18,18 +18,6 @@ from typing import Dict, List, Type, Union, Optional, Any, TYPE_CHECKING, NamedT
 from collections import defaultdict
 import re
 
-# Lazy import for QIcon — only needed when get_node_icon() is called,
-# which keeps the registry importable in headless / test environments.
-_QIcon = None
-
-def _ensure_qicon():
-    """Import QIcon on first use (avoids hard dependency on a running QApp)."""
-    global _QIcon
-    if _QIcon is None:
-        from PySide6.QtGui import QIcon
-        _QIcon = QIcon
-    return _QIcon
-
 # Use TYPE_CHECKING to avoid circular imports during runtime
 if TYPE_CHECKING:
     from weave.basenode import ActiveNode, ManualNode
@@ -81,10 +69,6 @@ class NodeRegistry:
         self._tree: Dict[str, Dict[Optional[str], List[NodeCls]]] = defaultdict(lambda: defaultdict(list))
         # Structure: { "NodeClassName": NodeClass }
         self._flat_map: Dict[str, NodeCls] = {}
-        # Icon cache: { "icon_path_string": QIcon_instance }
-        self._icon_cache: Dict[str, Any] = {}
-        # Sentinel for paths that failed to load (avoid retrying)
-        self._ICON_MISS = object()
 
     def register(self, cls: NodeCls) -> NodeCls:
         """
@@ -516,55 +500,110 @@ class NodeRegistry:
             return [str(t) for t in tags]
         return [str(tags)]
 
-    def get_node_icon(self, node_cls: NodeCls) -> Optional[Any]:
+    @staticmethod
+    def get_node_icon_stem(node_cls: NodeCls) -> Optional[str]:
         """
-        Resolve and cache a ``QIcon`` for a node class.
+        Return the icon stem (file name without extension) for a node class.
 
-        Reads the ``node_icon`` class variable, loads the icon once, and
-        caches it for all subsequent calls.  Failed lookups are also
-        cached (as a miss sentinel) so we never retry a broken path.
+        This is the value of ``node_icon`` — e.g. ``"blur"`` — which
+        ``NodeIconProvider`` combines with ``node_icon_path`` to locate the
+        SVG file on disk.
 
         Args:
             node_cls: The node class to inspect.
 
         Returns:
-            A ``QIcon`` instance if the class defines a valid ``node_icon``,
-            otherwise ``None``.
+            Icon stem string, or ``None`` if unset.
         """
-        icon_path = getattr(node_cls, 'node_icon', None)
-        if not icon_path:
-            return None
+        return getattr(node_cls, 'node_icon', None)
 
-        # Check cache (hits AND misses)
-        cached = self._icon_cache.get(icon_path)
-        if cached is self._ICON_MISS:
-            return None
-        if cached is not None:
-            return cached
+    @staticmethod
+    def get_node_class_icon_stem(node_cls: NodeCls) -> Optional[str]:
+        """
+        Return the class-level icon stem for a node class.
 
-        # Build icon
-        QIcon = _ensure_qicon()
+        Used by ``NodeIconProvider.for_menu_class()`` to set the icon on
+        category-level menu entries.  The stem is looked up in the same
+        directory as ``node_icon_path``.
+
+        Args:
+            node_cls: The node class to inspect.
+
+        Returns:
+            Class icon stem string, or ``None`` if unset.
+        """
+        return getattr(node_cls, 'node_class_icon', None)
+
+    @staticmethod
+    def get_node_subclass_icon_stem(node_cls: NodeCls) -> Optional[str]:
+        """
+        Return the subclass-level icon stem for a node class.
+
+        Used by ``NodeIconProvider.for_menu_subclass()`` to set the icon
+        on subcategory-level menu entries.
+
+        Args:
+            node_cls: The node class to inspect.
+
+        Returns:
+            Subclass icon stem string, or ``None`` if unset.
+        """
+        return getattr(node_cls, 'node_subclass_icon', None)
+
+    @staticmethod
+    def get_node_icon_dir(node_cls: NodeCls) -> Optional[str]:
+        """
+        Return the icon directory path for a node class.
+
+        This is the value of ``node_icon_path`` and is used as the base
+        directory for all three icon stems (``node_icon``,
+        ``node_class_icon``, ``node_subclass_icon``).  May be an absolute
+        path or a path relative to the node module's location.
+
+        Args:
+            node_cls: The node class to inspect.
+
+        Returns:
+            Directory path string, or ``None`` if unset.
+        """
+        return getattr(node_cls, 'node_icon_path', None)
+
+    def get_node_icon(self, node_cls: NodeCls) -> Optional[Any]:
+        """
+        Return a theme-aware ``QIcon`` for a node class.
+
+        Delegates to the process-wide ``NodeIconProvider`` singleton so
+        the icon is correctly tinted to the active theme's menu-text
+        colour.  Returns ``None`` if the node has no icon or the provider
+        is not yet initialised.
+
+        Args:
+            node_cls: The node class to inspect.
+
+        Returns:
+            A ``QIcon`` instance, or ``None``.
+        """
         try:
-            # Qt resource paths (:/…) are valid if the resource was compiled in
-            if icon_path.startswith(":/") or os.path.isfile(icon_path):
-                icon = QIcon(icon_path)
-                if not icon.isNull():
-                    self._icon_cache[icon_path] = icon
-                    return icon
+            from weave.node_icon_provider import get_node_icon_provider
+            return get_node_icon_provider().for_menu(node_cls)
         except Exception:
-            pass
-
-        # Mark as miss
-        self._icon_cache[icon_path] = self._ICON_MISS
-        return None
+            return None
 
     def clear_icon_cache(self) -> None:
         """
-        Clear the icon cache.
-        
-        Useful after changing icon paths or resource files at runtime.
+        Flush the tinted-icon cache in the active ``NodeIconProvider``.
+
+        The SVG source cache is unaffected — SVG files are never re-read
+        from disk.  Delegates to ``NodeIconProvider`` so the call is safe
+        to make before the provider is initialised (it becomes a no-op).
         """
-        self._icon_cache.clear()
+        try:
+            from weave.node_icon_provider import get_node_icon_provider
+            provider = get_node_icon_provider()
+            provider._menu_cache.clear()
+            provider._header_cache.clear()
+        except Exception:
+            pass
 
     def fuzzy_search(
         self,

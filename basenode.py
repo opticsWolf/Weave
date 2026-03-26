@@ -23,6 +23,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Final, ClassVar, Callable
 from dataclasses import dataclass, field
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt, Signal, QTimer, QObject
 from PySide6.QtWidgets import QApplication, QGraphicsScene, QGraphicsView
 from PySide6.QtGui import QColor, QPainter
@@ -432,9 +434,12 @@ class BaseControlNode(Node, NodeDataFlow):
         node_description:  Short one-liner describing what the node does.
                            Searched by the registry and shown in tooltips.
         node_tags:         List of keywords for search relevance.
-        node_icon:         Path to an icon file (absolute, relative, or
-                           Qt resource ``":/icons/…"``).  Cached by the
-                           registry the first time it is resolved.
+                           
+        node_icon:         Icon name to be provided to Node Icon Provider
+        node_class_icon:   Class-level icon name
+        node_subclass_icon: Subclass-level icon name
+        node_icon_path:    Base path for node icons, can be set individually
+                           by costume nodes
         dock_properties:   Optional ``DockProperties`` instance that defines
                            allowed dock areas, size constraints, and dock
                            feature flags for static dock panels created
@@ -458,7 +463,10 @@ class BaseControlNode(Node, NodeDataFlow):
             node_name        = "Gaussian Blur"
             node_description = "Applies a gaussian blur to the input image."
             node_tags        = ["blur", "smooth", "filter", "gaussian"]
-            node_icon        = ":/icons/blur.svg"
+            node_icon        = "blur"
+            node_class_icon  = "class_icon"
+            node_subclass_icon  = "sub_class_icon"
+            node_icon_path   =   r"path/to/icon"
             dock_properties  = DockProperties(
                 allowed_areas=Qt.DockWidgetArea.LeftDockWidgetArea
                             | Qt.DockWidgetArea.RightDockWidgetArea,
@@ -468,13 +476,18 @@ class BaseControlNode(Node, NodeDataFlow):
             # Node shrinks when ports are removed or hidden
             vertical_size_policy = VerticalSizePolicy.FIT
     """
-    node_class:       ClassVar[str]            = "Basic"
-    node_subclass:    ClassVar[str]            = "Basic"
-    node_name:        ClassVar[Optional[str]]  = None
-    node_description: ClassVar[Optional[str]]  = None
-    node_tags:        ClassVar[Optional[List[str]]] = None
-    node_icon:        ClassVar[Optional[str]]  = None
-    dock_properties:  ClassVar[Optional[DockProperties]] = None
+    node_class:             ClassVar[str]            = "Basic"
+    node_subclass:          ClassVar[str]            = "Basic"
+    node_name:              ClassVar[Optional[str]]  = None
+    node_description:       ClassVar[Optional[str]]  = None
+    node_tags:              ClassVar[Optional[List[str]]] = None
+    node_icon:              ClassVar[Optional[str]]  = "node"
+    node_class_icon:        ClassVar[Optional[str]]  = "node"
+    node_subclass_icon:     ClassVar[Optional[str]]  = "node"
+    #node_icon_path:         ClassVar[Optional[str]]  = r"../resources/node_icons"
+    #print (node_icon_path)
+    node_icon_path:         ClassVar[Optional[str]]  = str(Path(__file__).parent / "resources" / "node_icons")
+    dock_properties:        ClassVar[Optional[DockProperties]] = None
 
     #: Vertical resize behaviour.  Override in subclasses to change the
     #: default.  Can also be changed at runtime via
