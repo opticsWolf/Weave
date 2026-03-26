@@ -1,51 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-Weave: A modular PySide6 framework for the visual synthesis
-and execution of high-concurrency simulation workflows.
-Copyright (c) 2026 opticsWolf
-
-SPDX-License-Identifier: Apache-2.0
-
 Weave Multiprocessing Nodes
 ============================
-Auto-evaluating and manual nodes that execute compute() in a separate process.
+Auto-evaluating and manual nodes with full intermediate result support.
 
-Requirements:
-    1. Subclass MultiprocessingNode or MultiprocessingManualNode.
-    2. Override compute() as a @staticmethod (or assign a module function).
-    3. Use is_cancelled_from_inputs(inputs) inside compute() for cooperative cancellation.
-    
-Example:
-    @register_node
-    class HeavyMathNode(MultiprocessingNode):
-        def __init__(self, **kw):
-            super().__init__("Heavy Math", **kw)
-            self.add_input("values", "list")
-            self.add_output("sum", "float")
-        
-        @staticmethod
-        def compute(inputs):
-            data = inputs.get("values", [])
-            cancel_evt = inputs.get('_cancel_event')
-            
-            total = 0
-            for i, v in enumerate(data):
-                if cancel_evt and cancel_evt.is_set():
-                    return {"sum": None}  # Cancelled
-                total += v ** 2  # heavy-ish work
-            return {"sum": total}
+Key features:
+    - emit_intermediate(inputs, results) from within compute()
+    - report_progress(inputs, percent) helper for progress bars
+    - Shared memory utilities for large data
 """
 
 from typing import Optional, Set, Any, Dict
 
-from PySide6.QtCore import QTimer, Qt, Slot
+from PySide6.QtCore import Qt, Slot
 
 from weave.threadednodes import ThreadedNode, ThreadedManualNode, _HAS_COMPUTING_STATE
 from weave.node.node_enums import NodeState
 from weave.multiprocessingbridge import (
     MultiprocessingWorker,
     MultiprocessingCancellationToken,
-    get_multiprocessing_pool,
+    emit_intermediate,  # Exported for user convenience
+    report_progress,    # Exported for user convenience
+    setup_multiprocessing_cleanup,
 )
 
 from weave.logger import get_logger
@@ -53,15 +29,14 @@ log = get_logger("MultiprocessingNodes")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BASE MIXIN (shared logic)
+# BASE MIXIN (intermediate result handling)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _MultiprocessingMixin:
-    """Shared machinery for process-based nodes."""
+    """Shared machinery for process-based nodes with intermediate results."""
     
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        # Validate that compute is likely picklable at class definition time
         if hasattr(cls, 'compute') and not callable(cls.compute):
             raise TypeError(f"{cls.__name__}.compute must be callable")
     
@@ -69,7 +44,6 @@ class _MultiprocessingMixin:
         """Check if self.compute can be sent to subprocess."""
         import pickle
         try:
-            # Access via __func__ if it's a staticmethod descriptor
             fn = self.compute
             if isinstance(fn, staticmethod):
                 fn = fn.__func__
@@ -92,11 +66,10 @@ class _MultiprocessingMixin:
         return input_params
     
     def _dispatch_worker(self, inputs: Dict[str, Any]) -> None:
-        """Create and start the multiprocessing worker."""
-        # Create process-safe cancellation token
+        """Create and start the multiprocessing worker with intermediate support."""
         self._cancel_token = MultiprocessingCancellationToken()
         
-        # Resolve the static function (handle both staticmethod and function)
+        # Resolve static function
         compute_fn = self.compute
         if isinstance(compute_fn, staticmethod):
             compute_fn = compute_fn.__func__
@@ -107,18 +80,54 @@ class _MultiprocessingMixin:
             cancel_token=self._cancel_token,
         )
         
-        # Wire signals (queued connection ensures main thread reception)
+        # Wire standard signals
         worker.signals.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         worker.signals.error.connect(self._on_worker_error, Qt.ConnectionType.QueuedConnection)
         worker.signals.cancelled.connect(self._on_worker_cancelled, Qt.ConnectionType.QueuedConnection)
         worker.signals.progress.connect(self.compute_progress.emit, Qt.ConnectionType.QueuedConnection)
         
+        # Wire intermediate results (NEW)
+        worker.signals.intermediate.connect(self._handle_intermediate_result, Qt.ConnectionType.QueuedConnection)
+        
         self._current_worker = worker
-        self._thread_pool.start(worker)  # Uses QThreadPool for the monitor thread
+        self._thread_pool.start(worker)
     
-    # ------------------------------------------------------------------
-    # API Compatibility (shadow ThreadedNode's threading token)
-    # ------------------------------------------------------------------
+    @Slot(object)
+    def _handle_intermediate_result(self, results: object) -> None:
+        """
+        Handle intermediate results arriving from the subprocess.
+        Uses the same pathway as ThreadedNode.emit_intermediate.
+        """
+        if not self._is_computing or not isinstance(results, dict):
+            return
+        
+        # Handle special _progress key by emitting compute_progress signal
+        if '_progress' in results:
+            self.compute_progress.emit(results['_progress'])
+            # Don't store _progress in cache unless user has a port named '_progress'
+            results = {k: v for k, v in results.items() if k != '_progress'}
+            if not results:
+                return
+        
+        # Use the inherited intermediate handling from ThreadedNode
+        # which updates cache and marks downstream dirty
+        if hasattr(self, '_on_intermediate_results'):
+            self._on_intermediate_results(results)
+        else:
+            # Fallback: manual cache update
+            import time as _time
+            timestamp = _time.time()
+            from weave.basenode import CacheEntry
+            for port_name, value in results.items():
+                self._cached_values[port_name] = CacheEntry(
+                    value=value,
+                    is_valid=True,
+                    timestamp=timestamp,
+                    source_state=NodeState.COMPUTING,
+                )
+            self._mark_downstream_dirty("intermediate_update")
+            if hasattr(self, 'data_updated'):
+                self.data_updated.emit()
     
     def is_compute_cancelled(self) -> bool:
         """Main-thread check for cancellation status."""
@@ -131,30 +140,51 @@ class _MultiprocessingMixin:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AUTO-EVALUATING MULTIPROCESSING NODE
+# AUTO-EVALUATING NODE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class MultiprocessingNode(_MultiprocessingMixin, ThreadedNode):
     """
-    Auto-evaluating node that runs compute() in a subprocess via multiprocessing.Pool.
+    Auto-evaluating node that runs compute() in a subprocess.
     
-    Inherits all signals from ThreadedNode (compute_started, compute_finished, etc.).
+    Supports emit_intermediate() from within compute() to push partial results
+    back to the main thread while the subprocess continues working.
     
-    **CRITICAL**: Override compute() as a @staticmethod.
+    Example:
+        @register_node
+        class ImageProcessNode(MultiprocessingNode):
+            def __init__(self, **kw):
+                super().__init__("Image Process", **kw)
+                self.add_input("image", "ndarray")
+                self.add_output("result", "ndarray")
+                self.add_output("progress", "float")
+            
+            @staticmethod
+            def compute(inputs):
+                img = inputs["image"]
+                h, w = img.shape[:2]
+                
+                for y in range(h):
+                    if is_cancelled_from_inputs(inputs):
+                        return {"result": None, "status": "cancelled"}
+                    
+                    # Process row...
+                    row_result = img[y] * 2
+                    
+                    # Emit progress every 10 rows
+                    if y % 10 == 0:
+                        report_progress(inputs, int(100 * y / h))
+                        emit_intermediate(inputs, {"progress": y / h})
+                
+                return {"result": processed}
     """
     
     def __init__(self, title: str = "Multiprocessing Node", **kwargs):
-        # Initialize parent but we override the token type later
         super().__init__(title, **kwargs)
-        # Replace the threading-based token with None initially; created per-eval
         self._cancel_token: Optional[MultiprocessingCancellationToken] = None
     
     def evaluate(self, visited: Optional[Set[int]] = None) -> None:
-        """
-        Override ThreadedNode.evaluate to use MultiprocessingWorker instead of ComputeWorker.
-        Logic mirrors ThreadedNode but swaps the execution backend.
-        """
-        # ── State guards (same as ThreadedNode) ─────────────────────
+        """Override to use MultiprocessingWorker."""
         if self._state == NodeState.DISABLED:
             return
         
@@ -168,11 +198,9 @@ class MultiprocessingNode(_MultiprocessingMixin, ThreadedNode):
             return
         
         if self._state == NodeState.PASSTHROUGH:
-            # Passthrough stays synchronous (fast path)
-            super(ThreadedNode, self).evaluate(visited)  # Skip to BaseControlNode
+            super(ThreadedNode, self).evaluate(visited)
             return
         
-        # ── Prepare for compute ─────────────────────────────────────
         self._is_computing = True
         
         if not self._is_compute_picklable():
@@ -186,7 +214,6 @@ class MultiprocessingNode(_MultiprocessingMixin, ThreadedNode):
             self._is_computing = False
             return
         
-        # ── Set COMPUTING state visuals ─────────────────────────────
         self._pre_compute_state = self._state
         if _HAS_COMPUTING_STATE:
             try:
@@ -196,20 +223,35 @@ class MultiprocessingNode(_MultiprocessingMixin, ThreadedNode):
             except Exception:
                 pass
         
-        # ── Dispatch to process pool ────────────────────────────────
         self.compute_started.emit()
         self._dispatch_worker(inputs)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MANUAL MULTIPROCESSING NODE
+# MANUAL NODE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class MultiprocessingManualNode(_MultiprocessingMixin, ThreadedManualNode):
     """
-    Button-triggered node that runs compute() in a subprocess.
+    Button-triggered node with multiprocessing and intermediate results.
     
-    Inherits ThreadedManualNode behavior: execute() starts, execute() again cancels.
+    Example:
+        class ExportNode(MultiprocessingManualNode):
+            def __init__(self, **kw):
+                super().__init__("Heavy Export", **kw)
+                self.btn.clicked.connect(self.execute)
+            
+            @staticmethod
+            def compute(inputs):
+                frames = inputs["frames"]
+                for i, frame in enumerate(frames):
+                    if is_cancelled_from_inputs(inputs):
+                        return {"status": "cancelled"}
+                    
+                    export_frame(frame)
+                    emit_intermediate(inputs, {"exported_count": i + 1})
+                
+                return {"status": "complete"}
     """
     
     def __init__(self, title: str = "Multiprocessing Manual", **kwargs):
@@ -225,10 +267,7 @@ class MultiprocessingManualNode(_MultiprocessingMixin, ThreadedManualNode):
         self.evaluate()
     
     def evaluate(self, visited: Optional[Set[int]] = None) -> None:
-        """
-        Override ThreadedManualNode.evaluate for process-based execution.
-        """
-        # ── Guards ──────────────────────────────────────────────────
+        """Override to use MultiprocessingWorker."""
         if self._state == NodeState.DISABLED:
             return
         
@@ -251,7 +290,6 @@ class MultiprocessingManualNode(_MultiprocessingMixin, ThreadedManualNode):
             self._is_computing = False
             return
         
-        # ── COMPUTING state ─────────────────────────────────────────
         self._pre_compute_state = self._state
         if _HAS_COMPUTING_STATE:
             try:
@@ -261,9 +299,6 @@ class MultiprocessingManualNode(_MultiprocessingMixin, ThreadedManualNode):
             except Exception:
                 pass
         
-        # ── Dispatch ────────────────────────────────────────────────
         self.compute_started.emit()
         self._dispatch_worker(inputs)
-        
-        # Hold the eval fence (threaded path)
         self._fence_held = True
