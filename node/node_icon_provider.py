@@ -99,10 +99,11 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 from pathlib import Path
 from typing import Dict, Optional, Tuple, TYPE_CHECKING
 
-from PySide6.QtGui import QColor, QIcon
+from PySide6.QtGui import QColor, QIcon, QPixmap
 
 from weave.themes.icon_loader import (
     SvgIconLoader,
@@ -193,6 +194,12 @@ class NodeIconProvider:
     _HEADER_LIGHT   = "#E8ECF4"   # icon tint on dark headers
     _HEADER_DARK    = "#1A1C22"   # icon tint on light headers
 
+    # Regex for SVG stroke-width injection — same patterns as MinimapIconProvider.
+    # Attribute form:  stroke-width="1.5"
+    _SW_ATTR  = re.compile(r'stroke-width\s*=\s*"[^"]*"')
+    # CSS property form inside style="…" or <style> blocks: stroke-width: 1.5 / stroke-width:2px
+    _SW_STYLE = re.compile(r'(stroke-width\s*:\s*)[0-9]*\.?[0-9]+(?:px)?')
+
     def __init__(
         self,
         header_size: int = 14,
@@ -204,8 +211,11 @@ class NodeIconProvider:
         # Separate tint caches for each context.
         # menu cache key:   (icon_path, color_hex)
         # header cache key: (icon_path, color_hex, size_px)
-        self._menu_cache:   Dict[Tuple[str, str],      QIcon] = {}
-        self._header_cache: Dict[Tuple[str, str, int], QIcon] = {}
+        self._menu_cache:         Dict[Tuple[str, str],      QIcon]   = {}
+        self._header_cache:       Dict[Tuple[str, str, int], QIcon]   = {}
+        # Pixmap cache for direct header rendering (tinted + stroke-width injected).
+        # key: (icon_path, color_hex, size_px, stroke_width_key)
+        self._header_pixmap_cache: Dict[Tuple[str, str, int, str], QPixmap] = {}
 
         # Paths that failed to load — sentinel avoids retrying.
         self._miss_paths: Dict[str, object] = {}
@@ -226,6 +236,7 @@ class NodeIconProvider:
         """Flush both tint caches; SVG source loaders are preserved."""
         self._menu_cache.clear()
         self._header_cache.clear()
+        self._header_pixmap_cache.clear()
         log.debug(
             f"NodeIconProvider: tint caches flushed for theme '{_theme_name}'."
         )
@@ -562,6 +573,104 @@ class NodeIconProvider:
 
         self._header_cache[cache_key] = icon
         return icon
+
+
+    # ------------------------------------------------------------------
+    # Stroke-width injection
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _inject_stroke_width(cls, svg: str, width: float) -> str:
+        """
+        Replace every ``stroke-width`` declaration in *svg* with *width*.
+
+        Handles both the XML-attribute form (``stroke-width="…"``) and the
+        CSS-property form (``stroke-width: …`` inside ``style`` attributes
+        or ``<style>`` blocks), preserving units other than bare numbers
+        and ``px`` unchanged.
+
+        Parameters
+        ----------
+        svg : str
+            Raw SVG XML source.
+        width : float
+            Desired stroke-width value in SVG user units.
+        """
+        w = f"{width:.4g}"
+        svg = cls._SW_ATTR.sub(f'stroke-width="{w}"', svg)
+        svg = cls._SW_STYLE.sub(lambda m: f"{m.group(1)}{w}", svg)
+        return svg
+
+    # ------------------------------------------------------------------
+    # Header pixmap (tinted + stroke-width injected, for direct drawPixmap)
+    # ------------------------------------------------------------------
+
+    def for_header_pixmap(
+        self,
+        node_cls:     "NodeCls",
+        color_hex:    str,
+        size:         int,
+        stroke_width: float,
+    ) -> Optional[QPixmap]:
+        """
+        Return a tinted, stroke-weighted ``QPixmap`` for in-canvas node
+        header rendering.
+
+        Unlike ``for_header()`` which derives the tint automatically from
+        the background luminance, this method accepts an explicit *color_hex*
+        so the header can pass the exact title-text colour (already
+        selection-state and highlight-aware) and guarantee the icon matches
+        the text visually.
+
+        The *stroke_width* parameter is injected into the SVG source before
+        rendering, mirroring how ``header_icon_default_width`` scales with
+        ``QFont.weight()`` in the caller.
+
+        Results are cached by ``(icon_path, color_hex, size_px,
+        stroke_width_key)`` in ``_header_pixmap_cache``, separate from
+        ``_header_cache`` (which stores ``QIcon`` objects).  Both caches are
+        flushed automatically on ``StyleManager.theme_changed``.
+
+        Parameters
+        ----------
+        node_cls : NodeCls
+            The node class whose ``node_icon`` / ``node_icon_path`` classvars
+            are used to locate the SVG file.
+        color_hex : str
+            Hex tint colour, e.g. ``"#E0ECff"``.  Typically
+            ``self._title.defaultTextColor().name()`` from ``NodeHeader``.
+        size : int
+            Square pixel size for the rendered pixmap.
+        stroke_width : float
+            SVG ``stroke-width`` value to inject.  Pass
+            ``header_icon_default_width * (font_weight / 700.0)`` so the
+            icon weight tracks the title font weight.
+
+        Returns
+        -------
+        QPixmap | None
+            Rendered pixmap, or ``None`` if the icon cannot be resolved.
+        """
+        icon_path = self._resolve_full_path(node_cls, "node_icon", "node_icon_path")
+        if icon_path is None:
+            return None
+
+        sw_key    = f"{stroke_width:.3g}"
+        cache_key = (icon_path, color_hex, size, sw_key)
+
+        if cache_key in self._header_pixmap_cache:
+            return self._header_pixmap_cache[cache_key]
+
+        svg = self._load_raw(icon_path)
+        if svg is None:
+            return None
+
+        svg    = SvgIconLoader._tint_svg(svg, color_hex)
+        svg    = self._inject_stroke_width(svg, stroke_width)
+        pixmap = SvgIconLoader._render_svg(svg.encode("utf-8"), size)
+
+        self._header_pixmap_cache[cache_key] = pixmap
+        return pixmap
 
 
 # ============================================================================

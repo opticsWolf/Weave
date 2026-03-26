@@ -29,6 +29,7 @@ from weave.node.node_enums import NodeState, highlight_colors
 from weave.node.node_subcomponents import (
     StateSlider, MinimizeButton, EditableTitle, ResizeHandle
     )
+from weave.node.node_icon_provider import get_node_icon_provider
 
 # Forward declaration (as in original)
 if TYPE_CHECKING:
@@ -105,7 +106,8 @@ class NodeHeader(QGraphicsItem):
     __slots__ = (
         '_node', '_width', '_title', '_bg_color', '_outline_color',
         '_height', '_minimize_btn', '_state_slider',
-        '_shape_path', '_outline_path', '_bottom_line_path'
+        '_shape_path', '_outline_path', '_bottom_line_path',
+        '_is_selected',
     )
 
     def __init__(self, parent: 'Node', title_text: str):
@@ -133,6 +135,9 @@ class NodeHeader(QGraphicsItem):
         
         self._height = parent._config['header_height']
         
+        # Selection state — tracked so paint() can compute icon stroke weight
+        self._is_selected = False
+
         # Create the MinimizeButton - visual component with hover states
         self._minimize_btn = MinimizeButton(self)
         
@@ -227,6 +232,7 @@ class NodeHeader(QGraphicsItem):
 
     def update_selection_style(self, is_selected: bool):
         """Update title style based on selection state."""
+        self._is_selected = is_selected
         self._title.update_selection_style(is_selected)
         self._recalculate_layout()
 
@@ -272,6 +278,15 @@ class NodeHeader(QGraphicsItem):
         btn_y = (self._height - btn_size) / 2
         
         title_y = (self._height - self._title.boundingRect().height()) / 2
+
+        # --- 2b. Header Icon Reserved Space ---
+        # Reserve horizontal space left of the title when an icon is present.
+        # Icon height matches the font metrics height for optical alignment.
+        _icon_reserved = 0.0
+        if cfg.get('header_icon', True) and getattr(type(self._node), 'node_icon', None):
+            _icon_h = max(10, fm.height())
+            _icon_spacing = cfg.get('header_item_spacing', 10)
+            _icon_reserved = float(_icon_h + _icon_spacing/3)
     
         # --- 3. Position Button (Primary Anchor) ---
         btn_x = self._width - right_padding - btn_size
@@ -287,8 +302,8 @@ class NodeHeader(QGraphicsItem):
         self._state_slider.setPos(slider_x, slider_y)
     
         # --- 5. Position Title ---
-        title_x = left_padding
-        max_title_width = slider_x - title_slider_spacing - left_padding
+        title_x = left_padding + _icon_reserved
+        max_title_width = slider_x - title_slider_spacing/2 - title_x
         max_title_width = max(0.0, max_title_width)
     
         full_text = ""
@@ -428,6 +443,34 @@ class NodeHeader(QGraphicsItem):
             line_pen.setCapStyle(Qt.PenCapStyle.FlatCap) 
             painter.setPen(line_pen)
             painter.drawPath(self._bottom_line_path)
+
+        # --- Draw header icon ---
+        # Rendered only when header_icon=True and the node class defines a
+        # node_icon stem.  Tint = current title-text colour (already
+        # selection-state and highlight-aware from set_colors).
+        # Stroke weight scales with the live title font weight so Normal,
+        # Bold, and ExtraBold headers all feel visually consistent.
+        if cfg.get('header_icon', True):
+            _node_cls = type(self._node)
+            if getattr(_node_cls, 'node_icon', None):
+                _fm       = QFontMetrics(self._title.font())
+                _icon_h   = max(10, _fm.height())
+                # Scale stroke: Bold(700) → base_width × 1.0; heavier/lighter scales linearly.
+                _base_sw  = float(cfg.get('header_icon_default_width', 1.5))
+                _fw_int   = self._title.font().weight()   # int: 400=Normal, 700=Bold …
+                _stroke_w = _base_sw * (max(100, _fw_int) / 400.0)
+                _color    = self._title.defaultTextColor().name()  # "#rrggbb"
+
+                _pixmap = get_node_icon_provider().for_header_pixmap(
+                    _node_cls, _color, _icon_h, _stroke_w
+                )
+                if _pixmap is not None:
+                    _ix = float(cfg.get('header_left_padding',
+                                        cfg.get('header_h_padding', 10)))
+                    _iy = (self._height - _pixmap.height()) / 2.0
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawPixmap(QPointF(_ix, _iy), _pixmap)
 
         # Note: MinimizeButton and StateSlider are QGraphicsObject children and paint themselves
 
