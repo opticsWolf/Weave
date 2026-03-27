@@ -278,8 +278,12 @@ class NodePanel(QWidget):
         title = self._node_title(node)
         if not static:
             self._header.set_title(title)
+            # Show the node's SVG icon to the left of the title.
+            self._header.update_node_icon(type(node))
         else:
             self._header.set_title("")
+            # Static panels hide their header row entirely — no icon needed.
+            self._header.clear_node_icon()
             self.dock_title_changed.emit(title)
 
         self._build_mirrors()
@@ -376,6 +380,7 @@ class NodePanel(QWidget):
         self._header.set_state_text("")
         self._header.set_pin_visible(False)
         self._header.set_pin_checked(False)
+        self._header.clear_node_icon()
 
         self._placeholder.setParent(self._body)
         self._form.addRow(self._placeholder)
