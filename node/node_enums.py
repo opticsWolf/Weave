@@ -55,7 +55,13 @@ def highlight_colors(color: QColor, b_offset: int, s_offset: int = 0) -> QColor:
         b_offset: Lightness delta (positive = brighter).
         s_offset: Saturation delta (positive = more saturated).
     """
+    
     h, s, l, a = color.getHsl()
+    
+    # Handle achromatic colors (where Hue is -1)
+    if h < 0:
+        h = 0
+        
     l = int(max(0, min(255, l + b_offset)))
     s = int(max(0, min(255, s + s_offset)))
     return QColor.fromHsl(int(h), s, l, int(a))
