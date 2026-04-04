@@ -52,12 +52,13 @@ from weave.node.node_config_mixin import NodeConfigMixin
 from weave.node.node_ports_mixin import NodePortsMixin
 from weave.node.node_geometry_mixin import NodeGeometryMixin
 from weave.node.node_pulse_anim_mixin import NodePulseAnimMixin
+from weave.node.uuid_mixin import UUIDMixin  # <-- NEW IMPORT
 
 from weave.logger import get_logger
 log = get_logger("Node")
 
 
-class Node(NodeConfigMixin, NodePortsMixin, NodePulseAnimMixin, NodeGeometryMixin, QGraphicsObject):
+class Node(UUIDMixin, NodeConfigMixin, NodePortsMixin, NodePulseAnimMixin, NodeGeometryMixin, QGraphicsObject):
     """
     Principal node class for the QGraphicsScene.
     Handles visual representation, state transitions, and port management.
@@ -88,7 +89,11 @@ class Node(NodeConfigMixin, NodePortsMixin, NodePulseAnimMixin, NodeGeometryMixi
             title (str): The node's title text
             config (dict, optional): Configuration dictionary for styling
         """
+        # Call all mixin __init__ methods via MRO - this properly initializes UUIDMixin
         super().__init__()
+
+        # Initialize UUID via mixin (early, so it's available immediately)
+        self._init_uuid()
 
         # 1. Configuration & State Setup
         self._config = StyleManager.instance().get_all(StyleCategory.NODE)
@@ -179,36 +184,7 @@ class Node(NodeConfigMixin, NodePortsMixin, NodePulseAnimMixin, NodeGeometryMixi
         # Initialize summary ports after all setup
         self._initialize_summary_ports()
 
-        # 6. Node UUID - NEW: Add unique identifier for this node instance
-        self._node_uuid = uuid.uuid4()
-
-    # ==================================================================
-    # UUID METHODS (ADDED)
-    # ==================================================================
-
-    def get_uuid(self) -> uuid.UUID:
-        """
-        Get the unique identifier for this node.
-        
-        This UUID provides a persistent way to identify nodes across their lifetime,
-        even if other attributes like title or position change.
-        
-        Returns:
-            A uuid.UUID object that uniquely identifies this node instance.
-        """
-        return self._node_uuid
-    
-    def get_uuid_string(self) -> str:
-        """
-        Get the unique identifier for this node as a string representation.
-        
-        This is useful for serialization, logging, and other string-based operations
-        where working with UUID objects directly might be cumbersome.
-        
-        Returns:
-            A string representation of the node's UUID.
-        """
-        return str(self._node_uuid)
+        # 6. Node UUID - NOW HANDLED BY UUIDMixin
 
     # ==================================================================
     # HEADER COLOR — INDEX-BASED API
@@ -304,10 +280,10 @@ class Node(NodeConfigMixin, NodePortsMixin, NodePulseAnimMixin, NodeGeometryMixi
 
     def get_state(self) -> Dict[str, Any]:
         """
-        Serializes GUI-only state: position, geometry, colors, ports, visual state.
-
-        Widget/dataflow state is NOT handled here.
-        BaseControlNode.get_state() extends this with widget_data and dataflow metadata.
+        Serializes GUI-only state, now including the persistent UUID.
+        
+        Returns:
+            dict: State dictionary with node configuration and identity
         """
         inputs_state = [p.get_state() for p in self.inputs]
         outputs_state = [p.get_state() for p in self.outputs]
@@ -332,10 +308,8 @@ class Node(NodeConfigMixin, NodePortsMixin, NodePulseAnimMixin, NodeGeometryMixi
         # whose toolTip has not been populated yet.
         _full_title = self.header._title.toolTip() or self.header._title.toPlainText()
 
-        # NOTE: _config is intentionally NOT saved. Style properties come from the
-        # StyleManager (theme). Only the per-node custom color overrides (colors dict)
-        # are saved — everything else is re-derived from the active theme on load.
         return {
+            "id": self.unique_id,
             "title": _full_title,
             "width": self._width,
             "height": self._total_height,
@@ -350,13 +324,18 @@ class Node(NodeConfigMixin, NodePortsMixin, NodePulseAnimMixin, NodeGeometryMixi
 
     def restore_state(self, state: Dict[str, Any]) -> None:
         """
-        Restores GUI-only state from a dictionary.
-
-        Widget/dataflow state is NOT handled here.
-        BaseControlNode.restore_state() calls super() then restores widget_data.
+        Restores GUI-only state from a dictionary including persistent UUID.
+        
+        Args:
+            state (dict): State dictionary containing node configuration
         """
         was_visible = self.isVisible()
         self.setVisible(False)
+
+        # 1. Restore Identity First - CRITICAL STEP
+        if "id" in state:
+            self.unique_id = state["id"]
+
 
         # NOTE: _config is not restored from the save file — style properties are
         # owned by the StyleManager (theme). Only the per-node custom color overrides

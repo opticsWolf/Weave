@@ -37,9 +37,10 @@ process.
 
 DPI awareness
 -------------
-Pass ``size`` as a logical pixel value.  ``_render_svg`` creates
-a high-DPI pixmap via ``QPixmap.setDevicePixelRatio`` so icons
-are crisp on HiDPI / Retina displays.
+``MenuIconProvider.get()`` dynamically queries ``menu_icon_size()``
+(``QStyle.PM_SmallIconSize``) and passes the exact physical target
+to ``SvgIconLoader``, so the SVG is rasterized at the correct
+resolution in a single pass — no bitmap resampling artifacts.
 
 Color replacement strategy
 --------------------------
@@ -55,14 +56,14 @@ from __future__ import annotations
 import re
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 from PySide6.QtCore import QByteArray, QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QPixmap, QPainter
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication, QStyle, QStyleOption
 
-from weave.themes.icon_loader import SvgIconLoader, get_or_create_loader, scale_pixmap_to_menu
+from weave.themes.icon_loader import SvgIconLoader, get_or_create_loader, menu_icon_size
 from weave.stylemanager import StyleManager, StyleCategory
 from weave.logger import get_logger
 
@@ -70,7 +71,7 @@ log = get_logger("MenuIconProvider")
 
 
 # ==============================================================================
-# Button enum (for minimap icons) - moved from canvas_minimap_icons.py 
+# Button enum (for minimap icons)
 # ==============================================================================
 
 class MinimapButton(Enum):
@@ -82,7 +83,7 @@ class MinimapButton(Enum):
 
 
 # ==============================================================================
-# MenuIconProvider (original functionality)
+# MenuIconProvider
 # ==============================================================================
 
 class MenuIconProvider:
@@ -110,6 +111,14 @@ class MenuIconProvider:
     On construction the provider subscribes to ``StyleManager.theme_changed``
     so the icon cache is flushed automatically whenever the theme switches.
     No manual wiring required by the caller.
+
+    Sizing
+    ------
+    ``get()`` dynamically queries ``menu_icon_size()``
+    (``QStyle.PM_SmallIconSize``) and passes the exact pixel count to
+    ``SvgIconLoader.get()``.  This means the SVG is rasterized at the
+    OS menu metric in a single pass — no post-render bitmap scaling is
+    needed, which eliminates blurry icons on any DPI configuration.
 
     Parameters
     ----------
@@ -184,9 +193,7 @@ class MenuIconProvider:
         re-tints icons with the new theme's text colour.
         """
         self._loader.clear_icon_cache()
-        log.debug(
-            f"MenuIconProvider: cache flushed for theme '{_theme_name}'."
-        )
+        log.debug(f"MenuIconProvider: cache flushed for theme '{_theme_name}'.")
 
     # ------------------------------------------------------------------
     # Public API
@@ -201,6 +208,12 @@ class MenuIconProvider:
         """
         Return a tinted ``QIcon`` for *name*.
 
+        When *size* is ``None``, the method dynamically queries
+        ``menu_icon_size()`` (``QStyle.PM_SmallIconSize``) and passes
+        the exact physical resolution to ``SvgIconLoader``.  This
+        guarantees perfectly crisp SVG rasterization at any OS DPI
+        scale without bitmap resampling.
+
         Parameters
         ----------
         name : str
@@ -209,8 +222,8 @@ class MenuIconProvider:
             Hex colour override.  ``None`` (default) uses the colour
             resolved from the active theme (menu-text colour).
         size : int | None
-            Logical pixel size override.  ``None`` uses the default
-            size passed to the constructor.
+            Logical pixel size override.  ``None`` uses the size
+            returned by ``menu_icon_size()``.
 
         Returns
         -------
@@ -221,10 +234,12 @@ class MenuIconProvider:
         KeyError
             If no SVG file with the given *name* was found.
         """
+        target_size = size if size is not None else menu_icon_size()
+
         return self._loader.get(
             name  = name,
             color = color if color is not None else self._resolve_color(),
-            size  = size  if size  is not None else self._size,
+            size  = target_size,
         )
 
     def get_or_none(
@@ -237,10 +252,12 @@ class MenuIconProvider:
         Like ``get()``, but returns ``None`` instead of raising on a
         missing icon.  Safe to use everywhere icons are optional.
         """
+        target_size = size if size is not None else menu_icon_size()
+
         return self._loader.get_or_none(
             name  = name,
             color = color if color is not None else self._resolve_color(),
-            size  = size  if size  is not None else self._size,
+            size  = target_size,
         )
 
     def has(self, name: str) -> bool:
@@ -254,7 +271,7 @@ class MenuIconProvider:
 
 
 # ==============================================================================
-# MinimapIconProvider (merged from canvas_minimap_icons.py)
+# MinimapIconProvider
 # ==============================================================================
 
 class MinimapIconProvider:
@@ -327,9 +344,7 @@ class MinimapIconProvider:
     def _on_theme_changed(self, _theme_name: str) -> None:
         """Flush pixmap cache on theme switch."""
         self._pixmap_cache.clear()
-        log.debug(
-            f"MinimapIconProvider: pixmap cache flushed for theme '{_theme_name}'."
-        )
+        log.debug(f"MinimapIconProvider: pixmap cache flushed for theme '{_theme_name}'.")
 
     # ------------------------------------------------------------------
     # Colour resolution
@@ -337,11 +352,32 @@ class MinimapIconProvider:
 
     @staticmethod
     def _qcolor_to_hex(color: Any, fallback: str) -> str:
-        """Safely convert a QColor (or raw hex string) to a hex string."""
+        """
+        Safely convert a QColor (or raw hex string/list) to a hex string.
+
+        Handles three input forms that may arrive from StyleManager
+        depending on whether the config value has been coerced yet:
+
+        - ``QColor`` — the normal case after theme application.
+        - ``str`` starting with ``"#"`` — raw hex from unprocessed
+          config dictionaries.
+        - ``list | tuple`` of 3+ numeric values — RGB components from
+          misconfigured or hand-edited theme files.  Components are
+          cast to ``int`` before constructing a ``QColor``.
+
+        Parameters
+        ----------
+        color : Any
+            Value to convert.
+        fallback : str
+            Hex string returned when *color* cannot be interpreted.
+        """
         if isinstance(color, QColor) and color.isValid():
             return color.name()          # "#rrggbb"
         if isinstance(color, str) and color.startswith("#"):
             return color
+        if isinstance(color, (list, tuple)) and len(color) >= 3:
+            return QColor(int(color[0]), int(color[1]), int(color[2])).name()
         return fallback
 
     def _resolve_color(
@@ -606,7 +642,7 @@ class MinimapIconProvider:
 
 
 # ==============================================================================
-# Module-level singleton helpers (keeping both)
+# Module-level singleton helpers
 # ==============================================================================
 
 _menu_provider: Optional[MenuIconProvider] = None

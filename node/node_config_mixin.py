@@ -20,7 +20,6 @@ from typing import Optional, Dict, Any
 from PySide6.QtGui import QColor
 
 from weave.node.node_enums import NodeState, highlight_colors
-#from weave.node import highlight_colors
 from weave.stylemanager import StyleManager, StyleCategory
 
 from weave.logger import get_logger
@@ -250,7 +249,7 @@ class NodeConfigMixin:
             title_color_base = cfg['title_text_color']
 
         if is_selected:
-            h_bg = highlight_colors(base_h_bg, cfg['hl_header_bg'], cfg['hl_header_sat'])
+            h_bg = highlight_colors(base_h_bg, cfg['hl_header_bg'], cfg.get('hl_header_sat', 0))
             b_bg = highlight_colors(base_b_bg, cfg['hl_body_bg'])
             h_outline = highlight_colors(base_h_outline, cfg['hl_outline'])
             b_outline = highlight_colors(base_b_outline, cfg['hl_outline'])
@@ -267,9 +266,11 @@ class NodeConfigMixin:
         self.header.update_selection_style(is_selected)
         self._update_colors(is_selected)
 
-        # Don't force min dimensions if animating
+        # GAP FIX: Safely lookup _anim before checking state to prevent
+        # AttributeErrors when NodePulseAnimMixin is not composed in.
         from PySide6.QtCore import QVariantAnimation
-        if self._anim.state() != QVariantAnimation.State.Running:
+        anim = getattr(self, '_anim', None)
+        if anim is None or anim.state() != QVariantAnimation.State.Running:
             self.enforce_min_dimensions()
 
     def set_node_colors(

@@ -45,7 +45,10 @@ class CanvasView(QGraphicsView):
 
         # StyleManager for dynamic theme updates
         self._style_manager = get_style_manager()
-        self._style_manager.style_changed.connect(self._on_style_change)
+        
+        # Use standard weakref registration instead of direct signal
+        # connections to prevent memory leaks if the view is closed/re-created.
+        self._style_manager.register(self, StyleCategory.CANVAS)
         
         # Render hints
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -80,8 +83,14 @@ class CanvasView(QGraphicsView):
         
         # Update background color to match theme
         bg_color = self._style_manager.get(StyleCategory.CANVAS, 'bg_color')
-        if isinstance(bg_color, list):
-            self._apply_bg_color(QColor(*bg_color))
+        if isinstance(bg_color, QColor):
+            self._apply_bg_color(bg_color)
+        elif isinstance(bg_color, (list, tuple)) and len(bg_color) >= 3:
+            r, g, b = int(bg_color[0]), int(bg_color[1]), int(bg_color[2])
+            a = int(bg_color[3]) if len(bg_color) > 3 else 255
+            self._apply_bg_color(QColor(r, g, b, a))
+        elif isinstance(bg_color, str):
+            self._apply_bg_color(QColor(bg_color))
 
     def _get_canvas_config(self) -> Dict[str, Any]:
         """Fetch zoom and scrollbar configuration from StyleManager."""
@@ -321,7 +330,7 @@ class CanvasView(QGraphicsView):
     # Style Management
     # ==========================================================================
     
-    def _on_style_change(self, category: StyleCategory, changes: Dict[str, Any]):
+    def on_style_changed(self, category: StyleCategory, changes: Dict[str, Any]):
         """Handle live style updates from the StyleManager."""
         if category != StyleCategory.CANVAS:
             return
@@ -329,10 +338,22 @@ class CanvasView(QGraphicsView):
         # Background color → update view palette
         if 'bg_color' in changes:
             bg = changes['bg_color']
-            if isinstance(bg, list):
-                self._apply_bg_color(QColor(*bg))
-            elif isinstance(bg, QColor):
-                self._apply_bg_color(bg)
+
+            # Bulletproof C++ color casting to prevent crashes from
+            # malformed lists or float values in the theme config.
+            try:
+                if isinstance(bg, QColor):
+                    self._apply_bg_color(bg)
+                elif isinstance(bg, (list, tuple)) and len(bg) >= 3:
+                    r, g, b = int(bg[0]), int(bg[1]), int(bg[2])
+                    a = int(bg[3]) if len(bg) > 3 else 255
+                    self._apply_bg_color(QColor(r, g, b, a))
+                elif isinstance(bg, str):
+                    self._apply_bg_color(QColor(bg))
+            except Exception as e:
+                from weave.logger import get_logger
+                get_logger("CanvasView").warning(
+                    f"Failed to parse view bg_color '{bg}': {e}")
 
         # Zoom/scrollbar config → update config dict
         zoom_keys = {'zoom_min', 'zoom_max', 'zoom_factor', 'scrollbar_policy'}
@@ -344,10 +365,12 @@ class CanvasView(QGraphicsView):
     # ==========================================================================
 
     def closeEvent(self, event) -> None:
-        """Persist workspace preferences (grid, trace, snapping) on close.
+        """Persist workspace preferences and unregister from StyleManager.
 
         The view is typically the last widget destroyed, so this is the
-        safest place to flush preferences to QSettings.
+        safest place to flush preferences to QSettings and sever the
+        StyleManager subscription.
         """
+        self._style_manager.unregister(self, StyleCategory.CANVAS)
         self._style_manager.persist_all()
         super().closeEvent(event)

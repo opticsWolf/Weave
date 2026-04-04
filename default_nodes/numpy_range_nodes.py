@@ -11,6 +11,8 @@ numpy_range_nodes.py
 NumPy range-based array generator nodes with full per-parameter
 auto-disable input ports.
 
+FIXED: Replaced non-existent get_output_value() with _get_cached_value()
+
 Provided nodes
 --------------
 ``NumpyRange1DNode``
@@ -403,7 +405,8 @@ class NumpyRange1DNode(ThreadedNode):
     def on_evaluate_finished(self) -> None:
         """Emit array_changed on the main thread after results are cached."""
         try:
-            result = self.get_output_value("array")
+            # FIXED: Use _get_cached_value instead of non-existent get_output_value
+            result = self._get_cached_value("array")
             if result is not None:
                 self.array_changed.emit(result)
         except Exception as exc:
@@ -801,7 +804,8 @@ class NumpyRange2DNode(ThreadedNode):
     def on_evaluate_finished(self) -> None:
         """Emit array_changed on the main thread after results are cached."""
         try:
-            result = self.get_output_value("array")
+            # FIXED: Use _get_cached_value instead of non-existent get_output_value
+            result = self._get_cached_value("array")
             if result is not None:
                 self.array_changed.emit(result)
         except Exception as exc:

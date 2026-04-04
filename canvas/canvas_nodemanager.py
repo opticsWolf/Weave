@@ -18,6 +18,7 @@ Removed duplicate code (now in qt_portutils):
 - _create_connection -> ConnectionFactory.create
 """
 
+import uuid
 from typing import Any, Tuple, Dict, List, Optional, Set
 from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsScene
@@ -94,22 +95,21 @@ class NodeManager:
             self._managed_nodes.append(node)
 
     def remove_node(self, node: QGraphicsItem) -> None:
-        """
-        Remove a node from the scene and properly clean up all associated traces.
-        
-        This method ensures that when nodes are removed, their connected port traces 
-        are also cleaned up appropriately to prevent orphaned connection objects.
-        """
-        # First ensure we have access to NodePort components
+        """Remove a node from the scene and properly clean up all associated traces and threads."""
         if hasattr(node, 'inputs') and hasattr(node, 'outputs'):
-            # Clean up all ports' connections first (this ensures traces are properly disconnected)
             node.clear_ports()
-        
-        # Remove from tracking first  
+
+        # Trigger the cleanup lifecycle to kill active ThreadedNode workers
+        # and sever tracked signal connections (§7 Aggressive Cleanup).
+        if hasattr(node, 'cleanup') and callable(node.cleanup):
+            try:
+                node.cleanup()
+            except Exception as e:
+                log.error(f"Error during node cleanup: {e}")
+
         if node in self._managed_nodes:
             self._managed_nodes.remove(node)
         
-        # Then remove from scene
         if node.scene() == self._scene:
             self._scene.removeItem(node)
 
@@ -241,7 +241,13 @@ class NodeManager:
         
         if clone is None:
             return None
-        
+
+        # Prevent UUID Collision!
+        # The clone might have inherited the original's UUID via restore_state().
+        # Force a new UUID to prevent corrupting the UndoManager/Serializer.
+        if hasattr(clone, 'unique_id'):
+            clone.unique_id = str(uuid.uuid4())
+
         # Position with offset
         new_pos = original.pos() + offset
         clone.setPos(new_pos)
@@ -286,53 +292,38 @@ class NodeManager:
                 
                 clone_input = clone_inputs[i]
                 
-                # Get connected traces from the original input port
-                # Try multiple attribute names for compatibility
                 connected_traces = getattr(orig_input, 'connected_traces', None)
                 if connected_traces is None:
-                    connected_traces = getattr(orig_input, '_connected_traces', None)
-                if connected_traces is None:
-                    # Try as a property that returns empty list
-                    connected_traces = []
+                    connected_traces = getattr(orig_input, '_connected_traces', [])
                 
                 # Iterate through traces connected to this input
                 for trace in list(connected_traces):
                     # Get source port of the trace
-                    source_port = getattr(trace, 'source', None)
-                    if source_port is None:
-                        source_port = getattr(trace, '_source', None)
-                    
+                    source_port = getattr(trace, 'source', None) or getattr(trace, '_source', None)
                     if source_port is None:
                         continue
 
                     # Get the node that owns the source port
-                    source_node = getattr(source_port, 'node', None)
-                    if source_node is None:
-                        source_node = getattr(source_port, '_node', None)
-                    
-                    if source_node is None:
-                        continue
-                    
-                    # Only recreate connection if source node is ALSO being cloned
-                    if source_node not in original_to_clone:
+                    source_node = getattr(source_port, 'node', None) or getattr(source_port, '_node', None)
+                    if source_node is None or source_node not in original_to_clone:
                         continue
                     
                     # Get the cloned version of the source node
                     cloned_source_node = original_to_clone[source_node]
-                    
-                    # Find the index of the source port in original's outputs
-                    original_outputs = getattr(source_node, 'outputs', [])
                     cloned_outputs = getattr(cloned_source_node, 'outputs', [])
                     
-                    try:
-                        src_idx = list(original_outputs).index(source_port)
-                    except (ValueError, AttributeError):
+                    # Name-Based Resolution (§1): array indices are brittle
+                    # and shift if dynamic ports are added/removed.
+                    src_name = getattr(source_port, 'name', None)
+                    if not src_name:
                         continue
-                    
-                    if src_idx >= len(cloned_outputs):
+
+                    cloned_source_port = next(
+                        (p for p in cloned_outputs if getattr(p, 'name', '') == src_name),
+                        None
+                    )
+                    if not cloned_source_port:
                         continue
-                    
-                    cloned_source_port = cloned_outputs[src_idx]
 
                     # Avoid duplicate connections
                     connection_key = (id(cloned_source_port), id(clone_input))

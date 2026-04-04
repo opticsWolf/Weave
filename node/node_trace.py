@@ -95,8 +95,9 @@ class NodeTrace(TracePathMixin, QGraphicsPathItem):
         self.target = dest_port
         self.drag_pos = cursor_pos if cursor_pos else QPointF(0, 0)
 
-        self._source_uuid = getattr(source_port, '_port_uuid', None)
-        self._target_uuid = getattr(dest_port, '_port_uuid', None) if dest_port else None
+        # Use unified UUID extractor instead of direct _port_uuid access (§1)
+        self._source_uuid = PortUtils.get_port_uuid(source_port)
+        self._target_uuid = PortUtils.get_port_uuid(dest_port) if dest_port else None
 
         self._last_src_pos = QPointF()
         self._last_dst_pos = QPointF()
@@ -196,7 +197,7 @@ class NodeTrace(TracePathMixin, QGraphicsPathItem):
     def set_target(self, port: NodePort) -> None:
         """Set the target port for this trace."""
         self.target = port
-        self._target_uuid = getattr(port, '_port_uuid', None)
+        self._target_uuid = PortUtils.get_port_uuid(port)
         if hasattr(self.target, 'add_trace'):
             self.target.add_trace(self)
         self.update_path()

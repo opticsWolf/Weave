@@ -347,7 +347,8 @@ class NodeGeometryMixin:
             return
 
         # Don't fight the animation
-        if self._anim.state() == QVariantAnimation.State.Running:
+        anim = getattr(self, '_anim', None)
+        if anim is not None and anim.state() == QVariantAnimation.State.Running:
             return
 
         min_w, min_h = self._calculate_expanded_min_size()
@@ -400,7 +401,8 @@ class NodeGeometryMixin:
         """
         if self.is_minimized:
             return
-        if self._anim.state() == QVariantAnimation.State.Running:
+        anim = getattr(self, '_anim', None)
+        if anim is not None and anim.state() == QVariantAnimation.State.Running:
             return
         if self.scene():
             self.prepareGeometryChange()
@@ -568,7 +570,10 @@ class NodeGeometryMixin:
         self._summary_input.setPos(-offset, y_sum)
         self._summary_output.setPos(self._width + offset, y_sum)
 
-        if self.is_minimized and self._anim.state() != QVariantAnimation.State.Running:
+        if self.is_minimized:
+            anim = getattr(self, '_anim', None)
+            if anim is None or anim.state() != QVariantAnimation.State.Running:
+                return
             return
 
         port_dia = self._port_config['radius'] * 2
@@ -744,11 +749,13 @@ class NodeGeometryMixin:
 
         anim_duration = self._config['minimize_anim_duration']
 
-        self._anim.stop()
-        self._anim.setDuration(anim_duration)
-        self._anim.setStartValue(start_h)
-        self._anim.setEndValue(end_h)
-        self._anim.start()
+        anim = getattr(self, '_anim', None)
+        if anim is not None:
+            anim.stop()
+            anim.setDuration(anim_duration)
+            anim.setStartValue(start_h)
+            anim.setEndValue(end_h)
+            anim.start()
 
     def _set_ports_visible(self, visible: bool):
         """Updates visibility for ports and their labels."""
@@ -775,7 +782,10 @@ class NodeGeometryMixin:
         self._total_height = float(value)
 
         header_h = self.header.get_height()
-        expanded_h = self._stored_height if self.is_minimized else self._anim.endValue()
+        anim = getattr(self, '_anim', None)
+        expanded_h = self._stored_height if self.is_minimized else (
+            anim.endValue() if anim is not None else self._stored_height
+        )
 
         if abs(expanded_h - header_h) > 0.1:
             opacity = (self._total_height - header_h) / (expanded_h - header_h)
@@ -867,3 +877,8 @@ class NodeGeometryMixin:
 
         self._recalculate_paths()
         self.update_geometry()
+        self.update()
+        if hasattr(self.header, 'update'):
+            self.header.update()
+        if hasattr(self.body, 'update'):
+            self.body.update()

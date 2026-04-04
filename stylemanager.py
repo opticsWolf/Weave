@@ -88,8 +88,12 @@ def to_qcolor(val) -> QColor:
     if isinstance(val, str) and val.startswith("#"):
         return QColor(val)
     if isinstance(val, (list, tuple)) and len(val) >= 3:
-        r, g, b = int(val[0]), int(val[1]), int(val[2])
-        a = int(val[3]) if len(val) > 3 else 255
+        # Strict clamping to prevent PySide6 C++ ValueErrors if a theme
+        # provides out-of-bounds JSON values (e.g. 256 or -10)
+        r = max(0, min(255, int(val[0])))
+        g = max(0, min(255, int(val[1])))
+        b = max(0, min(255, int(val[2])))
+        a = max(0, min(255, int(val[3]))) if len(val) > 3 else 255
         return QColor(r, g, b, a)
     return QColor(0, 0, 0, 255)
 
@@ -551,13 +555,11 @@ class StyleManager(QObject):
                             snapping_enabled=persisted_snapping)
         finally:
             self._suppress_signals = False
-            
-            # Process any pending changes and clear them to avoid issues 
-            # that could have occurred during batch operations
-            for category, changes in self._pending_changes.items():
-                if changes:
-                    self._notify_subscribers(category, changes)
-            self._pending_changes = {}
+
+            # Do NOT flush incremental _pending_changes here.
+            # A full get_all() broadcast follows immediately below,
+            # so flushing would cause a massive redundant double-repaint.
+            self._pending_changes = {cat: {} for cat in StyleCategory}
 
         self._current_theme = theme_name
 

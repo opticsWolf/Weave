@@ -221,9 +221,8 @@ class StylableStateMixin:
         self._sync_style_cache()
         if STYLEMANAGER_AVAILABLE:
             try:
-                StyleManager.instance().style_changed.connect(
-                    self._on_style_changed
-                )
+                # Use memory-safe WeakSet registration instead of direct signal connections
+                StyleManager.instance().register(self, StyleCategory.CANVAS)
             except Exception as exc:
                 log.warning(f"Failed to subscribe to StyleManager: {exc}")
 
@@ -265,7 +264,8 @@ class StylableStateMixin:
 
         self._on_style_cache_updated()
 
-    def _on_style_changed(self, category, changes: dict) -> None:
+    def on_style_changed(self, category, changes: dict) -> None:
+        """Called automatically via StyleManager's WeakSet subscriber loop."""
         if category != StyleCategory.CANVAS:
             return
         _SHAKE_KEYS = {
@@ -286,12 +286,12 @@ class StylableStateMixin:
 # ============================================================================
 
 def build_connection_tuples(traces) -> list[tuple]:
-    """Build ``(src_uid, src_idx, dst_uid, dst_idx)`` tuples for undo.
+    """Build ``(src_uid, src_name, dst_uid, dst_name)`` tuples for undo.
 
     Accepts any iterable of trace objects.  Silently skips traces whose
     port/node metadata is incomplete.
     """
-    from weave.canvas.undo_commands import get_node_uid, _get_port_lists
+    from weave.canvas.undo_commands import get_node_uid
 
     result: list[tuple] = []
     for trace in traces:
@@ -303,15 +303,13 @@ def build_connection_tuples(traces) -> list[tuple]:
         dst_node = getattr(dst, "node", None)
         if not (src_node and dst_node):
             continue
-        try:
-            _, out_ports = _get_port_lists(src_node)
-            in_ports, _ = _get_port_lists(dst_node)
-            result.append((
-                get_node_uid(src_node),
-                out_ports.index(src),
-                get_node_uid(dst_node),
-                in_ports.index(dst),
-            ))
-        except ValueError:
-            pass
+
+        # Resolve strictly by port name to maintain compatibility
+        # with UndoCommands and avoid array-index shifting corruption (§1)
+        result.append((
+            get_node_uid(src_node),
+            getattr(src, "name", ""),
+            get_node_uid(dst_node),
+            getattr(dst, "name", ""),
+        ))
     return result

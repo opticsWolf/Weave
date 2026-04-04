@@ -1,807 +1,590 @@
 # -*- coding: utf-8 -*-
 """
-Weave: A modular PySide6 framework for the visual synthesis
+Weave: A modular PySide6 framework for the visual synthesis 
 and execution of high-concurrency simulation workflows.
 Copyright (c) 2026 opticsWolf
 
 SPDX-License-Identifier: Apache-2.0
 
-UndoCommands — Granular, command-pattern undo/redo
-===================================================
-
-Each user action that mutates the graph produces a lightweight
-``UndoCommand`` that stores only the delta — not a full graph
-snapshot.  The command knows how to apply itself forward (``redo``)
-and backward (``undo``).
-
-Stored data per command type
-----------------------------
-
-==============================  =========================================
-Command                         Data stored
-==============================  =========================================
-``MoveNodesCommand``            ``{uuid: (old_pos, new_pos)}`` dict
-``ResizeNodeCommand``           node uuid, old_w, old_h, new_w, new_h
-``WidgetValueCommand``          node uuid, port name, old value, new value
-``NodePropertyCommand``         node uuid, getter/setter names, old, new
-``AddNodeCommand``              class name, ``get_state()`` dict snapshot
-``RemoveNodesCommand``          per-node state dicts + connection tuples
-``AddConnectionCommand``        4-tuple: src/dst uuid + port index
-``RemoveConnectionsCommand``    list of 4-tuples
-``CompoundCommand``             list of sub-commands
-==============================  =========================================
-
-Node resolution
----------------
-Commands store **UUID strings**, never live object references.  A
-shared ``_find_node(canvas, uuid)`` helper resolves a UUID to the
-current scene object at undo/redo time.  This is O(N) over scene
-items but runs only on explicit user actions — never in hot paths.
-
-Merging
--------
-``WidgetValueCommand`` implements ``try_merge()`` so that rapid
-edits to the same widget (typing, scrolling a spinbox) collapse
-into a single undo step, replacing the old snapshot-based debounce.
+Undo Commands - Command pattern implementation for undo/redo operations.
+Architecturally corrected to enforce NodeManager routing, robust trace 
+serialization, and accurate widget state restoration.
 """
 
-from __future__ import annotations
+import uuid
+from typing import Optional, List, Dict, Set, Tuple, Union, Any
+from enum import Enum
 
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from PySide6.QtCore import QObject, Signal, QPointF
+from PySide6.QtWidgets import QGraphicsItem, QGraphicsScene
+from PySide6.QtGui import QUndoCommand
 
-from PySide6.QtCore import QPointF
-from PySide6.QtWidgets import QGraphicsItem
-
+from weave.portutils import PortUtils, ConnectionFactory
 from weave.logger import get_logger
+
 log = get_logger("UndoCommands")
 
 
 # ======================================================================
-# Node resolution helpers
+# Universal UUID Helpers
 # ======================================================================
 
 def get_node_uid(node) -> str:
-    """Return a stable string UUID for *node*.
-
-    Resolution order:
-    1. ``node.unique_id`` — set by Canvas.add_node / serializer
-    2. ``node.get_uuid_string()`` — Node-level UUID property
-    3. Empty string (should never happen if add_node ran)
-    """
-    uid = getattr(node, 'unique_id', None)
-    if uid:
-        return uid
-    if hasattr(node, 'get_uuid_string'):
-        return node.get_uuid_string()
-    return ''
+    """Return a stable string UUID for a node utilizing the UUIDMixin."""
+    if node is None:
+        return ""
+    uid = PortUtils.get_node_uuid_string(node)
+    return uid if uid else f"node_{id(node)}"
 
 
-def _find_node(canvas, node_uuid: str) -> Optional[QGraphicsItem]:
-    """Resolve a UUID string to the live node in *canvas*.
+def get_port_uid(port) -> str:
+    """Return stable UUID string for a port utilizing the UUIDMixin."""
+    if port is None:
+        return ""
+    uid = PortUtils.get_port_uuid_string(port)
+    return uid if uid else f"port_{id(port)}"
 
-    Checks ``_node_manager.nodes`` first (O(N) over managed nodes),
-    then falls back to scanning all scene items.  Tries both
-    ``unique_id`` and ``get_uuid_string()`` on each node.
-    """
+
+def resolve_node_by_uuid(canvas, node_uuid: Union[str, uuid.UUID]) -> Optional[QGraphicsItem]:
+    """Safely resolve a UUID string to a live node instance."""
     if not node_uuid:
         return None
-
-    # Fast path: managed nodes list
-    if hasattr(canvas, '_node_manager'):
-        for node in canvas._node_manager.nodes:
-            if get_node_uid(node) == node_uuid:
-                return node
-
-    # Fallback: full scene scan
-    for item in canvas.items():
-        if get_node_uid(item) == node_uuid:
+    
+    # Fast path via NodeManager
+    search_items = canvas._node_manager.nodes if hasattr(canvas, '_node_manager') else canvas.items()
+    
+    for item in search_items:
+        if PortUtils.node_matches_uuid(item, node_uuid):
             return item
-
+            
     return None
 
-
-def _get_port_lists(node) -> Tuple[list, list]:
-    """Return (inputs_list, outputs_list) normalised from dict or list."""
-    inputs = getattr(node, 'inputs', [])
-    outputs = getattr(node, 'outputs', [])
-    in_list = list(inputs.values()) if isinstance(inputs, dict) else list(inputs)
-    out_list = list(outputs.values()) if isinstance(outputs, dict) else list(outputs)
-    return in_list, out_list
-
-
-def _batch_trigger_compute(input_ports: list) -> None:
-    """Fire set_dirty once per unique downstream node."""
-    from weave.portutils import ConnectionFactory
-    seen: set = set()
-    for port in input_ports:
-        node = getattr(port, 'node', None)
-        if node is not None and id(node) not in seen:
-            seen.add(id(node))
-            ConnectionFactory._trigger_compute(port)
-
-
 # ======================================================================
-# Base class
+# Command Base Classes
 # ======================================================================
 
-class UndoCommand(ABC):
-    """A reversible graph mutation."""
+class UndoCommand(QUndoCommand):
+    """Abstract base class for all undo commands with unified hierarchical support."""
 
-    @abstractmethod
-    def undo(self, canvas) -> None: ...
+    def __init__(self, parent: Optional[QUndoCommand] = None) -> None:
+        super().__init__(parent)
+        self._child_count = 0
 
-    @abstractmethod
-    def redo(self, canvas) -> None: ...
+    def add_child(self, cmd: 'UndoCommand') -> None:
+        """Add a sub-command to enable macro groupings."""
+        if cmd is not None and isinstance(cmd, UndoCommand):
+            self._child_count += 1
+            super().add_child(cmd)
 
-    def try_merge(self, other: "UndoCommand") -> bool:
-        """Attempt to absorb *other* into this command.
-
-        Returns ``True`` if the merge succeeded (the manager should
-        discard *other*).  Default: no merging.
-        """
+    def mergeWith(self, other: QUndoCommand) -> bool:
         return False
+        
+    def try_merge(self, other: 'UndoCommand') -> bool:
+        """Alias for custom merge logic utilized by the UndoManager."""
+        return self.mergeWith(other)
 
     @property
     def description(self) -> str:
         return type(self).__name__
+    
+    def get_affected_node_uuids(self) -> Set[str]:
+        return set()
 
 
 # ======================================================================
-# Move
+# Macros & Grouping
 # ======================================================================
+
+class CompoundCommand(UndoCommand):
+    """A collection of commands executed atomically."""
+
+    def __init__(self, commands: List[UndoCommand], description: str = "Compound Operation") -> None:
+        super().__init__()
+        self._description = description
+        self._children: List[UndoCommand] = []
+        for cmd in commands:
+            self.add_child(cmd)
+            self._children.append(cmd)
+
+    def get_affected_node_uuids(self) -> Set[str]:
+        uuids: Set[str] = set()
+        for cmd in self._children:
+            uuids.update(cmd.get_affected_node_uuids())
+        return uuids
+
+    @property
+    def description(self) -> str:
+        return self._description
+
+    @property
+    def children(self) -> List[UndoCommand]:
+        return self._children
+
+
+# ======================================================================
+# Nodes: Add / Remove / Move / Resize / Properties
+# ======================================================================
+
+class AddNodeCommand(UndoCommand):
+    """Spawn a node and ensure it is tracked via NodeManager."""
+
+    def __init__(self, cls_name: str, state: Dict, uid: str, pos: Tuple[float, float], registry_map: Dict[str, type]) -> None:
+        super().__init__()
+        self._cls_name = cls_name
+        self._state = state
+        self._uid = uid
+        self._pos = pos
+        self._registry = registry_map
+        self._created_node = None
+
+    def undo(self, canvas) -> None:
+        node = resolve_node_by_uuid(canvas, self._uid)
+        if node:
+            if hasattr(canvas, 'remove_node'):
+                canvas.remove_node(node)
+            else:
+                canvas.removeItem(node)
+            self._created_node = None
+
+    def redo(self, canvas) -> None:
+        cls = self._registry.get(self._cls_name)
+        if not cls:
+            log.warning(f"AddNodeCommand: Class '{self._cls_name}' not in registry.")
+            return
+            
+        node = cls()
+        node.unique_id = self._uid
+        
+        if hasattr(node, '_eval_pending'):
+            node._eval_pending = True
+            
+        if hasattr(node, 'restore_state'):
+            node.restore_state(self._state)
+            
+        if hasattr(canvas, 'add_node'):
+            canvas.add_node(node, self._pos)
+        else:
+            canvas.addItem(node)
+            node.setPos(*self._pos)
+            
+        if hasattr(node, '_eval_pending'):
+            node._eval_pending = False
+            
+        self._created_node = node
+
+    def get_affected_node_uuids(self) -> Set[str]:
+        return {self._uid}
+
+
+class RemoveNodesCommand(UndoCommand):
+    """Remove multiple nodes natively executing through the Canvas orchestrator."""
+
+    def __init__(
+        self,
+        node_snapshots: List[Tuple[str, str, Dict[str, Any], Tuple[float, float]]],
+        connections: List[Tuple[str, str, str, str]],
+        registry_map: Dict[str, type],
+    ) -> None:
+        super().__init__()
+        self._nodes = node_snapshots
+        self._connections = connections
+        self._registry = registry_map
+
+    def undo(self, canvas) -> None:
+        # 1. Re-create nodes
+        for uid, cls_name, state, pos in self._nodes:
+            cls = self._registry.get(cls_name)
+            if cls is None:
+                log.warning(f"RemoveNodesCommand: '{cls_name}' not in registry")
+                continue
+                
+            node = cls()
+            node.unique_id = uid
+            
+            if hasattr(node, '_eval_pending'):
+                node._eval_pending = True
+                
+            if hasattr(node, 'restore_state'):
+                node.restore_state(state)
+            
+            # CRITICAL FIX: Ensure Canvas tracks the newly recreated node
+            if hasattr(canvas, 'add_node'):
+                canvas.add_node(node, pos)
+            else:
+                canvas.addItem(node)
+                node.setPos(pos[0], pos[1])
+            
+            if hasattr(node, '_eval_pending'):
+                node._eval_pending = False
+
+        # 2. Re-create connections via ConnectionFactory (name-based)
+        for src_uid, src_name, dst_uid, dst_name in self._connections:
+            src_node = resolve_node_by_uuid(canvas, src_uid)
+            dst_node = resolve_node_by_uuid(canvas, dst_uid)
+            if src_node is None or dst_node is None:
+                continue
+
+            src_port = next((p for p in getattr(src_node, 'outputs', []) if p.name == src_name), None)
+            dst_port = next((p for p in getattr(dst_node, 'inputs', []) if p.name == dst_name), None)
+
+            if src_port and dst_port:
+                ConnectionFactory.create(canvas, src_port, dst_port, validate=False, trigger_compute=True)
+
+    def redo(self, canvas) -> None:
+        # Execute the deletion
+        for uid, _, _, _ in self._nodes:
+            node = resolve_node_by_uuid(canvas, uid)
+            if node:
+                if hasattr(canvas, 'remove_node'):
+                    canvas.remove_node(node)
+                else:
+                    canvas.removeItem(node)
+
+    def get_affected_node_uuids(self) -> Set[str]:
+        return {uid for uid, _, _, _ in self._nodes}
+
 
 class MoveNodesCommand(UndoCommand):
-    """One or more nodes moved from old positions to new positions.
-
-    Stored data: ``{uuid_str: (QPointF_old, QPointF_new)}``
-    """
+    """Translate nodes between old and new positions."""
 
     def __init__(self, moves: Dict[str, Tuple[QPointF, QPointF]]) -> None:
-        self._moves = moves  # {uuid: (old_pos, new_pos)}
+        super().__init__()
+        self._moves = moves
 
     def undo(self, canvas) -> None:
         for uid, (old_pos, _new_pos) in self._moves.items():
-            node = _find_node(canvas, uid)
+            node = resolve_node_by_uuid(canvas, uid)
             if node is not None:
                 node.setPos(old_pos)
                 self._update_traces(node)
 
     def redo(self, canvas) -> None:
         for uid, (_old_pos, new_pos) in self._moves.items():
-            node = _find_node(canvas, uid)
+            node = resolve_node_by_uuid(canvas, uid)
             if node is not None:
                 node.setPos(new_pos)
                 self._update_traces(node)
 
     @staticmethod
     def _update_traces(node) -> None:
-        for port in list(getattr(node, 'inputs', [])) + list(getattr(node, 'outputs', [])):
+        for port in getattr(node, 'inputs', []) + getattr(node, 'outputs', []):
             for trace in getattr(port, 'connected_traces', []):
-                trace.update_path()
+                if hasattr(trace, 'update_path'):
+                    trace.update_path()
 
-    @property
-    def description(self) -> str:
-        n = len(self._moves)
-        return f"Move {n} node{'s' if n != 1 else ''}"
+    def get_affected_node_uuids(self) -> Set[str]:
+        return set(self._moves.keys())
 
-
-# ======================================================================
-# Resize
-# ======================================================================
 
 class ResizeNodeCommand(UndoCommand):
-    """A single node was resized from old dimensions to new dimensions.
+    """Handle node scale adjustments."""
 
-    Stored data: ``(uuid_str, old_w, old_h, new_w, new_h)``
-    """
+    def __init__(self, uid: str, old_w: float, old_h: float, new_w: float, new_h: float):
+        super().__init__()
+        self._uid = uid
+        self._old_size = (old_w, old_h)
+        self._new_size = (new_w, new_h)
 
-    def __init__(
-        self,
-        node_uid: str,
-        old_w: float,
-        old_h: float,
-        new_w: float,
-        new_h: float,
-    ) -> None:
-        self._uid = node_uid
-        self._old_w = old_w
-        self._old_h = old_h
-        self._new_w = new_w
-        self._new_h = new_h
+    def undo(self, canvas):
+        node = resolve_node_by_uuid(canvas, self._uid)
+        if node: node.apply_resize(*self._old_size)
 
-    def undo(self, canvas) -> None:
-        self._apply(canvas, self._old_w, self._old_h)
+    def redo(self, canvas):
+        node = resolve_node_by_uuid(canvas, self._uid)
+        if node: node.apply_resize(*self._new_size)
 
-    def redo(self, canvas) -> None:
-        self._apply(canvas, self._new_w, self._new_h)
+    def get_affected_node_uuids(self) -> Set[str]:
+        return {self._uid}
 
-    def _apply(self, canvas, w: float, h: float) -> None:
-        node = _find_node(canvas, self._uid)
-        if node is None:
-            return
-        node.apply_resize(w, h)
-
-    @property
-    def description(self) -> str:
-        return "Resize node"
-
-
-
-# ======================================================================
-# Widget value
-# ======================================================================
-
-class WidgetValueCommand(UndoCommand):
-    """A widget value changed on a single node/port.
-
-    Supports merging: consecutive edits to the same (node, port)
-    collapse into one command, keeping the original ``old_value``
-    and updating ``new_value``.
-    """
-
-    def __init__(
-        self, node_uuid: str, port_name: str,
-        old_value: Any, new_value: Any,
-    ) -> None:
-        self.node_uuid = node_uuid
-        self.port_name = port_name
-        self.old_value = old_value
-        self.new_value = new_value
-
-    def undo(self, canvas) -> None:
-        self._apply(canvas, self.old_value)
-
-    def redo(self, canvas) -> None:
-        self._apply(canvas, self.new_value)
-
-    def _apply(self, canvas, value: Any) -> None:
-        node = _find_node(canvas, self.node_uuid)
-        if node is None:
-            return
-        wc = getattr(node, '_widget_core', None) or getattr(node, '_weave_core', None)
-        if wc is None:
-            return
-
-        # Use apply_port_value (NOT set_port_value) so the widget's
-        # native signal fires.  This is critical for widgets whose
-        # signal handlers drive side-effects (e.g. a count spinbox's
-        # valueChanged → _on_count_changed → port creation/removal).
-        #
-        # apply_port_value suppresses only WidgetCore's value_changed
-        # (preventing the undo manager from re-recording), while letting
-        # QSpinBox.valueChanged etc. propagate to the node's own slots.
-        if hasattr(wc, 'apply_port_value'):
-            wc.apply_port_value(self.port_name, value)
-        else:
-            wc.set_port_value(self.port_name, value)
-
-        # Explicitly mark the node dirty so downstream nodes re-evaluate.
-        # apply_port_value suppresses WidgetCore.value_changed, which is
-        # the only trigger for set_dirty on simple value nodes (e.g.
-        # IntInputNode).  Without this, undoing a value change on an
-        # upstream node leaves downstream nodes stale — they never
-        # recompute because set_dirty was never called.
-        #
-        # For nodes with native signal handlers (e.g. MultiFloatOutputNode
-        # _on_count_changed), set_dirty may fire twice (once from the
-        # handler, once here) — but NodeDataFlow.set_dirty short-circuits
-        # on already-dirty nodes, so the duplicate is harmless.
-        if hasattr(node, 'set_dirty'):
-            node.set_dirty("undo_redo")
-
-    def try_merge(self, other: UndoCommand) -> bool:
-        if (
-            isinstance(other, WidgetValueCommand)
-            and other.node_uuid == self.node_uuid
-            and other.port_name == self.port_name
-        ):
-            self.new_value = other.new_value
-            return True
-        return False
-
-    @property
-    def description(self) -> str:
-        return f"Change {self.port_name}"
-
-
-# ======================================================================
-# Generic node property (state, header color, etc.)
-# ======================================================================
-
-class NodePropertyCommand(UndoCommand):
-    """A property changed on one or more nodes via a value-accepting setter.
-
-    *setter_name* must accept a single positional argument (the value).
-    Examples: ``set_state(NodeState.DISABLED)``,
-    ``set_header_color_by_index(2)``.
-    """
-
-    def __init__(
-        self,
-        changes: List[Tuple[str, Any, Any]],
-        setter_name: str,
-        label: str = "Change property",
-    ) -> None:
-        # [(node_uuid, old_value, new_value), ...]
-        self._changes = changes
-        self._setter = setter_name
-        self._label = label
-
-    def undo(self, canvas) -> None:
-        for uid, old_val, _new_val in self._changes:
-            node = _find_node(canvas, uid)
-            if node is not None:
-                getattr(node, self._setter)(old_val)
-
-    def redo(self, canvas) -> None:
-        for uid, _old_val, new_val in self._changes:
-            node = _find_node(canvas, uid)
-            if node is not None:
-                getattr(node, self._setter)(new_val)
-
-    @property
-    def description(self) -> str:
-        return self._label
-
-
-# ======================================================================
-# Toggle minimize
-# ======================================================================
 
 class ToggleMinimizeCommand(UndoCommand):
-    """One or more nodes were minimized or restored.
+    """Toggle a node's minimized geometry state."""
 
-    Stores the target ``is_minimized`` state for each node.  On undo /
-    redo, only calls ``toggle_minimize()`` if the node's current state
-    differs from the desired state — avoiding a double-toggle that
-    would leave the node in the wrong state.
-    """
+    def __init__(self, toggles: List[Tuple[str, bool]]):
+        super().__init__()
+        self._toggles = toggles
 
-    def __init__(self, nodes: List[Tuple[str, bool]]) -> None:
-        # [(node_uuid, new_is_minimized), ...]
-        self._nodes = nodes
+    def undo(self, canvas):
+        for uid, was_min in self._toggles:
+            node = resolve_node_by_uuid(canvas, uid)
+            if node: node.toggle_minimize()
+
+    def redo(self, canvas):
+        for uid, was_min in self._toggles:
+            node = resolve_node_by_uuid(canvas, uid)
+            if node: node.toggle_minimize()
+
+
+class NodePropertyCommand(UndoCommand):
+    """Atomic adjustment of a visual/architectural property on a Node."""
+
+    def __init__(self, changes: List[Tuple[str, Any, Any]], method: str, desc: str):
+        super().__init__()
+        self._changes = changes
+        self._method = method
+        self._desc = desc
+
+    @property
+    def description(self): 
+        return self._desc
+
+    def undo(self, canvas):
+        for uid, old_val, new_val in self._changes:
+            node = resolve_node_by_uuid(canvas, uid)
+            if node:
+                if self._method == 'set_state':
+                    node.set_state(old_val)
+                elif self._method == 'set_config':
+                    node.set_config(header_bg=old_val)
+
+    def redo(self, canvas):
+        for uid, old_val, new_val in self._changes:
+            node = resolve_node_by_uuid(canvas, uid)
+            if node:
+                if self._method == 'set_state':
+                    node.set_state(new_val)
+                elif self._method == 'set_config':
+                    node.set_config(header_bg=new_val)
+
+
+class WidgetValueCommand(UndoCommand):
+    """Push state changes safely back into the Node's underlying WidgetCore."""
+
+    def __init__(self, node_uuid: str, port_name: str, old_value: Any, new_value: Any) -> None:
+        super().__init__()
+        self._node_uuid = node_uuid
+        self._port_name = port_name
+        self._old_value = old_value
+        self._new_value = new_value
 
     def undo(self, canvas) -> None:
-        for uid, was_minimized_after in self._nodes:
-            node = _find_node(canvas, uid)
-            if node is not None and node.is_minimized == was_minimized_after:
-                node.toggle_minimize()
+        node = resolve_node_by_uuid(canvas, self._node_uuid)
+        if node:
+            wc = getattr(node, '_widget_core', None) or getattr(node, '_weave_core', None)
+            if wc and hasattr(wc, 'apply_port_value'):
+                wc.apply_port_value(self._port_name, self._old_value)
 
     def redo(self, canvas) -> None:
-        for uid, was_minimized_after in self._nodes:
-            node = _find_node(canvas, uid)
-            if node is not None and node.is_minimized != was_minimized_after:
-                node.toggle_minimize()
+        node = resolve_node_by_uuid(canvas, self._node_uuid)
+        if node:
+            wc = getattr(node, '_widget_core', None) or getattr(node, '_weave_core', None)
+            if wc and hasattr(wc, 'apply_port_value'):
+                wc.apply_port_value(self._port_name, self._new_value)
+
+    def get_affected_node_uuids(self) -> Set[str]:
+        return {self._node_uuid}
+
+    @property
+    def node_uuid(self) -> str:
+        return self._node_uuid
+
+    @property
+    def port_name(self) -> str:
+        return self._port_name
+
+    @property
+    def old_value(self) -> Any:
+        return self._old_value
+
+    @property
+    def new_value(self) -> Any:
+        return self._new_value
 
     @property
     def description(self) -> str:
-        return "Toggle minimize"
+        return f"Change '{self._port_name}' widget value"
+
+    def mergeWith(self, other: 'UndoCommand') -> bool:
+        """Coalesce rapid continuous changes (e.g., slider drags) on the same widget."""
+        if not isinstance(other, WidgetValueCommand):
+            return False
+
+        if self._node_uuid == other.node_uuid and self._port_name == other.port_name:
+            # Adopt the incoming command's new value, retaining our original old_value
+            self._new_value = other.new_value
+            return True
+
+        return False
 
 
 # ======================================================================
-# Add node
-# ======================================================================
-
-class AddNodeCommand(UndoCommand):
-    """A node was added to the canvas (spawn or paste).
-
-    Stores the node class name and the full ``get_state()`` dict so
-    the node can be re-created on redo after an undo removes it.
-    """
-
-    def __init__(
-        self, class_name: str, state_dict: Dict[str, Any],
-        node_uuid: str, pos: Tuple[float, float],
-        registry_map: Dict[str, type],
-    ) -> None:
-        self._class_name = class_name
-        self._state = state_dict
-        self._uuid = node_uuid
-        self._pos = pos
-        self._registry = registry_map
-
-    def undo(self, canvas) -> None:
-        node = _find_node(canvas, self._uuid)
-        if node is None:
-            return
-        # Remove connections first
-        if hasattr(node, 'remove_all_connections'):
-            node.remove_all_connections()
-        canvas.remove_node(node)
-
-    def redo(self, canvas) -> None:
-        cls = self._registry.get(self._class_name)
-        if cls is None:
-            log.warning(f"AddNodeCommand.redo: class '{self._class_name}' not in registry")
-            return
-        node = cls()
-        node.unique_id = self._uuid
-        if hasattr(node, 'restore_state'):
-            node.restore_state(self._state)
-        canvas.add_node(node, self._pos)
-
-    @property
-    def description(self) -> str:
-        return f"Add {self._class_name}"
-
-
-# ======================================================================
-# Remove nodes (with their connections)
-# ======================================================================
-
-# A connection tuple: (src_uuid, src_port_idx, dst_uuid, dst_port_idx)
-ConnectionTuple = Tuple[str, int, str, int]
-
-
-class RemoveNodesCommand(UndoCommand):
-    """One or more nodes were removed from the canvas.
-
-    Captures each node's full serialised state *and* every connection
-    that touches any of the removed nodes.  Undo re-creates nodes
-    first, then re-creates all captured connections.
-    """
-
-    def __init__(
-        self,
-        node_snapshots: List[Tuple[str, str, Dict[str, Any], Tuple[float, float]]],
-        connections: List[ConnectionTuple],
-        registry_map: Dict[str, type],
-    ) -> None:
-        # [(uuid, class_name, state_dict, (x, y)), ...]
-        self._nodes = node_snapshots
-        self._connections = connections
-        self._registry = registry_map
-
-    def undo(self, canvas) -> None:
-        from weave.portutils import ConnectionFactory
-
-        # 1. Re-create nodes
-        for uid, cls_name, state, pos in self._nodes:
-            cls = self._registry.get(cls_name)
-            if cls is None:
-                log.warning(f"RemoveNodesCommand.undo: class '{cls_name}' not in registry")
-                continue
-            node = cls()
-            node.unique_id = uid
-            if hasattr(node, 'restore_state'):
-                node.restore_state(state)
-            canvas.add_node(node, pos)
-
-        # 2. Re-create connections (deferred compute)
-        affected: list = []
-        for src_uuid, src_idx, dst_uuid, dst_idx in self._connections:
-            src_node = _find_node(canvas, src_uuid)
-            dst_node = _find_node(canvas, dst_uuid)
-            if src_node is None or dst_node is None:
-                continue
-            _in, out = _get_port_lists(src_node)
-            in2, _out2 = _get_port_lists(dst_node)
-            if src_idx < len(out) and dst_idx < len(in2):
-                trace = ConnectionFactory.create(
-                    canvas, out[src_idx], in2[dst_idx],
-                    validate=False, trigger_compute=False,
-                )
-                if trace is not None:
-                    affected.append(in2[dst_idx])
-        _batch_trigger_compute(affected)
-
-    def redo(self, canvas) -> None:
-        # Remove in reverse order
-        for uid, _cls, _state, _pos in reversed(self._nodes):
-            node = _find_node(canvas, uid)
-            if node is None:
-                continue
-            if hasattr(node, 'remove_all_connections'):
-                node.remove_all_connections()
-            canvas.remove_node(node)
-
-    @property
-    def description(self) -> str:
-        n = len(self._nodes)
-        return f"Delete {n} node{'s' if n != 1 else ''}"
-
-
-# ======================================================================
-# Add connection
-# ======================================================================
-
-class AddConnectionCommand(UndoCommand):
-    """A connection was created between two ports."""
-
-    def __init__(self, conn: ConnectionTuple) -> None:
-        self._conn = conn  # (src_uuid, src_port_idx, dst_uuid, dst_port_idx)
-
-    def undo(self, canvas) -> None:
-        src_uuid, src_idx, dst_uuid, dst_idx = self._conn
-        dst_node = _find_node(canvas, dst_uuid)
-        if dst_node is None:
-            return
-        in_list, _ = _get_port_lists(dst_node)
-        if dst_idx >= len(in_list):
-            return
-        dst_port = in_list[dst_idx]
-        # Input ports have at most one connection — remove it
-        from weave.portutils import ConnectionFactory
-        for trace in list(getattr(dst_port, 'connected_traces', [])):
-            ConnectionFactory.remove(trace, trigger_compute=True)
-
-    def redo(self, canvas) -> None:
-        from weave.portutils import ConnectionFactory
-        src_uuid, src_idx, dst_uuid, dst_idx = self._conn
-        src_node = _find_node(canvas, src_uuid)
-        dst_node = _find_node(canvas, dst_uuid)
-        if src_node is None or dst_node is None:
-            return
-        _, out = _get_port_lists(src_node)
-        in_list, _ = _get_port_lists(dst_node)
-        if src_idx < len(out) and dst_idx < len(in_list):
-            ConnectionFactory.create(
-                canvas, out[src_idx], in_list[dst_idx],
-                validate=False, trigger_compute=True,
-            )
-
-    @property
-    def description(self) -> str:
-        return "Add connection"
-
-
-# ======================================================================
-# Remove connections
-# ======================================================================
-
-class RemoveConnectionsCommand(UndoCommand):
-    """One or more connections were removed.
-
-    Undo/redo defer per-trace compute triggers and batch once per
-    downstream node.
-    """
-
-    def __init__(self, connections: List[ConnectionTuple]) -> None:
-        self._connections = connections
-
-    def undo(self, canvas) -> None:
-        from weave.portutils import ConnectionFactory
-        affected: list = []
-        for src_uuid, src_idx, dst_uuid, dst_idx in self._connections:
-            src_node = _find_node(canvas, src_uuid)
-            dst_node = _find_node(canvas, dst_uuid)
-            if src_node is None or dst_node is None:
-                continue
-            _, out = _get_port_lists(src_node)
-            in_list, _ = _get_port_lists(dst_node)
-            if src_idx < len(out) and dst_idx < len(in_list):
-                trace = ConnectionFactory.create(
-                    canvas, out[src_idx], in_list[dst_idx],
-                    validate=False, trigger_compute=False,
-                )
-                if trace is not None:
-                    affected.append(in_list[dst_idx])
-        _batch_trigger_compute(affected)
-
-    def redo(self, canvas) -> None:
-        from weave.portutils import ConnectionFactory
-        affected: list = []
-        for src_uuid, _src_idx, dst_uuid, dst_idx in self._connections:
-            dst_node = _find_node(canvas, dst_uuid)
-            if dst_node is None:
-                continue
-            in_list, _ = _get_port_lists(dst_node)
-            if dst_idx >= len(in_list):
-                continue
-            dst_port = in_list[dst_idx]
-            for trace in list(getattr(dst_port, 'connected_traces', [])):
-                ConnectionFactory.remove(trace, trigger_compute=False)
-            affected.append(dst_port)
-        _batch_trigger_compute(affected)
-
-    @property
-    def description(self) -> str:
-        n = len(self._connections)
-        return f"Remove {n} connection{'s' if n != 1 else ''}"
-
-
-# ======================================================================
-# Add port (dynamic)
+# Ports & Connections
 # ======================================================================
 
 class AddPortCommand(UndoCommand):
-    """A port was dynamically added to a node at runtime.
+    """Add a port to an existing node."""
 
-    Stores the port definition so that undo can remove it and redo can
-    re-create it.  Connected traces are NOT captured here — they are
-    always empty at creation time.
-    """
-
-    def __init__(
-        self,
-        node_uuid: str,
-        port_name: str,
-        datatype: str,
-        is_output: bool,
-        description: str = "",
-    ) -> None:
-        self._node_uuid = node_uuid
-        self._port_name = port_name
+    def __init__(self, node, name: str, datatype: str = "flow", is_output: bool = False) -> None:
+        super().__init__()
+        self._node_uuid = get_node_uid(node)
+        self._port_name = name
         self._datatype = datatype
         self._is_output = is_output
-        self._port_desc = description
 
     def undo(self, canvas) -> None:
-        node = _find_node(canvas, self._node_uuid)
-        if node is None:
-            return
-        if hasattr(node, 'remove_port'):
+        node = resolve_node_by_uuid(canvas, self._node_uuid)
+        if node and hasattr(node, 'remove_port'):
             node.remove_port(self._port_name, is_output=self._is_output)
 
     def redo(self, canvas) -> None:
-        node = _find_node(canvas, self._node_uuid)
-        if node is None:
-            return
-        if self._is_output:
-            node.add_output(self._port_name, self._datatype, self._port_desc)
-        else:
-            node.add_input(self._port_name, self._datatype, self._port_desc)
+        node = resolve_node_by_uuid(canvas, self._node_uuid)
+        if node:
+            func = getattr(node, 'add_output' if self._is_output else 'add_input')
+            func(self._port_name, self._datatype, "")
 
-    @property
-    def description(self) -> str:
-        side = "output" if self._is_output else "input"
-        return f"Add {side} port '{self._port_name}'"
-
-
-# ======================================================================
-# Remove port (dynamic)
-# ======================================================================
 
 class RemovePortCommand(UndoCommand):
-    """A port was dynamically removed from a node at runtime.
+    """Safely destroy a port, backing up and seamlessly restoring its traces."""
 
-    Captures the port definition and any connections that were attached
-    to it so that undo can fully restore the port and its traces.
-    """
-
-    def __init__(
-        self,
-        node_uuid: str,
-        port_name: str,
-        datatype: str,
-        is_output: bool,
-        description: str = "",
-        connections: Optional[List[ConnectionTuple]] = None,
-    ) -> None:
-        self._node_uuid = node_uuid
-        self._port_name = port_name
-        self._datatype = datatype
-        self._is_output = is_output
-        self._port_desc = description
-        self._connections = connections or []
+    def __init__(self, node, port) -> None:
+        super().__init__()
+        self._node_uuid = get_node_uid(node)
+        self._port_name = getattr(port, 'name', None) or port if isinstance(port, str) else None
+        self._is_output = getattr(port, 'is_output', False)
+        
+        self._port_state = {}
+        if hasattr(port, 'get_state'):
+            try: self._port_state = port.get_state()
+            except Exception: pass
+            
+        # Store connections cleanly by Port Name (defends against index shifts!)
+        self._saved_connections = []
+        if not isinstance(port, str):
+            for trace in getattr(port, 'connected_traces', []):
+                src = trace.source
+                dst = trace.target
+                if not src or not dst: continue
+                src_node = getattr(src, 'node', None)
+                dst_node = getattr(dst, 'node', None)
+                if not src_node or not dst_node: continue
+                
+                self._saved_connections.append((
+                    get_node_uid(src_node), src.name,
+                    get_node_uid(dst_node), dst.name
+                ))
 
     def undo(self, canvas) -> None:
-        from weave.portutils import ConnectionFactory
-
-        # 1. Re-create port
-        node = _find_node(canvas, self._node_uuid)
-        if node is None:
-            return
-        if self._is_output:
-            node.add_output(self._port_name, self._datatype, self._port_desc)
-        else:
-            node.add_input(self._port_name, self._datatype, self._port_desc)
-
-        # 2. Re-create connections (deferred compute)
-        affected: list = []
-        for src_uuid, src_idx, dst_uuid, dst_idx in self._connections:
-            src_node = _find_node(canvas, src_uuid)
-            dst_node = _find_node(canvas, dst_uuid)
-            if src_node is None or dst_node is None:
-                continue
-            _, out = _get_port_lists(src_node)
-            in_list, _ = _get_port_lists(dst_node)
-            if src_idx < len(out) and dst_idx < len(in_list):
-                trace = ConnectionFactory.create(
-                    canvas, out[src_idx], in_list[dst_idx],
-                    validate=False, trigger_compute=False,
-                )
-                if trace is not None:
-                    affected.append(in_list[dst_idx])
-        _batch_trigger_compute(affected)
+        node = resolve_node_by_uuid(canvas, self._node_uuid)
+        if not node or not self._port_state: return
+        
+        is_output = self._port_state.get('is_output', self._is_output)
+        func = getattr(node, 'add_output' if is_output else 'add_input')
+        func(self._port_name, self._port_state.get('datatype', 'flow'), self._port_state.get('description', ''))
+        
+        for src_uid, src_name, dst_uid, dst_name in self._saved_connections:
+            src_node = resolve_node_by_uuid(canvas, src_uid)
+            dst_node = resolve_node_by_uuid(canvas, dst_uid)
+            if not src_node or not dst_node: continue
+            
+            src_port = next((p for p in getattr(src_node, 'outputs', []) if p.name == src_name), None)
+            dst_port = next((p for p in getattr(dst_node, 'inputs', []) if p.name == dst_name), None)
+            if src_port and dst_port:
+                ConnectionFactory.create(canvas, src_port, dst_port, validate=False, trigger_compute=True)
 
     def redo(self, canvas) -> None:
-        node = _find_node(canvas, self._node_uuid)
-        if node is None:
-            return
-        if hasattr(node, 'remove_port'):
+        node = resolve_node_by_uuid(canvas, self._node_uuid)
+        if node and self._port_name:
             node.remove_port(self._port_name, is_output=self._is_output)
 
-    @property
-    def description(self) -> str:
-        side = "output" if self._is_output else "input"
-        return f"Remove {side} port '{self._port_name}'"
 
+class AddPortsCommand(UndoCommand):
+    """Batch operation for adding arrays of dynamic ports."""
 
-# ======================================================================
-# Port visibility
-# ======================================================================
-
-class PortVisibilityCommand(UndoCommand):
-    """One or more ports had their visibility toggled.
-
-    Stores ``[(port_name, is_output, old_visible, new_visible), ...]``
-    for a single node.
-    """
-
-    def __init__(
-        self,
-        node_uuid: str,
-        changes: List[Tuple[str, bool, bool, bool]],
-    ) -> None:
-        # changes: [(port_name, is_output, was_visible, now_visible), ...]
-        self._node_uuid = node_uuid
-        self._changes = changes
-
+    def __init__(self, node, port_configs: List[Dict]) -> None:
+        super().__init__()
+        self._node_uuid = get_node_uid(node)
+        self._port_configs = port_configs
+        
     def undo(self, canvas) -> None:
-        self._apply(canvas, revert=True)
+        node = resolve_node_by_uuid(canvas, self._node_uuid)
+        if node:
+            for config in reversed(self._port_configs):
+                node.remove_port(config['name'], is_output=config.get('is_output', False))
 
     def redo(self, canvas) -> None:
-        self._apply(canvas, revert=False)
+        node = resolve_node_by_uuid(canvas, self._node_uuid)
+        if node:
+            for config in self._port_configs:
+                func = getattr(node, 'add_output' if config.get('is_output', False) else 'add_input')
+                func(config['name'], config.get('datatype', 'flow'), config.get('description', ''))
 
-    def _apply(self, canvas, revert: bool) -> None:
-        node = _find_node(canvas, self._node_uuid)
-        if node is None:
-            return
-        for port_name, is_output, was_visible, now_visible in self._changes:
-            target_vis = was_visible if revert else now_visible
-            port = None
-            if hasattr(node, 'find_port'):
-                port = node.find_port(port_name, is_output=is_output)
-            if port is not None and hasattr(node, 'set_port_visible'):
-                node.set_port_visible(port, target_vis)
 
-    @property
-    def description(self) -> str:
-        n = len(self._changes)
-        return f"Toggle {n} port visibility"
+class AddConnectionCommand(UndoCommand):
+    """Create a new trace link."""
+
+    def __init__(self, connection: Tuple[str, str, str, str]):
+        super().__init__()
+        self._connection = connection
+
+    def undo(self, canvas):
+        src_uid, src_name, dst_uid, dst_name = self._connection
+        src_node = resolve_node_by_uuid(canvas, src_uid)
+        dst_node = resolve_node_by_uuid(canvas, dst_uid)
+        if not src_node or not dst_node: return
+
+        src_port = next((p for p in getattr(src_node, 'outputs', []) if p.name == src_name), None)
+        dst_port = next((p for p in getattr(dst_node, 'inputs', []) if p.name == dst_name), None)
+
+        if src_port and dst_port:
+            for t in list(dst_port.connected_traces):
+                if t.source == src_port:
+                    ConnectionFactory.remove(t, trigger_compute=True)
+                    break
+
+    def redo(self, canvas):
+        src_uid, src_name, dst_uid, dst_name = self._connection
+        src_node = resolve_node_by_uuid(canvas, src_uid)
+        dst_node = resolve_node_by_uuid(canvas, dst_uid)
+        if not src_node or not dst_node: return
+
+        src_port = next((p for p in getattr(src_node, 'outputs', []) if p.name == src_name), None)
+        dst_port = next((p for p in getattr(dst_node, 'inputs', []) if p.name == dst_name), None)
+
+        if src_port and dst_port:
+            ConnectionFactory.create(canvas, src_port, dst_port, validate=False, trigger_compute=True)
+
+
+class RemoveConnectionsCommand(UndoCommand):
+    """Sever trace links across multiple items (e.g. Backspace / Shake actions)."""
+
+    def __init__(self, connections: List[Tuple[str, str, str, str]]):
+        super().__init__()
+        self._connections = connections
+
+    def undo(self, canvas):
+        for src_uid, src_name, dst_uid, dst_name in self._connections:
+            src_node = resolve_node_by_uuid(canvas, src_uid)
+            dst_node = resolve_node_by_uuid(canvas, dst_uid)
+            if not src_node or not dst_node: continue
+
+            src_port = next((p for p in getattr(src_node, 'outputs', []) if p.name == src_name), None)
+            dst_port = next((p for p in getattr(dst_node, 'inputs', []) if p.name == dst_name), None)
+
+            if src_port and dst_port:
+                ConnectionFactory.create(canvas, src_port, dst_port, validate=False, trigger_compute=True)
+
+    def redo(self, canvas):
+        for src_uid, src_name, dst_uid, dst_name in self._connections:
+            src_node = resolve_node_by_uuid(canvas, src_uid)
+            dst_node = resolve_node_by_uuid(canvas, dst_uid)
+            if not src_node or not dst_node: continue
+
+            src_port = next((p for p in getattr(src_node, 'outputs', []) if p.name == src_name), None)
+            dst_port = next((p for p in getattr(dst_node, 'inputs', []) if p.name == dst_name), None)
+
+            if src_port and dst_port:
+                for t in list(dst_port.connected_traces):
+                    if t.source == src_port:
+                        ConnectionFactory.remove(t, trigger_compute=True)
+                        break
 
 
 # ======================================================================
-# Compound command
+# Snapshot Helpers
 # ======================================================================
 
-class CompoundCommand(UndoCommand):
-    """Groups multiple sub-commands into a single undo step.
-
-    Undo applies sub-commands in reverse order; redo in forward order.
-    """
-
-    def __init__(self, children: List[UndoCommand], label: str = "") -> None:
-        self._children = children
-        self._label = label
-
-    def undo(self, canvas) -> None:
-        for cmd in reversed(self._children):
-            cmd.undo(canvas)
-
-    def redo(self, canvas) -> None:
-        for cmd in self._children:
-            cmd.redo(canvas)
-
-    @property
-    def description(self) -> str:
-        return self._label or f"{len(self._children)} actions"
-
-
-# ======================================================================
-# Snapshot helpers — used by callers to capture state BEFORE mutation
-# ======================================================================
-
-def capture_node_snapshot(
-    node,
-) -> Tuple[str, str, Dict[str, Any], Tuple[float, float]]:
-    """Return ``(uuid, class_name, state_dict, (x, y))`` for a node.
-
-    Call this **before** removing the node so that its full state is
-    preserved for undo.
-    """
+def capture_node_snapshot(node) -> Tuple[str, str, Dict[str, Any], Tuple[float, float]]:
+    """Return (uuid, class_name, state_dict, (x, y)) for a node."""
     uid = get_node_uid(node)
     cls_name = type(node).__name__
     state = node.get_state() if hasattr(node, 'get_state') else {}
@@ -809,46 +592,29 @@ def capture_node_snapshot(
     return uid, cls_name, state, pos
 
 
-def capture_node_connections(
-    canvas, node,
-) -> List[ConnectionTuple]:
-    """Return every connection touching *node* as 4-tuples.
-
-    Call this **before** removing the node.
-    """
-    from weave.node.node_trace import NodeTrace
-    seen: set = set()
-    result: List[ConnectionTuple] = []
-
+def capture_node_connections(canvas, node) -> List[Tuple[str, str, str, str]]:
+    """Generates name-based connection tuples for recreating connections."""
+    seen = set()
+    result = []
+    
     for port_attr in ('inputs', 'outputs'):
         for port in getattr(node, port_attr, []):
             for trace in list(getattr(port, 'connected_traces', [])):
-                if id(trace) in seen:
-                    continue
+                if id(trace) in seen: continue
                 seen.add(id(trace))
-
-                src = getattr(trace, 'source', None)
-                dst = getattr(trace, 'target', None)
-                if src is None or dst is None:
-                    continue
-
+                
+                src = trace.source
+                dst = trace.target
+                if not src or not dst: continue
+                
                 src_node = getattr(src, 'node', None)
                 dst_node = getattr(dst, 'node', None)
-                if src_node is None or dst_node is None:
-                    continue
-
-                _, out = _get_port_lists(src_node)
-                in_list, _ = _get_port_lists(dst_node)
-                try:
-                    src_idx = out.index(src)
-                    dst_idx = in_list.index(dst)
-                except ValueError:
-                    continue
-
+                if not src_node or not dst_node: continue
+                
+                # Use names instead of indices for total stability
                 result.append((
-                    get_node_uid(src_node),
-                    src_idx,
-                    get_node_uid(dst_node),
-                    dst_idx,
+                    get_node_uid(src_node), getattr(src, 'name', ''),
+                    get_node_uid(dst_node), getattr(dst, 'name', '')
                 ))
+                
     return result

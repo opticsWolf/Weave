@@ -44,7 +44,6 @@ from weave.canvas.states.state_utils import (
     ItemResolver,
     OptimizedShakeRecognizer,
     StylableStateMixin,
-    build_connection_tuples,
     get_movable_nodes,
 )
 from weave.canvas.commands_mixin import CanvasCommandsMixin
@@ -604,6 +603,19 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
         else:
             provider.cmd_duplicate(target_node)
 
+    def _build_safe_tuples(self, traces: list) -> list:
+        """Convert traces to name-based tuples for robust undo/redo."""
+        from weave.canvas.undo_commands import get_node_uid
+        tuples = []
+        for t in traces:
+            src, dst = getattr(t, 'source', None), getattr(t, 'target', None)
+            if src and dst and getattr(src, 'node', None) and getattr(dst, 'node', None):
+                tuples.append((
+                    get_node_uid(src.node), getattr(src, 'name', ''),
+                    get_node_uid(dst.node), getattr(dst, 'name', '')
+                ))
+        return tuples
+
     def _clear_port_connections(self, port: NodePort) -> None:
         """Remove connections from *port* and push an undo command."""
         from weave.canvas.undo_commands import RemoveConnectionsCommand
@@ -611,7 +623,7 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
         traces = list(port.connected_traces) if port.is_output else (
             [port.connected_traces[0]] if port.connected_traces else []
         )
-        tuples = build_connection_tuples(traces)
+        tuples = self._build_safe_tuples(traces)
         for trace in traces:
             ConnectionFactory.remove(trace)
         if tuples:
@@ -643,9 +655,19 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
 
     @staticmethod
     def _update_node_traces(node: QGraphicsItem) -> None:
-        for port in getattr(node, "inputs", []) + getattr(node, "outputs", []):
-            for trace in getattr(port, "connected_traces", []):
-                trace.update_path()
+        """Update traces after a node position change.
+
+        Delegates to the node's internal updater to guarantee that
+        traces connected to minimized summary ports are updated.
+        Falls back to manual port iteration for lightweight items.
+        """
+        if hasattr(node, '_update_all_connected_traces'):
+            node._update_all_connected_traces()
+        else:
+            for port in getattr(node, "inputs", []) + getattr(node, "outputs", []):
+                for trace in getattr(port, "connected_traces", []):
+                    if hasattr(trace, 'update_path'):
+                        trace.update_path()
 
     # ==================================================================
     # SHAKE DISCONNECT
@@ -653,6 +675,7 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
 
     def _trigger_shake_disconnect(self) -> None:
         from weave.canvas.undo_commands import RemoveConnectionsCommand
+        from weave.canvas.undo_manager import UndoManager
 
         # Resolve target nodes
         nodes: list[QGraphicsItem] = []
@@ -667,25 +690,54 @@ class DefaultInteractionState(StylableStateMixin, CanvasInteractionState):
         if not nodes:
             return
 
-        # Collect unique traces
+        # Collect unique traces and affected input ports
         traces: set = set()
+        affected_input_ports: list = []
         for node in nodes:
             for attr in ("inputs", "outputs"):
                 for port in getattr(node, attr, []):
                     for trace in list(getattr(port, "connected_traces", [])):
-                        traces.add(trace)
+                        if trace not in traces:
+                            traces.add(trace)
+                            target = getattr(trace, "target", None)
+                            if target is not None:
+                                affected_input_ports.append(target)
 
-        tuples = build_connection_tuples(traces)
+        if not traces:
+            return
+
+        tuples = self._build_safe_tuples(traces)
+        mgr = UndoManager.of(self.canvas)
+
+        # Open an explicit macro — the RemoveConnectionsCommand plus
+        # any downstream WidgetValueCommands from the batch set_dirty
+        # all land in one CompoundCommand.
+        if mgr:
+            mgr.begin_macro(f"Shake disconnect {len(traces)} traces")
 
         removed = 0
         for trace in traces:
-            ConnectionFactory.remove(trace)
+            ConnectionFactory.remove(trace, trigger_compute=False)
             removed += 1
+
+        # Single batch recompute per downstream node
+        seen: set = set()
+        for port in affected_input_ports:
+            node = getattr(port, "node", None)
+            if node is not None and id(node) not in seen:
+                seen.add(id(node))
+                if hasattr(node, "set_dirty"):
+                    node.set_dirty("disconnect")
+                elif hasattr(node, "evaluate"):
+                    node.evaluate()
 
         if removed:
             log.info(f"Shake disconnected {removed} traces")
             if tuples:
                 self._push_cmd(RemoveConnectionsCommand(tuples))
+
+        if mgr:
+            mgr.end_macro()
 
     # ==================================================================
     # KEYBOARD

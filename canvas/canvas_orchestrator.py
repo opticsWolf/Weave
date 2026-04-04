@@ -125,14 +125,23 @@ class CanvasOrchestrator:
     def _update_node_traces(self, node: QGraphicsItem) -> None:
         """
         Update all traces connected to a node's ports.
+
+        Delegates to the node's internal updater to guarantee that traces
+        connected to minimized summary ports are updated.  Falls back to
+        manual port iteration for lightweight / custom items that do not
+        implement ``_update_all_connected_traces``.
+
         Called after node position changes to keep traces aligned.
         """
-        # Collect all ports from node (either may be absent)
-        ports = getattr(node, 'inputs', []) + getattr(node, 'outputs', [])
-        
-        for port in ports:
-            for trace in port.connected_traces:
-                trace.update_path()
+        if hasattr(node, '_update_all_connected_traces'):
+            node._update_all_connected_traces()
+        else:
+            # Fallback for lightweight/custom items
+            ports = getattr(node, 'inputs', []) + getattr(node, 'outputs', [])
+            for port in ports:
+                for trace in getattr(port, 'connected_traces', []):
+                    if hasattr(trace, 'update_path'):
+                        trace.update_path()
 
     # =========================================================================
     # Z-ORDERING

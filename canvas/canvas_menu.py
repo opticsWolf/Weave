@@ -22,9 +22,68 @@ from weave.stylemanager import StyleManager, StyleCategory
 from weave.canvas.canvas_grid import GridType
 from weave.canvas.commands_mixin import CanvasCommandsMixin, HAS_NODE_COMPONENTS, HAS_SERIALIZER
 from weave.node.node_trace import NodeTrace, DragTrace
+from weave.canvas.canvas_icon_provider import get_menu_icon_provider
 
 from weave.logger import get_logger
 log = get_logger("ContextMenu")
+
+# ============================================================================
+# ICON PROVIDER — initialised lazily on first use via _icon()
+# ============================================================================
+
+def _icons():
+    """Return the process-wide MenuIconProvider, or None if not configured."""
+    from pathlib import Path
+    default_path = Path(__file__).parent.parent / "resources" / "menu_icons"
+    icon_dir = os.environ.get("WEAVE_ICON_DIR", default_path)
+    icon_path = Path(icon_dir).resolve()
+    return get_menu_icon_provider(directory=icon_path, size=16)
+
+
+def _icon(name: str) -> Optional[QIcon]:
+    """
+    Fetch a theme-tinted menu icon by name.
+
+    Returns None — rather than raising — when the provider is not
+    configured or the named icon does not exist, so every call-site
+    can treat icons as optional:
+
+        if ic := _icon("save"): action.setIcon(ic)
+    """
+    provider = _icons()
+    if provider is None:
+        return None
+    return provider.get_or_none(name)
+
+
+# ============================================================================
+# NODE ICON PROVIDER — theme-aware icons for node registry entries
+# ============================================================================
+
+def _get_node_icon_provider():
+    """
+    Return the process-wide ``NodeIconProvider`` singleton, or ``None``.
+
+    The provider is created on first use with default parameters.
+    Returns ``None`` — rather than raising — if the import fails so
+    every call-site can treat node icons as optional.
+    """
+    #try:
+    from weave.node.node_icon_provider import get_node_icon_provider
+    return get_node_icon_provider()
+    #except Exception:
+    #    return None
+
+
+def _node_icon(node_cls) -> Optional[QIcon]:
+    """
+    Return a theme-tinted menu ``QIcon`` for *node_cls* via
+    ``NodeIconProvider.for_menu()``, or ``None`` if unavailable.
+    """
+    provider = _get_node_icon_provider()
+    if provider is None:
+        return None
+    return provider.for_menu(node_cls)
 
 # ============================================================================
 # THEME DISCOVERY
@@ -46,10 +105,10 @@ class SearchMenuController:
     via QWidgetAction, then dynamically adding/removing plain QActions as
     search results directly into the menu. No QListWidget is used.
     """
-
+ 
     # Sentinel used as the data payload for the search separator and status actions
     _SEARCH_SENTINEL = "__search_result__"
-
+ 
     def __init__(
         self,
         canvas: 'Canvas',
@@ -62,82 +121,98 @@ class SearchMenuController:
         self._scene_pos = scene_pos
         self._menu = menu
         self._insert_before = insert_before  # Actions are inserted before this action
-
+ 
         # Keep track of dynamically added result actions so we can remove them
         self._result_actions: List[QAction] = []
         self._status_action: Optional[QAction] = None
         self._separator_action: Optional[QAction] = None
         self._current_index: int = -1  # Track keyboard-navigable highlight
-
+ 
         self._search_timer: Optional[QTimer] = None
-
+ 
         self._setup(insert_before)
-
+ 
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
-
+ 
     def _setup(self, insert_before: Optional[QAction]) -> None:
         """Create the search input widget-action and wire signals."""
-
+ 
         # --- search input wrapped in a small widget for padding ---
         container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(36, 8, 8, 8)
-        layout.setSpacing(0)
-
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(0)
+ 
+        # Inner row: icon (optional) + line edit side by side
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+ 
+        # Search icon — uses the same provider as the rest of the menu
+        _ic = _icon("input-search")
+        if _ic is not None:
+            icon_label = QLabel()
+            icon_label.setPixmap(_ic.pixmap(_ic.availableSizes()[0] if _ic.availableSizes() else 16))
+            icon_label.setFixedSize(16, 16)
+            icon_label.setScaledContents(True)
+            row.addWidget(icon_label)
+ 
         self._search_input = QLineEdit()
         self._search_input.setPlaceholderText("Search nodes...")
         self._search_input.setMinimumWidth(250)
         self._search_input.setClearButtonEnabled(True)
-        layout.addWidget(self._search_input)
-
+        row.addWidget(self._search_input)
+ 
+        outer.addLayout(row)
+ 
         container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
+ 
         widget_action = QWidgetAction(self._menu)
         widget_action.setDefaultWidget(container)
-
+ 
         if insert_before:
             self._menu.insertAction(insert_before, widget_action)
         else:
             self._menu.addAction(widget_action)
-
+ 
         # Store so we know where to insert result actions (right after the search bar)
         self._search_action = widget_action
-
+ 
         # --- debounce timer ---
         self._search_timer = QTimer()
         self._search_timer.setSingleShot(True)
         self._search_timer.timeout.connect(self._perform_search)
-
+ 
         # --- signals ---
         self._search_input.textChanged.connect(self._on_text_changed)
         self._search_input.returnPressed.connect(self._on_return_pressed)
         self._search_input.installEventFilter(_SearchEventFilter(self, self._search_input))
-
+ 
         # Give focus after the menu is shown
         QTimer.singleShot(0, self._search_input.setFocus)
-
+ 
     # ------------------------------------------------------------------
     # Internal: dynamic action management
     # ------------------------------------------------------------------
-
+ 
     def _clear_results(self) -> None:
         """Remove all previously injected search-result actions."""
         for action in self._result_actions:
             self._menu.removeAction(action)
         self._result_actions.clear()
-
+ 
         if self._status_action:
             self._menu.removeAction(self._status_action)
             self._status_action = None
-
+ 
         if self._separator_action:
             self._menu.removeAction(self._separator_action)
             self._separator_action = None
-
+ 
         self._current_index = -1
-
+ 
     def _insertion_point(self) -> Optional[QAction]:
         """Return the QAction before which new results should be inserted."""
         # We insert results right after the search widget action.
@@ -149,7 +224,7 @@ class SearchMenuController:
         except ValueError:
             pass
         return None  # append at end
-
+ 
     def _insert_action(self, action: QAction) -> None:
         """Insert an action right after the last result (or after the search bar)."""
         # We always append result actions at the "insertion point" which is the
@@ -159,11 +234,11 @@ class SearchMenuController:
             self._menu.insertAction(self._insert_before, action)
         else:
             self._menu.addAction(action)
-
+ 
     # ------------------------------------------------------------------
     # Search logic
     # ------------------------------------------------------------------
-
+ 
     def _on_text_changed(self, text: str) -> None:
         if self._search_timer:
             self._search_timer.stop()
@@ -172,52 +247,51 @@ class SearchMenuController:
             self._clear_results()
             return
         self._search_timer.start(150)
-
+ 
     def _perform_search(self) -> None:
         query = self._search_input.text().strip()
         self._clear_results()
-
+ 
         if not query:
             return
-
+ 
         if not HAS_REGISTRY or NODE_REGISTRY is None:
             self._add_status("Registry unavailable")
             return
-
+ 
         # Primary search
         results: List = NODE_REGISTRY.search(query, limit=50)
         fuzzy = False
-
+ 
         if not results:
             results = NODE_REGISTRY.fuzzy_search(query, threshold=0.5, limit=20)
             fuzzy = True
-
+ 
         if not results:
             self._add_status("No results found")
             return
-
+ 
         label = f"{len(results)} results" + (" (fuzzy)" if fuzzy else "")
         self._add_status(label)
-
+ 
         # Add a separator between status and result items
         sep = QAction(self._menu)
         sep.setSeparator(True)
         self._insert_action(sep)
         self._separator_action = sep
-
+ 
         # Populate result actions
         for result in results:
             display_name = self._get_node_display_name(result.node_cls)
             category_path = result.category
             if result.subcategory:
                 category_path += f" > {result.subcategory}"
-
+ 
             action = QAction(display_name, self._menu)
             
-            # Set node icon if available
-            icon = NODE_REGISTRY.get_node_icon(result.node_cls) if HAS_REGISTRY else None
-            if icon:
-                action.setIcon(icon)
+            # Set node icon via NodeIconProvider (theme-aware, tinted)
+            if ic := _node_icon(result.node_cls):
+                action.setIcon(ic)
             
             action.setToolTip(
                 f"Category: {category_path}\n"
@@ -229,23 +303,23 @@ class SearchMenuController:
             action.triggered.connect(partial(self._spawn_node, result.node_cls))
             self._insert_action(action)
             self._result_actions.append(action)
-
+ 
         # Highlight the first result
         if self._result_actions:
             self._current_index = 0
             self._highlight_current()
-
+ 
     def _add_status(self, text: str) -> None:
         """Add a disabled status action (e.g. '5 results')."""
         action = QAction(text, self._menu)
         action.setEnabled(False)
         self._insert_action(action)
         self._status_action = action
-
+ 
     # ------------------------------------------------------------------
     # Navigation helpers
     # ------------------------------------------------------------------
-
+ 
     def _highlight_current(self) -> None:
         """Visually highlight the current result action in the menu."""
         if not self._result_actions:
@@ -253,39 +327,39 @@ class SearchMenuController:
         # QMenu.setActiveAction sets the hover/highlight
         if 0 <= self._current_index < len(self._result_actions):
             self._menu.setActiveAction(self._result_actions[self._current_index])
-
+ 
     def navigate_down(self) -> None:
         if not self._result_actions:
             return
         self._current_index = (self._current_index + 1) % len(self._result_actions)
         self._highlight_current()
-
+ 
     def navigate_up(self) -> None:
         if not self._result_actions:
             return
         self._current_index = (self._current_index - 1) % len(self._result_actions)
         self._highlight_current()
-
+ 
     # ------------------------------------------------------------------
     # Spawning
     # ------------------------------------------------------------------
-
+ 
     def _on_return_pressed(self) -> None:
         """Spawn the currently highlighted node on Enter."""
         if self._result_actions and 0 <= self._current_index < len(self._result_actions):
             node_cls = self._result_actions[self._current_index].data()
             if node_cls:
                 self._spawn_node(node_cls)
-
+ 
     def _spawn_node(self, node_cls) -> None:
         if node_cls and self._canvas:
             self._canvas.spawn_node(node_cls, self._scene_pos)
             self._menu.close()
-
+ 
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
-
+ 
     @staticmethod
     def _get_node_display_name(node_cls) -> str:
         if HAS_REGISTRY and NODE_REGISTRY is not None:
@@ -394,6 +468,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         duplicate_action = QAction(dup_text, menu)
         duplicate_action.setShortcut("Ctrl+D")
         duplicate_action.triggered.connect(lambda: self.cmd_duplicate(target_item))
+        if ic := _icon("duplicate"): duplicate_action.setIcon(ic)
         menu.addAction(duplicate_action)
         
         # Action: Delete Node(s)
@@ -401,6 +476,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         delete_action = QAction(del_text, menu)
         delete_action.setShortcut("Delete")
         delete_action.triggered.connect(lambda: self.cmd_delete(target_item))
+        if ic := _icon("square-minus"): delete_action.setIcon(ic)
         menu.addAction(delete_action)
         
         menu.addSeparator()
@@ -410,6 +486,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         undo_action.setShortcut("Ctrl+Z")
         undo_action.setEnabled(self.can_undo)
         undo_action.triggered.connect(self.cmd_undo)
+        if ic := _icon("undo"): undo_action.setIcon(ic)
         menu.addAction(undo_action)
 
         # Action: Redo
@@ -417,6 +494,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         redo_action.setShortcut("Ctrl+Shift+Z")
         redo_action.setEnabled(self.can_redo)
         redo_action.triggered.connect(self.cmd_redo)
+        if ic := _icon("redo"): redo_action.setIcon(ic)
         menu.addAction(redo_action)
 
         menu.addSeparator()
@@ -425,6 +503,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         if not is_multi_selection:
             add_insp = QAction("Add Inspector", menu)
             add_insp.triggered.connect(self.cmd_add_dynamic_panel)
+            if ic := _icon("eye-plus"): add_insp.setIcon(ic)
             menu.addAction(add_insp)
 
         # Action: Mirror to Panel (static dock)
@@ -434,12 +513,14 @@ class ContextMenuProvider(CanvasCommandsMixin):
                 remove_panel.triggered.connect(
                     lambda: self.cmd_remove_static_panel(root_node)
                 )
+                if ic := _icon("panel_remove"): remove_panel.setIcon(ic)
                 menu.addAction(remove_panel)
             else:
                 mirror_action = QAction("Mirror to Panel", menu)
                 mirror_action.triggered.connect(
                     lambda: self.cmd_mirror_node(root_node)
                 )
+                if ic := _icon("add-mirror"): mirror_action.setIcon(ic)
                 menu.addAction(mirror_action)
 
         menu.addSeparator()
@@ -448,6 +529,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         clear_canvas_action = QAction("Clear Canvas", menu)
         clear_canvas_action.setShortcut("Ctrl+Shift+C")  # Using Ctrl+Shift+C to avoid conflicts
         clear_canvas_action.triggered.connect(self.cmd_clear_canvas)
+        if ic := _icon("eraser"): clear_canvas_action.setIcon(ic)
         menu.addAction(clear_canvas_action)
         
         menu.addSeparator()
@@ -462,6 +544,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
             targets = selected_nodes if is_multi_selection else [root_node]
             
             color_menu = menu.addMenu("Set Header Color")
+            if ic := _icon("palette"): color_menu.setIcon(ic)
             for i, color in enumerate(palette):
                 # Generate action with a color swatch icon
                 action = QAction(f"Color {i + 1}", color_menu)
@@ -486,11 +569,13 @@ class ContextMenuProvider(CanvasCommandsMixin):
         select_all_action = QAction("Select All", menu)
         select_all_action.setShortcut("Ctrl+A")
         select_all_action.triggered.connect(self.cmd_select_all)
+        if ic := _icon("click"): select_all_action.setIcon(ic)
         menu.addAction(select_all_action)
         
         # Action: Bring to Front
         front_action = QAction("Bring to Front", menu)
         front_action.triggered.connect(lambda: self.cmd_bring_to_front(target_item))
+        if ic := _icon("arrow-move-up"): front_action.setIcon(ic)
         menu.addAction(front_action)
 
         menu.addSeparator()
@@ -509,26 +594,31 @@ class ContextMenuProvider(CanvasCommandsMixin):
         # --- File Operations ---
         if HAS_SERIALIZER:
             file_menu = menu.addMenu("File")
-            
+            if ic := _icon("file"): file_menu.setIcon(ic)
+
             # New command
             new_action = QAction("New", file_menu)
             new_action.setShortcut("Ctrl+N")
             new_action.triggered.connect(self._on_new)
+            if ic := _icon("file-new"): new_action.setIcon(ic)
             file_menu.addAction(new_action)
             
             save_action = QAction("Save", file_menu)
             save_action.setShortcut("Ctrl+S")
             save_action.triggered.connect(self._on_save)
+            if ic := _icon("file-save"): save_action.setIcon(ic)
             file_menu.addAction(save_action)
             
             save_as_action = QAction("Save As...", file_menu)
             save_as_action.setShortcut("Ctrl+Shift+S")
             save_as_action.triggered.connect(self._on_save_as)
+            if ic := _icon("file-save_as"): save_as_action.setIcon(ic)
             file_menu.addAction(save_as_action)
             
             # Add recent files submenu
             if self._file_history:
                 recent_files_menu = file_menu.addMenu("Recent Files")
+                if ic := _icon("history"): recent_files_menu.setIcon(ic)
                 for i, filepath in enumerate(self._file_history):
                     action = QAction(filepath, recent_files_menu)
                     action.triggered.connect(partial(self._on_load_recent_file, filepath))
@@ -541,6 +631,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
             load_action = QAction("Open...", file_menu)
             load_action.setShortcut("Ctrl+O")
             load_action.triggered.connect(self._on_load)
+            if ic := _icon("open"): load_action.setIcon(ic)
             file_menu.addAction(load_action)
             
             menu.addSeparator()
@@ -549,12 +640,14 @@ class ContextMenuProvider(CanvasCommandsMixin):
         select_all_action = QAction("Select All", menu)
         select_all_action.setShortcut("Ctrl+A")
         select_all_action.triggered.connect(self._on_select_all)
+        if ic := _icon("click"): select_all_action.setIcon(ic)
         menu.addAction(select_all_action)
         
         # Action: Clear Canvas
         clear_canvas_action = QAction("Clear Canvas", menu)
         clear_canvas_action.setShortcut("Ctrl+Shift+C")
         clear_canvas_action.triggered.connect(self._on_clear_canvas_triggered)
+        if ic := _icon("eraser"): clear_canvas_action.setIcon(ic)
         menu.addAction(clear_canvas_action)
         
         menu.addSeparator()
@@ -564,6 +657,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         undo_action.setShortcut("Ctrl+Z")
         undo_action.setEnabled(self.can_undo)
         undo_action.triggered.connect(self.cmd_undo)
+        if ic := _icon("undo"): undo_action.setIcon(ic)
         menu.addAction(undo_action)
 
         # Action: Redo
@@ -571,6 +665,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         redo_action.setShortcut("Ctrl+Shift+Z")
         redo_action.setEnabled(self.can_redo)
         redo_action.triggered.connect(self.cmd_redo)
+        if ic := _icon("redo"): redo_action.setIcon(ic)
         menu.addAction(redo_action)
 
         menu.addSeparator()
@@ -595,6 +690,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         tree = NODE_REGISTRY.get_tree()
         if tree and isinstance(tree, dict):
             browse_menu = menu.addMenu("Browse Nodes")
+            if ic := _icon("list-tree"): browse_menu.setIcon(ic)
             self._populate_browse_menu(browse_menu, tree, scene_pos)
         
         menu.addSeparator()
@@ -612,6 +708,8 @@ class ContextMenuProvider(CanvasCommandsMixin):
     
     def _populate_browse_menu(self, browse_menu: QMenu, tree: dict, scene_pos: QPointF) -> None:
         """Build the hierarchical Browse Nodes submenu."""
+        node_icons = _get_node_icon_provider()
+
         for category, sub_dict in sorted(tree.items()):
             if not isinstance(sub_dict, dict) or not sub_dict:
                 continue
@@ -628,16 +726,33 @@ class ContextMenuProvider(CanvasCommandsMixin):
                 continue
             
             cat_menu = browse_menu.addMenu(str(category))
-            
+
+            # Category icon — scan every node in the category looking for one
+            # that provides a node_class_icon.  Only fall back to a plain
+            # node_icon when *no* node in the entire category defines one,
+            # so a single node returning None never silently hides a proper
+            # class icon set on another node in the same group.
+            if node_icons:
+                all_cat_nodes = [n for nodes in valid_sub_cats.values() for n in nodes]
+                cat_ic = next(
+                    (ic for n in all_cat_nodes if (ic := node_icons.for_menu_class(n))),
+                    None,
+                ) or next(
+                    (ic for n in all_cat_nodes if (ic := node_icons.for_menu(n))),
+                    None,
+                )
+                if cat_ic:
+                    cat_menu.setIcon(cat_ic)
+
             # Nodes with None subcategory go directly in the category menu
             direct_nodes = valid_sub_cats.get(None, [])
             if direct_nodes:
                 for node_cls in sorted(direct_nodes, key=lambda c: self._get_node_display_name(c)):
                     action_name = self._get_node_display_name(node_cls)
                     action = cat_menu.addAction(action_name)
-                    icon = NODE_REGISTRY.get_node_icon(node_cls)
-                    if icon:
-                        action.setIcon(icon)
+                    if node_icons:
+                        if ic := node_icons.for_menu(node_cls):
+                            action.setIcon(ic)
                     action.triggered.connect(
                         partial(self._canvas.spawn_node, node_cls, scene_pos)
                     )
@@ -649,12 +764,35 @@ class ContextMenuProvider(CanvasCommandsMixin):
                 key=lambda x: str(x[0])
             ):
                 sub_menu = cat_menu.addMenu(str(sub_cat))
+
+                # Subcategory icon — scan every node in the subcategory for a
+                # node_subclass_icon first, then node_class_icon, and only fall
+                # back to a plain node_icon when none of the nodes in the group
+                # define a dedicated class or subclass icon.
+                if node_icons and valid_nodes:
+                    sub_ic = (
+                        next(
+                            (ic for n in valid_nodes if (ic := node_icons.for_menu_subclass(n))),
+                            None,
+                        )
+                        or next(
+                            (ic for n in valid_nodes if (ic := node_icons.for_menu_class(n))),
+                            None,
+                        )
+                        or next(
+                            (ic for n in valid_nodes if (ic := node_icons.for_menu(n))),
+                            None,
+                        )
+                    )
+                    if sub_ic:
+                        sub_menu.setIcon(sub_ic)
+
                 for node_cls in sorted(valid_nodes, key=lambda c: self._get_node_display_name(c)):
                     action_name = self._get_node_display_name(node_cls)
                     action = sub_menu.addAction(action_name)
-                    icon = NODE_REGISTRY.get_node_icon(node_cls)
-                    if icon:
-                        action.setIcon(icon)
+                    if node_icons:
+                        if ic := node_icons.for_menu(node_cls):
+                            action.setIcon(ic)
                     action.triggered.connect(
                         partial(self._canvas.spawn_node, node_cls, scene_pos)
                     )
@@ -699,11 +837,17 @@ class ContextMenuProvider(CanvasCommandsMixin):
             current_type = GridType.DOTS
 
         grid_menu = parent_menu.addMenu("Grid Style")
+        if ic := _icon("grid"): grid_menu.setIcon(ic)
 
         for grid_type, label in self._GRID_TYPE_LABELS.items():
             action = QAction(label, grid_menu)
             action.setCheckable(True)
             action.setChecked(grid_type == current_type)
+            # Try a grid-type-specific icon (e.g. "grid_dots", "grid_lines"),
+            # fall back to the generic "grid" icon.
+            #icon_name = f"grid_{label.lower().replace(' ', '_').replace('(', '').replace(')', '')}"
+            #if ic := (_icon(icon_name) or _icon("grid")):
+            #    action.setIcon(ic)
             action.triggered.connect(partial(self.cmd_set_grid_type, grid_type))
             grid_menu.addAction(action)
 
@@ -724,6 +868,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         available = manager.available_themes
 
         theme_menu = parent_menu.addMenu("Themes")
+        if ic := _icon("brush"): theme_menu.setIcon(ic)
 
         if not available:
             no_themes = QAction("No themes available", theme_menu)
@@ -737,12 +882,17 @@ class ContextMenuProvider(CanvasCommandsMixin):
             action = QAction(label, theme_menu)
             action.setCheckable(True)
             action.setChecked(name == current)
+            # Use a theme-specific icon if one exists (e.g. "theme_warm"),
+            # otherwise fall back to the generic "theme" icon.
+            #if ic := (_icon(f"theme_{name}") or _icon("theme")):
+            #    action.setIcon(ic)
             action.triggered.connect(partial(self._on_apply_theme, name))
             theme_menu.addAction(action)
 
         theme_menu.addSeparator()
 
         load_action = QAction("Load Theme from File…", theme_menu)
+        if ic := _icon("open"): load_action.setIcon(ic)
         load_action.triggered.connect(self._on_load_theme_file)
         theme_menu.addAction(load_action)
 
@@ -811,11 +961,16 @@ class ContextMenuProvider(CanvasCommandsMixin):
         current_type = trace_styles.get("connection_type", "bezier")
 
         trace_menu = parent_menu.addMenu("Trace Style")
+        if ic := _icon("trace"): trace_menu.setIcon(ic)
 
         for key, label in self._TRACE_STYLE_LABELS.items():
             action = QAction(label, trace_menu)
             action.setCheckable(True)
             action.setChecked(key == current_type)
+            # Try "trace_bezier", "trace_straight", "trace_angular",
+            # fall back to generic "trace".
+            #if ic := (_icon(f"trace_{key}") or _icon("trace")):
+            #    action.setIcon(ic)
             action.triggered.connect(partial(self.cmd_set_trace_style, key))
             trace_menu.addAction(action)
 
@@ -829,6 +984,8 @@ class ContextMenuProvider(CanvasCommandsMixin):
         Themes, Grid Style, and Trace Style submenus.
         """
         styles_menu = parent_menu.addMenu("Styles")
+        if ic := _icon("themes"): styles_menu.setIcon(ic)
+        
         self._build_themes_submenu(styles_menu)
         self._build_grid_type_submenu(styles_menu)
         self._build_trace_style_submenu(styles_menu)
@@ -852,10 +1009,12 @@ class ContextMenuProvider(CanvasCommandsMixin):
         - Close All Panels
         """
         panels_menu = parent_menu.addMenu("Panels")
+        if ic := _icon("layout-2"): panels_menu.setIcon(ic)
 
         # ── Inspectors ───────────────────────────────────────────────
         add_insp = QAction("Add Inspector", panels_menu)
         add_insp.triggered.connect(self.cmd_add_dynamic_panel)
+        if ic := _icon("eye-plus"): add_insp.setIcon(ic)
         panels_menu.addAction(add_insp)
 
         has_inspectors = bool(self._dynamic_docks)
@@ -863,11 +1022,13 @@ class ContextMenuProvider(CanvasCommandsMixin):
         show_insp = QAction("Show All Inspectors", panels_menu)
         show_insp.setEnabled(has_inspectors)
         show_insp.triggered.connect(self.cmd_show_all_dynamic_panels)
+        if ic := _icon("eye-check"): show_insp.setIcon(ic)
         panels_menu.addAction(show_insp)
 
         hide_insp = QAction("Hide All Inspectors", panels_menu)
         hide_insp.setEnabled(has_inspectors)
         hide_insp.triggered.connect(self.cmd_hide_all_dynamic_panels)
+        if ic := _icon("eye-off"): hide_insp.setIcon(ic)
         panels_menu.addAction(hide_insp)
 
         panels_menu.addSeparator()
@@ -878,11 +1039,13 @@ class ContextMenuProvider(CanvasCommandsMixin):
         show_all = QAction("Show All Panels", panels_menu)
         show_all.setEnabled(has_any)
         show_all.triggered.connect(self.cmd_show_all_panels)
+        if ic := _icon("layout"): show_all.setIcon(ic)
         panels_menu.addAction(show_all)
 
         hide_all = QAction("Hide All Panels", panels_menu)
         hide_all.setEnabled(has_any)
         hide_all.triggered.connect(self.cmd_hide_all_panels)
+        if ic := _icon("layout-off"): hide_all.setIcon(ic)
         panels_menu.addAction(hide_all)
 
         panels_menu.addSeparator()
@@ -890,6 +1053,7 @@ class ContextMenuProvider(CanvasCommandsMixin):
         close_all = QAction("Close All Panels", panels_menu)
         close_all.setEnabled(has_any)
         close_all.triggered.connect(self.cmd_close_all_panels)
+        if ic := _icon("square-x"): close_all.setIcon(ic)
         panels_menu.addAction(close_all)
 
     # ==========================================================================

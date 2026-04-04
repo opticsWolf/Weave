@@ -807,8 +807,6 @@ class Canvas(QGraphicsScene):
 
     def _create_connection(self, start: NodePort, end: NodePort) -> Optional[NodeTrace]:
         """Create a connection and emit signal."""
-        from weave.canvas.states.state_utils import build_connection_tuples
-
         result = ConnectionFactory.create(
             self, start, end,
             validate=True,
@@ -816,28 +814,43 @@ class Canvas(QGraphicsScene):
         )
         if result:
             self.connection_created.emit(start, end)
-            # Push undo command for the new connection.
-            from weave.canvas.undo_commands import AddConnectionCommand
+
+            # Push undo command for the new connection using strict name-based resolution
+            from weave.canvas.undo_commands import AddConnectionCommand, get_node_uid
             provider = getattr(self, '_context_menu_provider', None)
             if provider is not None and hasattr(provider, '_undo_manager'):
-                tuples = build_connection_tuples([result])
-                if tuples:
-                    provider._undo_manager.push(AddConnectionCommand(tuples[0]))
+                src_node = getattr(start, 'node', None)
+                dst_node = getattr(end, 'node', None)
+                if src_node and dst_node:
+                    conn_tuple = (
+                        get_node_uid(src_node), getattr(start, 'name', ''),
+                        get_node_uid(dst_node), getattr(end, 'name', '')
+                    )
+                    provider._undo_manager.push(AddConnectionCommand(conn_tuple))
         return result
 
     def _set_global_port_dimming(self, active: bool, source_port: Optional[NodePort]) -> None:
         """Dim incompatible ports during connection drag."""
-        for item in self.items():
-            if not isinstance(item, NodePort) or item == source_port:
-                continue
-            
-            if active:
-                if not PortUtils.are_compatible(source_port, item):
-                    if hasattr(item, 'set_connection_state'):
-                        item.set_connection_state(False)
-            else:
-                if hasattr(item, 'reset_connection_state'):
-                    item.reset_connection_state()
+        if not hasattr(self, '_node_manager'):
+            return
+
+        for node in self._node_manager.nodes:
+            # Gather all real and summary ports on the node
+            ports = getattr(node, 'inputs', []) + getattr(node, 'outputs', [])
+            if getattr(node, '_summary_input', None): ports.append(node._summary_input)
+            if getattr(node, '_summary_output', None): ports.append(node._summary_output)
+
+            for port in ports:
+                if port is None or port == source_port:
+                    continue
+
+                if active:
+                    if not PortUtils.are_compatible(source_port, port):
+                        if hasattr(port, 'set_connection_state'):
+                            port.set_connection_state(False)
+                else:
+                    if hasattr(port, 'reset_connection_state'):
+                        port.reset_connection_state()
 
     # ==========================================================================
     # SELECTION

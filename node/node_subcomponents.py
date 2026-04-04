@@ -198,8 +198,7 @@ class StateSlider(QGraphicsObject):
         is_hover_hl = self._hovered and cfg['state_slider_highlight_on_hover']
         if is_hover_hl:
             shift = cfg['state_slider_highlight_color_shift']
-            #print ('is_hover_hl_body_bg', body_bg)
-            body_bg = highlight_colors(body_bg, shift/2)
+            body_bg = highlight_colors(body_bg, shift / 2)
         
         painter.setPen(QPen(outline_color, 1.5))
         painter.setBrush(QBrush(body_bg)) # Now uses body background
@@ -216,8 +215,7 @@ class StateSlider(QGraphicsObject):
         # 3. Draw Knob (highlight knob color on hover)
         knob_color = self._interpolate_color()
         if is_hover_hl:
-            #print ('is_hover_hl_knob_color', knob_color)
-            knob_color = highlight_colors(knob_color, shift*2)
+            knob_color = highlight_colors(knob_color, shift * 2)
         painter.setBrush(knob_color)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(knob_rect)

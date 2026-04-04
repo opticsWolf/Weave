@@ -58,7 +58,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Union
 
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, QTimer
 from PySide6.QtWidgets import QApplication, QWidget, QStyleFactory
 
 from weave.stylemanager import StyleManager, StyleCategory
@@ -131,6 +131,9 @@ class AppThemeBridge(QObject):
                 "Create one before instantiating the bridge."
             )
 
+        # Debounce tracking flag
+        self._refresh_scheduled = False
+
         # ── Apply a palette-friendly base style ──────────────────────
         # Must happen BEFORE the palette is set: the style determines
         # which QPalette roles the paint code actually consults.
@@ -194,6 +197,15 @@ class AppThemeBridge(QObject):
         self, category: StyleCategory, changes: Dict[str, Any]
     ) -> None:
         """Called by ``StyleManager`` when NODE or CANVAS styles change."""
+        # Debounce the global palette refresh. If NODE and CANVAS both
+        # update in the same frame, we only rebuild the palette once.
+        if not self._refresh_scheduled:
+            self._refresh_scheduled = True
+            QTimer.singleShot(0, self._execute_refresh)
+
+    def _execute_refresh(self) -> None:
+        """Execute the deferred palette refresh."""
+        self._refresh_scheduled = False
         self.refresh_app_palette()
 
     # ──────────────────────────────────────────────────────────────────────

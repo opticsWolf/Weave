@@ -51,6 +51,7 @@ class ConnectionDragState(CanvasInteractionState):
         self._detached_from_port: Optional[NodePort] = None
         self._detached_target_node = None
         self._detachment_occurred = False
+        self._detached_trace_tuple = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -132,6 +133,18 @@ class ConnectionDragState(CanvasInteractionState):
             self.request_transition("default")
             return True
 
+        mgr = None
+        provider = getattr(self.canvas, "_context_menu_provider", None)
+        if provider and hasattr(provider, "_undo_manager"):
+            mgr = provider._undo_manager
+
+        # Open an Undo macro to bundle detachment and (optional) reconnection
+        if self._detachment_occurred and mgr:
+            mgr.begin_macro("Reconnect Trace" if self.snapped_port else "Disconnect Trace")
+            if self._detached_trace_tuple:
+                from weave.canvas.undo_commands import RemoveConnectionsCommand
+                mgr.push(RemoveConnectionsCommand([self._detached_trace_tuple]))
+
         if self.snapped_port:
             self._finalize_connection()
         elif self._detachment_occurred and self._detached_target_node is not None:
@@ -140,6 +153,9 @@ class ConnectionDragState(CanvasInteractionState):
                 node.set_dirty("disconnect")
             elif hasattr(node, "evaluate"):
                 node.evaluate()
+
+        if self._detachment_occurred and mgr:
+            mgr.end_macro()
 
         self.request_transition("default")
         return True
@@ -157,8 +173,17 @@ class ConnectionDragState(CanvasInteractionState):
 
         trace = self._pending_detach_trace
         target_port = getattr(trace, "target", None)
+        source_port = getattr(trace, "source", None)
         if target_port is not None:
             self._detached_target_node = getattr(target_port, "node", None)
+
+        # Snapshot the connection by name BEFORE it is destroyed
+        if source_port and target_port and getattr(source_port, 'node', None) and getattr(target_port, 'node', None):
+            from weave.canvas.undo_commands import get_node_uid
+            self._detached_trace_tuple = (
+                get_node_uid(source_port.node), getattr(source_port, "name", ""),
+                get_node_uid(target_port.node), getattr(target_port, "name", "")
+            )
 
         ConnectionFactory.remove(trace, trigger_compute=False)
 

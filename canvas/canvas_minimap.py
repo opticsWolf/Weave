@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Weave: A modular PySide6 framework for the visual synthesis 
 and execution of high-concurrency simulation workflows.
@@ -140,6 +139,8 @@ class CanvasMinimap(QGraphicsView):
         self.update_position()
         
         # Register for style change notifications
+        # GAP 1 FIX: Using weakref registration via StyleManager.register() to prevent memory leaks.
+        # Do NOT use self._style_manager.style_changed.connect(...) directly.
         self._style_manager.register(self, StyleCategory.MINIMAP)
 
     def _get_minimap_config(self) -> Dict[str, Any]:
@@ -467,6 +468,10 @@ class CanvasMinimap(QGraphicsView):
             painter.drawRoundedRect(item.sceneBoundingRect(), visual_radius, visual_radius)
 
         painter.restore()
+
+    # =========================================================================
+    # RENDER PIPELINE - FOREGROUND
+    # =========================================================================
 
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
         """Draw minimap foreground (lens, UI)."""

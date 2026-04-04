@@ -38,8 +38,11 @@ process.
 DPI awareness
 -------------
 Pass ``size`` as a logical pixel value.  ``_render_svg`` creates
-a high-DPI pixmap via ``QPixmap.setDevicePixelRatio`` so icons
-are crisp on HiDPI / Retina displays.
+a pixmap of exactly *size* × *size* physical pixels with
+``devicePixelRatio`` = 1.  HiDPI is handled at the ``QIcon``
+level by the consuming provider (e.g. ``MenuIconProvider``
+queries ``menu_icon_size()`` and passes the exact target to the
+loader so no bitmap resampling is needed).
 
 Color replacement strategy
 --------------------------
@@ -48,6 +51,18 @@ Color replacement strategy
 2. Fallback: all ``fill="…"`` / ``stroke="…"`` attributes are
    rewritten, **except** ``fill="none"`` (transparent cutouts) and
    ``stroke="none"`` (no-stroke declarations) which are preserved.
+
+Sizing architecture
+-------------------
+``SvgIconLoader`` is a **generic, shared** cache.  It renders SVG
+data at whatever ``size`` the caller requests and does **not**
+apply any menu-specific scaling.  Menu-size enforcement is the
+responsibility of each provider layer (``MenuIconProvider``,
+``NodeIconProvider``) which query ``menu_icon_size()`` and pass
+the exact target resolution down to ``get()``.  This ensures
+non-menu consumers (e.g. Minimap at 24 px, Node Headers at 64 px)
+receive pixmaps at their requested resolution without unwanted
+downscaling.
 """
 
 from __future__ import annotations
@@ -85,6 +100,12 @@ class SvgIconLoader:
     This class has no knowledge of StyleManager or Weave themes.
     Colour resolution is the responsibility of the caller
     (``MenuIconProvider`` handles this for the menu layer).
+
+    The loader does **not** apply any menu-specific scaling.  It
+    renders at exactly the ``size`` requested by the caller.  Menu
+    providers are expected to pass ``menu_icon_size()`` directly so
+    the SVG is rasterized at the correct resolution in a single pass
+    (no bitmap resampling).
 
     Parameters
     ----------
@@ -177,12 +198,10 @@ class SvgIconLoader:
         Render *svg_data* into a square ``QPixmap`` of exactly *size* × *size*
         physical pixels with ``devicePixelRatio`` = 1.
 
-        HiDPI is handled at the ``QIcon`` level: ``scale_pixmap_to_menu``
-        computes the correct physical target size from ``menu_icon_size() × dpr``
-        and ``addPixmap`` registers the result under the right logical size.
-        Baking a 2× DPR into the pixmap here caused double-sizing because the
-        menu was already accounting for DPR, displaying a 16 px logical icon
-        at 32 logical pixels.
+        HiDPI is handled at the ``QIcon`` level by the consuming provider.
+        Each provider queries ``menu_icon_size()`` (or its own target size)
+        and passes the exact pixel count here, so no bitmap resampling is
+        ever needed after this call.
 
         Parameters
         ----------
@@ -220,6 +239,12 @@ class SvgIconLoader:
         """
         Return a tinted ``QIcon`` for *name*, using the cache.
 
+        The icon is rendered at exactly *size* × *size* pixels.  No
+        menu-specific scaling is applied — the caller is responsible for
+        passing the correct target size (e.g. ``menu_icon_size()`` for
+        menu consumers, or a larger value for node headers / minimap
+        buttons).
+
         Parameters
         ----------
         name : str
@@ -253,7 +278,12 @@ class SvgIconLoader:
 
         tinted  = self._tint_svg(self._svg_cache[key], color)
         pixmap  = self._render_svg(tinted.encode("utf-8"), size)
-        pixmap  = scale_pixmap_to_menu(pixmap)
+
+        # NOTE: No scale_pixmap_to_menu() here.  The generic loader must
+        # respect the requested resolution (e.g. size=64 for node headers).
+        # Menu-specific scaling is the responsibility of each provider
+        # layer (MenuIconProvider, NodeIconProvider) which pass the exact
+        # menu_icon_size() as the *size* argument.
 
         # addPixmap() lets Qt inspect devicePixelRatio directly, so a
         # 32×32 pixmap with DPR=2 is correctly understood as a 16×16
@@ -335,6 +365,14 @@ def scale_pixmap_to_menu(pixmap: QPixmap) -> QPixmap:
     ``QPixmap.scaled`` preserves the source DPR on the result, so no
     manual ``setDevicePixelRatio`` is needed afterwards.
 
+    .. note::
+
+       This helper is retained for backwards compatibility but is no
+       longer called by ``SvgIconLoader.get()``.  Providers that need
+       menu-sized icons should pass ``menu_icon_size()`` as the *size*
+       argument to the loader directly, which avoids bitmap resampling
+       entirely.
+
     Parameters
     ----------
     pixmap : QPixmap
@@ -355,6 +393,7 @@ def scale_pixmap_to_menu(pixmap: QPixmap) -> QPixmap:
         Qt.AspectRatioMode.KeepAspectRatio,
         Qt.TransformationMode.SmoothTransformation,
     )
+
 
 # ============================================================================
 # Shared loader registry
@@ -394,4 +433,3 @@ def get_or_create_loader(directory: str | Path) -> SvgIconLoader:
     if key not in _loader_registry:
         _loader_registry[key] = SvgIconLoader(key)
     return _loader_registry[key]
-

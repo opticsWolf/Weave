@@ -13,7 +13,7 @@ Renders node SVG icons in three distinct contexts:
 
 - **Menu (node)** — ``for_menu(node_cls)``
   Tinted to the active theme's menu-text colour (``body_text_color``),
-  sized to ``PM_SmallIconSize`` via ``scale_pixmap_to_menu()``.  Uses
+  sized to ``PM_SmallIconSize`` via ``menu_icon_size()``.  Uses
   the ``node_icon`` + ``node_icon_path`` classvars.
 
 - **Menu (category)** — ``for_menu_class(node_cls)``
@@ -51,6 +51,14 @@ icon lives in the same directory as the menu icons, both providers
 share a single loader — the directory is scanned and each file read
 from disk exactly once per process.
 
+Sizing architecture
+-------------------
+Menu methods (``for_menu``, ``for_menu_class``, ``for_menu_subclass``)
+dynamically query ``menu_icon_size()`` and pass the exact target to
+``SvgIconLoader._render_svg()``, so the SVG is rasterized at the
+correct OS menu metric in a single pass — no bitmap resampling
+(``scale_pixmap_to_menu``) is needed after rendering.
+
 Architecture
 ------------
 ::
@@ -61,9 +69,9 @@ Architecture
           ▼
     NodeIconProvider._resolve_full_path(node_cls, stem_attr, dir_attr)
           │
-          ├── for_menu(node_cls)                    → QIcon  (text colour, menu size)
-          ├── for_menu_class(node_cls)              → QIcon  (text colour, menu size)
-          ├── for_menu_subclass(node_cls)           → QIcon  (text colour, menu size)
+          ├── for_menu(node_cls)                    → QIcon  (text colour, menu_icon_size())
+          ├── for_menu_class(node_cls)              → QIcon  (text colour, menu_icon_size())
+          ├── for_menu_subclass(node_cls)           → QIcon  (text colour, menu_icon_size())
           └── for_header(node_cls, header_bg)       → QIcon  (contrast colour, header size)
                     │
                     └── get_or_create_loader(directory)  ← shared with MenuIconProvider
@@ -108,7 +116,6 @@ from PySide6.QtGui import QColor, QIcon, QPixmap
 from weave.themes.icon_loader import (
     SvgIconLoader,
     get_or_create_loader,
-    scale_pixmap_to_menu,
     menu_icon_size,
 )
 from weave.stylemanager import StyleManager, StyleCategory
@@ -162,8 +169,8 @@ class NodeIconProvider:
     Produces tinted ``QIcon`` objects for two rendering contexts:
 
     ``for_menu(node_cls)``
-        Tinted to the theme's ``body_text_color``, scaled to
-        ``PM_SmallIconSize`` — consistent with all other menu icons.
+        Tinted to the theme's ``body_text_color``, rendered at
+        ``menu_icon_size()`` — consistent with all other menu icons.
 
     ``for_header(node_cls, header_bg)``
         Tinted to a colour that contrasts against *header_bg* (WCAG
@@ -181,13 +188,21 @@ class NodeIconProvider:
     Both tint caches are flushed automatically on
     ``StyleManager.theme_changed`` — no manual wiring required.
 
+    Sizing
+    ------
+    Menu methods dynamically query ``menu_icon_size()`` and pass the
+    exact pixel count to ``SvgIconLoader._render_svg()``, so the SVG
+    is rasterized at the correct resolution in a single pass — no
+    post-render ``scale_pixmap_to_menu()`` bitmap resampling is needed.
+
     Parameters
     ----------
     header_size : int
         Logical pixel size for header icons (default: 14).
     menu_size : int
-        Logical pixel size used when rendering menu icons before
-        ``scale_pixmap_to_menu`` trims to the style metric (default: 16).
+        Logical pixel size for menu icons (default: 16).  Retained for
+        backwards compatibility but overridden at call time by
+        ``menu_icon_size()`` in the ``for_menu*`` methods.
     """
 
     _FALLBACK_COLOR = "#C8CDD7"
@@ -431,9 +446,10 @@ class NodeIconProvider:
         """
         Return a menu-context ``QIcon`` for *node_cls* (``node_icon``).
 
-        Tinted to ``body_text_color``, scaled to ``PM_SmallIconSize``
-        via ``scale_pixmap_to_menu()``.  Consistent with all other menu
-        icons from ``MenuIconProvider``.
+        Tinted to ``body_text_color``, rendered at ``menu_icon_size()``
+        so the SVG is rasterized at the exact OS menu metric in a single
+        pass — no bitmap resampling needed.  Consistent with all other
+        menu icons from ``MenuIconProvider``.
 
         Returns ``None`` if the node has no ``node_icon`` or the path
         cannot be resolved.
@@ -452,9 +468,10 @@ class NodeIconProvider:
         if svg is None:
             return None
 
+        # Render at menu_icon_size() directly — no post-render scaling.
+        target_size = menu_icon_size()
         tinted = SvgIconLoader._tint_svg(svg, color)
-        pixmap = SvgIconLoader._render_svg(tinted.encode("utf-8"), self._menu_size)
-        pixmap = scale_pixmap_to_menu(pixmap)
+        pixmap = SvgIconLoader._render_svg(tinted.encode("utf-8"), target_size)
 
         icon = QIcon()
         icon.addPixmap(pixmap)
@@ -468,7 +485,7 @@ class NodeIconProvider:
         (``node_class_icon``).
 
         Intended for use as the icon on category-level ``QMenu`` entries
-        in the Browse Nodes hierarchy.  Tinted and scaled identically to
+        in the Browse Nodes hierarchy.  Tinted and sized identically to
         ``for_menu()`` so all menu icons are visually consistent.
 
         Returns ``None`` if the node has no ``node_class_icon`` or the
@@ -488,9 +505,10 @@ class NodeIconProvider:
         if svg is None:
             return None
 
+        # Render at menu_icon_size() directly — no post-render scaling.
+        target_size = menu_icon_size()
         tinted = SvgIconLoader._tint_svg(svg, color)
-        pixmap = SvgIconLoader._render_svg(tinted.encode("utf-8"), self._menu_size)
-        pixmap = scale_pixmap_to_menu(pixmap)
+        pixmap = SvgIconLoader._render_svg(tinted.encode("utf-8"), target_size)
 
         icon = QIcon()
         icon.addPixmap(pixmap)
@@ -504,7 +522,7 @@ class NodeIconProvider:
         (``node_subclass_icon``).
 
         Intended for use as the icon on subcategory-level ``QMenu``
-        entries in the Browse Nodes hierarchy.  Tinted and scaled
+        entries in the Browse Nodes hierarchy.  Tinted and sized
         identically to ``for_menu()`` so all menu icons are consistent.
 
         Returns ``None`` if the node has no ``node_subclass_icon`` or the
@@ -524,9 +542,10 @@ class NodeIconProvider:
         if svg is None:
             return None
 
+        # Render at menu_icon_size() directly — no post-render scaling.
+        target_size = menu_icon_size()
         tinted = SvgIconLoader._tint_svg(svg, color)
-        pixmap = SvgIconLoader._render_svg(tinted.encode("utf-8"), self._menu_size)
-        pixmap = scale_pixmap_to_menu(pixmap)
+        pixmap = SvgIconLoader._render_svg(tinted.encode("utf-8"), target_size)
 
         icon = QIcon()
         icon.addPixmap(pixmap)
@@ -573,7 +592,6 @@ class NodeIconProvider:
 
         self._header_cache[cache_key] = icon
         return icon
-
 
     # ------------------------------------------------------------------
     # Stroke-width injection
@@ -695,8 +713,9 @@ def get_node_icon_provider(
     header_size : int
         Logical pixel size for header-context icons.
     menu_size : int
-        Logical pixel size used when rendering menu-context icons
-        before ``scale_pixmap_to_menu`` trims to the style metric.
+        Logical pixel size for menu-context icons.  Retained for
+        backwards compatibility; the ``for_menu*`` methods override
+        this with ``menu_icon_size()`` at call time.
     """
     global _node_icon_provider
 

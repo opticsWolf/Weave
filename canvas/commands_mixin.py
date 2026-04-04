@@ -283,7 +283,6 @@ class CanvasCommandsMixin:
             return 0
 
         # Capture connection tuples BEFORE removing
-        from weave.canvas.undo_commands import _get_port_lists
         seen: set = set()
         conn_tuples = []
         traces_to_remove: set = set()
@@ -302,17 +301,12 @@ class CanvasCommandsMixin:
                             src_node = getattr(src, 'node', None)
                             dst_node = getattr(dst, 'node', None)
                             if src_node and dst_node:
-                                _, out = _get_port_lists(src_node)
-                                in_list, _ = _get_port_lists(dst_node)
-                                try:
-                                    conn_tuples.append((
-                                        get_node_uid(src_node),
-                                        out.index(src),
-                                        get_node_uid(dst_node),
-                                        in_list.index(dst),
-                                    ))
-                                except ValueError:
-                                    pass
+                                conn_tuples.append((
+                                    get_node_uid(src_node),
+                                    getattr(src, 'name', ''),
+                                    get_node_uid(dst_node),
+                                    getattr(dst, 'name', '')
+                                ))
 
         removed = 0
         for trace in traces_to_remove:
@@ -760,7 +754,7 @@ class CanvasCommandsMixin:
         # Matches  "Base Title"  and  "Base Title (N)".
         used_numbers: set[int] = {1}  # The bare title counts as 1.
         pattern = re.compile(
-            rf"^{re.escape(base_title)}\s*\((\d+)\)$"
+            rf"^{re.escape(base_title)}\s*$(\d+)$$"
         )
         for title in existing_titles:
             m = pattern.match(title)

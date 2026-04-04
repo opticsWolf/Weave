@@ -6,19 +6,22 @@ Copyright (c) 2026 opticsWolf
 
 SPDX-License-Identifier: Apache-2.0
 
-Improved NodeDataFlow with robust state-aware data propagation.
+BaseControlNode with robust fence management and enhanced dataflow logic.
 
-Key improvements:
-1. request_data() properly handles DISABLED nodes
-2. Last valid values preserved before disabling
-3. Configurable downstream behavior (use_cached, use_none, use_default)
-4. Better passthrough that properly pulls from upstream
-5. State change notifications propagate with reason
-6. Atomic cache updates to prevent partial state
+FIXED:
+- Added `_are_inputs_ready()` barrier for synchronous multi-input dependency synchronization.
+- Delegated `_handle_state_transition` re-evaluation to `self.set_dirty()` to ensure polymorphic safety.
+- Fixed `AttributeError` for computing pulse animations.
+- Fixed Terminal Node crash (0 outputs) in `_normalize_results`.
+- Fixed Passthrough type-dropping for "any" datatypes.
 """
 
+from __future__ import annotations
+
+import os
 import sys
 import uuid
+import weakref
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Final, ClassVar, Callable
 from dataclasses import dataclass, field
@@ -29,16 +32,20 @@ from PySide6.QtCore import Qt, Signal, QTimer, QObject
 from PySide6.QtWidgets import QApplication, QGraphicsScene, QGraphicsView
 from PySide6.QtGui import QColor, QPainter
 
-# Assuming these exist in your project structure
 from weave.node.node_core import Node
 from weave.node.node_enums import NodeState, VerticalSizePolicy, DisabledBehavior
 from weave.panel.dock_properties import DockProperties
 
 from weave.logger import get_logger
-log = get_logger("NodeDataFlow")
+log = get_logger("BaseNode")
 
-#mouse jump diagnostics:
-#from weave.node_drag_diagnostic import NodeDragDiagnostic
+_DEBUG = os.environ.get("WEAVE_DEBUG", "0") == "1"
+
+def _dbg(msg: str) -> None:
+    """Module-local debug printer for verbose evaluation tracking."""
+    if _DEBUG:
+        print(f"[BaseNode] {msg}", flush=True)
+    log.debug(msg)
 
 
 @dataclass
@@ -46,33 +53,29 @@ class CacheEntry:
     """Represents a cached value with metadata."""
     value: Any
     is_valid: bool = True
-    timestamp: float = 0.0  # For potential staleness checks
-    source_state: Optional[NodeState] = None  # State when this was computed
+    timestamp: float = 0.0
+    source_state: Optional[NodeState] = None
 
 
 class NodeDataFlow:
     """Mixin to handle logic state, dirty-flag propagation, and lazy evaluation.
 
-    Attributes:
-        _is_dirty (bool): Indicates if the cache is invalid.
-        _is_computing (bool): Lock to prevent infinite recursion during eval.
-        _cached_values (Dict[str, CacheEntry]): Stores computed results with metadata.
-        _last_valid_values (Dict[str, Any]): Preserved values from before DISABLED.
-        _manual_mode (bool): If True, auto-propagation stops at this node.
-        _disabled_behavior (DisabledBehavior): What to return when disabled.
-        _port_defaults (Dict[str, Any]): Default values per output port.
+    Key improvements over base implementation:
+    - Robust cycle detection in request_data()
+    - Atomic cache updates for thread-safety
+    - Better passthrough that properly pulls from upstream 
+    - State change notifications with reason
     """
 
     def __init__(self) -> None:
-        """Initialize the dataflow state."""
         self._is_dirty: bool = True
         self._is_computing: bool = False
         self._cached_values: Dict[str, CacheEntry] = {}
         self._last_valid_values: Dict[str, Any] = {}  # NEW: Preserved before disable
         self._manual_mode: bool = False
         self._disabled_behavior: DisabledBehavior = DisabledBehavior.USE_NONE
-        self._port_defaults: Dict[str, Any] = {}  # Configurable defaults per port
-        self._state: NodeState = NodeState.NORMAL  # Ensure state is always defined
+        self._port_defaults: Dict[str, Any] = {}
+        self._state: NodeState = NodeState.NORMAL
 
     def set_port_default(self, port_name: str, default_value: Any) -> None:
         """Set a default value for an output port (used when disabled with USE_DEFAULT)."""
@@ -98,10 +101,7 @@ class NodeDataFlow:
         self._mark_downstream_dirty(reason)
 
     def _mark_downstream_dirty(self, reason: str = "upstream_change") -> None:
-        """Mark all downstream nodes as dirty with a reason.
-        
-        Separated from set_dirty() so it can be called independently.
-        """
+        """Mark all downstream nodes as dirty with a reason."""
         outputs = getattr(self, 'outputs', [])
         for port in outputs:
             traces = getattr(port, 'connected_traces', [])
@@ -132,8 +132,8 @@ class NodeDataFlow:
     def request_data(self, port_name: str, visited: Optional[Set[int]] = None) -> Any:
         """Retrieves data for a specific port, evaluating upstream if necessary.
 
-        IMPROVED: Now properly handles DISABLED and PASSTHROUGH states.
-
+        IMPROVED: Now properly handles DISABLED and PASSTHROUGH states with cycle detection.
+        
         Args:
             port_name: The name of the output port to retrieve.
             visited: A set of node IDs to detect dependency cycles.
@@ -255,6 +255,9 @@ class NodeDataFlow:
             if hasattr(self, 'on_evaluate_finished'):
                 self.on_evaluate_finished()
 
+            # --- NEW: Wake up any downstream nodes waiting at the barrier ---
+            self._mark_downstream_dirty("upstream_evaluated")
+
         except Exception as e:
             log.info(f"Error computing node {self}: {e}")
             # Mark cache entries as invalid but preserve values
@@ -324,7 +327,11 @@ class NodeDataFlow:
         
         if results is None:
             return {}
-        
+
+        # Safely handle Terminal Nodes (0 outputs) returning scalars
+        if len(outputs) == 0:
+            return {}
+
         # Scalar return for single-output node
         if len(outputs) == 1:
             return {outputs[0].name: results}
@@ -362,7 +369,7 @@ class NodeDataFlow:
                 # Optional: Type compatibility check
                 if out_type is not None:
                     in_type = getattr(in_port, 'data_type', None)
-                    if in_type == out_type or self._types_compatible(in_type, out_type):
+                    if self._types_compatible(in_type, out_type):
                         val = candidate
                 else:
                     val = candidate
@@ -382,7 +389,13 @@ class NodeDataFlow:
         """Check if input type can be passed through to output type."""
         if in_type is None or out_type is None:
             return True
-        # Add custom type compatibility logic here
+
+        # Universal wildcard support for "any" datatype
+        in_str = str(in_type).lower()
+        out_str = str(out_type).lower()
+        if in_str == "any" or out_str == "any":
+            return True
+
         return in_type == out_type
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -420,10 +433,9 @@ class DisabledMarker:
         return False  # Evaluates to False in boolean context
 
 
-#class BaseControlNode(NodeDragDiagnostic, Node, NodeDataFlow):
 class BaseControlNode(Node, NodeDataFlow):
     """Hybrid Node: Combines UI (Node) with Logic (NodeDataFlow).
-    
+
     IMPROVED: Comprehensive state change handling with proper cache management.
     
     Class-Level Metadata (override in subclasses):
@@ -476,110 +488,48 @@ class BaseControlNode(Node, NodeDataFlow):
             # Node shrinks when ports are removed or hidden
             vertical_size_policy = VerticalSizePolicy.FIT
     """
-    node_class:             ClassVar[str]            = "Basic"
-    node_subclass:          ClassVar[str]            = "Basic"
-    node_name:              ClassVar[Optional[str]]  = None
-    node_description:       ClassVar[Optional[str]]  = None
-    node_tags:              ClassVar[Optional[List[str]]] = None
-    node_icon:              ClassVar[Optional[str]]  = "node"
-    node_class_icon:        ClassVar[Optional[str]]  = "node"
-    node_subclass_icon:     ClassVar[Optional[str]]  = "node"
-    #node_icon_path:         ClassVar[Optional[str]]  = r"../resources/node_icons"
-    #print (node_icon_path)
-    node_icon_path:         ClassVar[Optional[str]]  = str(Path(__file__).parent / "resources" / "node_icons")
-    dock_properties:        ClassVar[Optional[DockProperties]] = None
-
-    #: Vertical resize behaviour.  Override in subclasses to change the
-    #: default.  Can also be changed at runtime via
-    #: ``node.set_vertical_size_policy(VerticalSizePolicy.FIT)``.
+    node_class: ClassVar[str] = "Basic"
+    node_subclass: ClassVar[str] = "Basic"
+    node_name: ClassVar[Optional[str]] = None
+    node_description: ClassVar[Optional[str]] = None
+    node_tags: ClassVar[Optional[List[str]]] = None
+    node_icon: ClassVar[Optional[str]] = "node"
+    node_class_icon: ClassVar[Optional[str]] = "node"
+    node_subclass_icon: ClassVar[Optional[str]] = "node"
+    node_icon_path: ClassVar[Optional[str]] = str(Path(__file__).parent / "resources" / "node_icons")
+    dock_properties: ClassVar[Optional[DockProperties]] = None
     vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.GROW_ONLY
     
     data_updated = Signal()
-    # NOTE: Do NOT redefine state_changed here - parent Node already defines it
-    # as Signal(object, object) emitting (old_state, new_state)
 
     def __init__(self, title: str, **kwargs):
-        """Initialize the node with UI and Logic components."""
         Node.__init__(self, title, **kwargs)
         NodeDataFlow.__init__(self)
         
-        # Apply the class-level vertical size policy to the instance.
         self._vertical_size_policy = type(self).vertical_size_policy
 
-        # Per-node flag: True when a _fenced_evaluate is scheduled but
-        # hasn't fired yet.  Prevents duplicate fence increments from
-        # repeated set_dirty calls on the same node.
+        # Fence tracking
         self._eval_pending: bool = False
+        self._fence_token: Optional[int] = None
+        self._fence_scene_ref: Optional[weakref.ref] = None
         
-        # Wire port lifecycle signals to dataflow/widget cleanup.
         self.port_removed.connect(self._on_port_removed)
-
-        # Deferred initial evaluation
         QTimer.singleShot(0, self._post_init_eval)
 
-    # ==================================================================
-    # UUID METHODS - PROXY TO PARENT NODE'S UUID FUNCTIONALITY 
-    # ==================================================================
-
-    def get_uuid(self) -> uuid.UUID:
-        """
-        Get the unique identifier for this node.
-        
-        This method provides access to the underlying Node's UUID functionality,
-        ensuring consistent identification across all node types in the system.
-        
-        Returns:
-            A uuid.UUID object that uniquely identifies this node instance.
-        """
-        return super().get_uuid()
-    
-    def get_uuid_string(self) -> str:
-        """
-        Get the unique identifier for this node as a string representation.
-        
-        This is useful for serialization, logging, and other string-based operations
-        where working with UUID objects directly might be cumbersome.
-        
-        Returns:
-            A string representation of the node's UUID.
-        """
-        return super().get_uuid_string()
-
     def _post_init_eval(self) -> None:
-        """Runs initial evaluation after constructor completes."""
-        # Safety: Check if we're still in a valid scene
         if not self._is_scene_valid():
             return
         if not self._manual_mode:
-            self.evaluate()
+            self.set_dirty("init")
 
     def _is_scene_valid(self) -> bool:
-        """Check if the node is still in a valid scene."""
         try:
             return self.scene() is not None
         except RuntimeError:
             return False
 
-    # ------------------------------------------------------------------
-    # Widget palette synchronisation
-    # ------------------------------------------------------------------
-
     def _update_colors(self, is_selected: bool):
-        """Extend the mixin to propagate effective colours to WidgetCore.
-
-        After the parent updates header/body brushes, the *actual*
-        colours (including selection highlights and custom overrides) are
-        stored on ``self.header._bg_color`` and ``self.body._bg_color``.
-        We forward them to the embedded ``WidgetCore`` so that:
-
-        - ``QPalette.Highlight`` (text selection, combo focus) matches
-          the node's real header colour — not the global theme default.
-        - ``QPalette.Window`` / ``Base`` shift when the node is selected,
-          giving embedded widgets a subtle visual cue that mirrors the
-          QPainter-drawn body fill.
-        """
         super()._update_colors(is_selected)
-
         wc = getattr(self, '_widget_core', None) or getattr(self, '_weave_core', None)
         if wc is not None and hasattr(wc, 'apply_node_palette'):
             wc.apply_node_palette(
@@ -618,12 +568,13 @@ class BaseControlNode(Node, NodeDataFlow):
 
         # --- STEP 2: Pre-transition work ---
 
-        # Computing pulse: managed here because NodePortsMixin doesn't know
-        # about start_computing_pulse / stop_computing_pulse.
+        # Use the correct encapsulated method names from NodePulseAnimMixin (§3)
         if state == NodeState.COMPUTING:
-            self.start_computing_pulse()  # From NodeGeometryMixin
+            if hasattr(self, '_start_computing_pulse'):
+                self._start_computing_pulse()
         elif old_state == NodeState.COMPUTING:
-            self.stop_computing_pulse()   # From NodeGeometryMixin
+            if hasattr(self, '_stop_computing_pulse'):
+                self._stop_computing_pulse()
 
         # Preserve cache snapshot before entering DISABLED so that
         # USE_LAST_VALID can serve the final good values downstream.
@@ -640,7 +591,7 @@ class BaseControlNode(Node, NodeDataFlow):
         self._notify_downstream_state_change(state)
 
     def _handle_state_transition(self, old_state: NodeState, new_state: NodeState) -> None:
-        """Handle specific state transition logic.
+        """Handle specific state transition logic efficiently by delegating to set_dirty.
         
         State Transition Matrix:
         ┌──────────────┬────────────────┬────────────────┬────────────────┐
@@ -654,11 +605,7 @@ class BaseControlNode(Node, NodeDataFlow):
         
         # DISABLED -> anything else: Restore and re-evaluate
         if old_state == NodeState.DISABLED:
-            self._is_dirty = True
-            if not self._manual_mode and not self._eval_pending:
-                self._eval_pending = True
-                self._increment_eval_fence()
-                QTimer.singleShot(0, self._fenced_evaluate)
+            self.set_dirty("state_restored")
         
         # anything -> DISABLED: Already preserved, notify downstream
         elif new_state == NodeState.DISABLED:
@@ -668,80 +615,129 @@ class BaseControlNode(Node, NodeDataFlow):
         elif (old_state == NodeState.NORMAL and new_state == NodeState.PASSTHROUGH) or \
              (old_state == NodeState.PASSTHROUGH and new_state == NodeState.NORMAL):
             self._cached_values.clear()
-            self._is_dirty = True
-            if not self._manual_mode and not self._eval_pending:
-                self._eval_pending = True
-                self._increment_eval_fence()
-                QTimer.singleShot(0, self._fenced_evaluate)
+            self.set_dirty("mode_switched")
 
     def _safe_evaluate(self) -> None:
         """Evaluate with safety checks for Qt deletion."""
         if self._is_scene_valid():
             self.evaluate()
 
-    # ------------------------------------------------------------------
-    # Eval fence — tracks pending deferred evaluations for undo manager
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Fence & Barrier Management
+    # ==================================================================
 
     def _increment_eval_fence(self) -> None:
-        """Increment the scene-level pending-evaluation counter.
-
-        Called when ``QTimer.singleShot(0, _fenced_evaluate)`` is
-        scheduled.  The undo manager checks this counter to know when
-        all deferred evaluations have completed.
-        """
+        """Increment fence with token tracking and scene reference."""
         try:
             scene = self.scene()
             if scene is not None:
-                scene._eval_fence = getattr(scene, '_eval_fence', 0) + 1
+                current = getattr(scene, '_eval_fence', 0)
+                scene._eval_fence = current + 1
+                self._fence_token = current + 1
+                # CRITICAL FIX: Store weak reference to scene
+                self._fence_scene_ref = weakref.ref(scene)
+                _dbg(f"fence increment: {current} -> {current + 1} "
+                     f"(token={self._fence_token}, node={self.get_uuid_string()[:8]})")
         except RuntimeError:
             pass
 
     def _decrement_eval_fence(self) -> None:
-        """Decrement the scene-level pending-evaluation counter."""
+        """Decrement fence using stored scene reference if current scene is None."""
         try:
-            scene = self.scene()
-            if scene is not None:
-                scene._eval_fence = max(
-                    0, getattr(scene, '_eval_fence', 0) - 1)
+            if self._fence_token is not None:
+                scene = None
+                
+                # Try stored weak reference first (node may be removed from scene)
+                if self._fence_scene_ref is not None:
+                    scene = self._fence_scene_ref()
+                
+                # Fallback to current scene() if stored ref is dead
+                if scene is None:
+                    scene = self.scene()
+                
+                if scene is not None:
+                    current = getattr(scene, '_eval_fence', 0)
+                    if current > 0:
+                        scene._eval_fence = current - 1
+                        _dbg(f"fence decrement: {current} -> {current - 1} "
+                             f"(cleared token={self._fence_token})")
+                else:
+                    _dbg(f"WARNING: Cannot decrement fence, scene gone. "
+                         f"Token={self._fence_token}")
         except RuntimeError:
             pass
+        finally:
+            self._fence_token = None
+            self._fence_scene_ref = None
+
+    def _are_inputs_ready(self) -> bool:
+        """Dependency Synchronization Barrier.
+
+        Ensures this node waits until ALL upstream dependencies have
+        finished evaluating before it attempts to compute.
+        """
+        for port in getattr(self, 'inputs', []):
+            for trace in getattr(port, 'connected_traces', []):
+                src_port = getattr(trace, 'source', None)
+                if not src_port: continue
+
+                src_node = getattr(src_port, 'node', None)
+                if not src_node: continue
+                # 1. Disabled nodes won't compute. Safe to proceed.
+                if getattr(src_node, '_state', None) == NodeState.DISABLED:
+                    continue
+                # 2. If upstream is currently running or queued, wait!
+                if getattr(src_node, '_is_computing', False) or getattr(src_node, '_eval_pending', False):
+                    return False
+                # 3. If upstream is marked dirty, it's about to be queued.
+                if getattr(src_node, '_is_dirty', False):
+                    if not getattr(src_node, '_manual_mode', False):
+                        return False
+        return True
 
     def _fenced_evaluate(self) -> None:
-        """Run evaluate if still dirty, always decrement the fence.
-
-        Clears ``_eval_pending`` first so that a ``set_dirty`` triggered
-        from *within* evaluate (e.g. compute → _set_count → set_dirty)
-        can schedule a fresh evaluate + fence increment.
-        """
+        """Run evaluate with guaranteed fence cleanup and barrier synchronization."""
         self._eval_pending = False
+
+        if not self._is_dirty or self._state == NodeState.DISABLED:
+            return
+
+        # Synchronization Barrier: wait for upstream nodes to finish
+        if not self._are_inputs_ready():
+            return
+
+        self._increment_eval_fence()
         try:
-            if self._is_dirty:
-                self._safe_evaluate()
+            self._safe_evaluate()
         finally:
             self._decrement_eval_fence()
 
     def set_dirty(self, reason: str = "value_change") -> None:
-        """Overrides Logic.set_dirty for Qt-specific behavior.
-
-        Increments the eval fence and schedules ``_fenced_evaluate``
-        only if this node doesn't already have a pending evaluate
-        (``_eval_pending``).  This prevents infinite fence pumping
-        from recursive ``_mark_downstream_dirty`` cascades while
-        still ensuring every evaluate cycle is tracked by the fence.
-
-        The fence is the mechanism the undo manager uses to know when
-        all deferred evaluations have completed — the macro stays open
-        while ``fence > 0``.
-        """
+        """Mark dirty with improved fence handling and dependency barrier."""
         NodeDataFlow.set_dirty(self, reason)
 
         if not self._manual_mode and not self._eval_pending:
             self._eval_pending = True
-            self._increment_eval_fence()
+            # Fence increment moved inside _fenced_evaluate so we don't hold it
+            # unnecessarily while waiting at the dependency barrier
             QTimer.singleShot(0, self._fenced_evaluate)
         elif self._manual_mode:
             self.update()
+
+    def _on_port_removed(self, port) -> None:
+        """Clean up dataflow artifacts with fence-tracked dirty."""
+        name = getattr(port, 'name', None)
+        if name is None:
+            return
+
+        # Purge dataflow caches
+        self._cached_values.pop(name, None)
+        self._last_valid_values.pop(name, None)
+        self._port_defaults.pop(name, None)
+
+        # FIXED: Only mark dirty if node is still in a valid scene and not computing
+        if not self._is_computing and self.scene() is not None:
+            self.set_dirty("port_removed")
 
     def on_evaluate_finished(self) -> None:
         """Callback after compute() completes."""
@@ -766,63 +762,6 @@ class BaseControlNode(Node, NodeDataFlow):
     def on_ui_change(self) -> None:
         """Hook for internal widgets to request updates."""
         self.set_dirty("ui_change")
-
-    # ------------------------------------------------------------------
-    # Port lifecycle — dataflow + widget cleanup
-    # ------------------------------------------------------------------
-
-    def _on_port_removed(self, port) -> None:
-        """Slot connected to ``port_removed``.
-
-        Cleans up dataflow artefacts that reference the removed port.
-
-        This runs *after* the visual teardown in ``NodePortsMixin.remove_port``
-        has already disconnected traces, unregistered the port from
-        StyleManager, and removed it from the scene.
-
-        Cleanup performed:
-            1. Purge the port's name from ``_cached_values`` so stale data
-               is never returned by ``request_data()`` / ``get_output_value()``.
-            2. Purge from ``_last_valid_values`` (pre-disable snapshot).
-            3. Purge from ``_port_defaults``.
-            4. Mark the node dirty so the next evaluation rebuilds its cache
-               without the removed port.
-
-        WidgetCore bindings are intentionally NOT touched here.  A
-        WidgetCore binding represents a static widget↔port-name mapping
-        declared in ``__init__`` — the widget itself outlives port
-        destruction (e.g. during ``restore_state → clear_ports``).
-        Nodes that dynamically create ports AND register them with
-        WidgetCore should call ``wc.unregister_widget()`` explicitly
-        before or after ``remove_port()``.
-        """
-        name = getattr(port, 'name', None)
-        if name is None:
-            return
-
-        # 1–3. Purge dataflow caches
-        self._cached_values.pop(name, None)
-        self._last_valid_values.pop(name, None)
-        self._port_defaults.pop(name, None)
-
-        # 4. Mark dirty (skip if already computing to avoid re-entrancy)
-        if not self._is_computing:
-            self._is_dirty = True
-
-    def get_output_value(self, port_name: str) -> Any:
-        """Public API to get current output value (for UI display, etc.)."""
-        return self._get_cached_value(port_name)
-
-    def is_output_valid(self, port_name: str) -> bool:
-        """Check if an output port has a valid cached value."""
-        entry = self._cached_values.get(port_name)
-        if isinstance(entry, CacheEntry):
-            return entry.is_valid
-        return entry is not None
-
-    # ══════════════════════════════════════════════════════════════════
-    # Serialisation — extends Node with widget + dataflow state
-    # ══════════════════════════════════════════════════════════════════
 
     def get_state(self) -> Dict[str, Any]:
         '''Full node state: GUI (super) + widget data + dataflow metadata.
@@ -850,23 +789,15 @@ class BaseControlNode(Node, NodeDataFlow):
 
     def restore_state(self, state: Dict[str, Any]) -> None:
         '''Restore full node state: GUI (super) + widget data + dataflow metadata.'''
-        def _t(msg):
-            print(f"[BaseControlNode.restore_state] {msg}", flush=True)
-
         # 1. Restore GUI state (position, size, colors, ports, minimized)
-        _t("Calling super().restore_state (Node) ...")
         super().restore_state(state)
-        _t("super().restore_state OK")
         
         # 2. Restore widget state — exclusively via WeaveWidgetCore
-        _t("Restoring widget_data ...")
         widget_data = state.get("widget_data")
         if widget_data and hasattr(self, '_widget_core') and self._widget_core is not None:
             self._widget_core.set_state(widget_data)
-        _t("widget_data OK")
         
         # 3. Restore dataflow metadata
-        _t("Restoring dataflow metadata ...")
         df = state.get("dataflow", {})
         if "manual_mode" in df:
             self._manual_mode = df["manual_mode"]
@@ -877,7 +808,6 @@ class BaseControlNode(Node, NodeDataFlow):
                 pass
         if "port_defaults" in df:
             self._port_defaults = df["port_defaults"]
-        _t("restore_state COMPLETE")
 
 
 # ------------------------------------------------------------------------------

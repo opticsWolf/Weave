@@ -16,6 +16,7 @@ Changelog
 - Added remove_port_by_uuid(), remove_ports() (batch), find_port_by_uuid().
 - clear_ports() now delegates to remove_ports() for consistent cleanup.
 - Added port_removed / port_added signals (declared on Node).
+- FIXED: Removed undefined _dbg reference in _detach_port
 """
 
 import uuid
@@ -203,18 +204,18 @@ class NodePortsMixin:
     # Port Removal — by UUID
     # ------------------------------------------------------------------
 
-    def remove_port_by_uuid(self, port_uuid: uuid.UUID) -> bool:
+    def remove_port_by_uuid(self, port_uuid: Union[str, uuid.UUID]) -> bool:
         """
         Remove a port identified by its UUID.
 
-        Searches both inputs and outputs for a port whose ``_port_uuid``
-        matches *port_uuid* and delegates to :meth:`remove_port`.
+        Searches both inputs and outputs for a port matching *port_uuid*
+        and delegates to :meth:`remove_port`.
 
         Returns:
             ``True`` if found and removed, ``False`` otherwise.
         """
         for port in self.inputs + self.outputs:
-            if getattr(port, '_port_uuid', None) == port_uuid:
+            if hasattr(port, 'matches_uuid') and port.matches_uuid(port_uuid):
                 return self.remove_port(port)
 
         log.warning(
@@ -363,10 +364,10 @@ class NodePortsMixin:
                 return port
         return None
 
-    def find_port_by_uuid(self, port_uuid: uuid.UUID) -> Optional[NodePort]:
+    def find_port_by_uuid(self, port_uuid: Union[str, uuid.UUID]) -> Optional[NodePort]:
         """Find a port by its UUID across both inputs and outputs."""
         for port in self.inputs + self.outputs:
-            if getattr(port, '_port_uuid', None) == port_uuid:
+            if hasattr(port, 'matches_uuid') and port.matches_uuid(port_uuid):
                 return port
         return None
 

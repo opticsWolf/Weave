@@ -2,20 +2,14 @@
 """
 Weave: A modular PySide6 framework for the visual synthesis
 and execution of high-concurrency simulation workflows.
-Copyright (c) 2026 opticsWolf
 
-SPDX-License-Identifier: Apache-2.0
-
-widgets._adapter — Strategy for reading/writing standard Qt widgets
-and auto-detecting their change signals.
-
-New widget types can be supported by updating ``_IO_REGISTRY`` and
-``_SIGNAL_MAP`` — no changes to WidgetCore required.
+WidgetAdapter: PySide6 Type Firewall.
+Ensures strict type casting before passing data to C++ Qt methods.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type, List, Callable
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -37,33 +31,30 @@ log = get_logger("WidgetAdapter")
 # I/O Registry — maps widget types to (getter_method, setter_method) names
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Each key is a tuple of types; value is (getter_attr, setter_attr).
-# Order matters — first match wins.
-_IO_REGISTRY: list[tuple[tuple[type, ...], str, str]] = [
-    ((QDoubleSpinBox,),               "value",       "setValue"),
-    ((QSpinBox, QAbstractSlider),     "value",       "setValue"),
-    ((QLineEdit, QLabel),             "text",        "setText"),
-    ((QCheckBox,),                    "isChecked",   "setChecked"),
-    ((QTextEdit, QPlainTextEdit),     "toPlainText", "setPlainText"),
+# Rule 1 & 4: Order matters — first match wins.
+# QAbstractSlider covers QSlider, QScrollBar, and QDial.
+# QAbstractSpinBox is used as a fallback, but specific types handle specialized casting.
+_IO_REGISTRY: List[Tuple[Tuple[Type[QWidget], ...], str, str]] = [
+    ((QDoubleSpinBox,), 'value', 'setValue'),
+    ((QSpinBox, QAbstractSlider, QSlider), 'value', 'setValue'),
+    ((QLineEdit, QLabel), 'text', 'setText'),
+    ((QTextEdit, QPlainTextEdit), 'toPlainText', 'setPlainText'),
+    ((QComboBox,), 'currentText', 'setCurrentText'),
+    ((QCheckBox,), 'isChecked', 'setChecked'),
+    ((QAbstractSpinBox,), 'value', 'setValue'), 
 ]
 
 
 def generic_get(widget: QWidget, default: Any = None) -> Any:
-    """Read a value from a standard Qt widget.
-
-    Resolution order:
-        1. QComboBox special handling (currentData → currentText).
-        2. ``_IO_REGISTRY`` lookup.
-        3. Duck-typed ``.value()`` fallback.
-        4. *default*.
-    """
+    """Read a value from a standard Qt widget with fallback support."""
     if isinstance(widget, QComboBox):
         data = widget.currentData()
         return data if data is not None else widget.currentText()
 
     for types, getter, _ in _IO_REGISTRY:
         if isinstance(widget, types):
-            return getattr(widget, getter)()
+            func = getattr(widget, getter, None)
+            return func() if func else default
 
     if hasattr(widget, "value") and callable(widget.value):
         return widget.value()
@@ -75,27 +66,23 @@ def generic_set(
     value: Any,
     block_signals: bool = True,
 ) -> None:
-    """Write a value to a standard Qt widget.
-
-    Parameters
-    ----------
-    widget : QWidget
-        Target widget.
-    value : Any
-        Value to write.
-    block_signals : bool
-        If True (default), the widget's own signals are blocked during
-        the write.  Pass False when the native signal must fire (e.g.
-        undo/redo restoring a value whose side-effects rebuild ports).
+    """
+    Rule 3 & 4: Type Firewall for PySide6 C++ boundary safety.
+    Explicitly casts loosely-typed values to C++ primitives to prevent crashes.
     """
     was_blocked = widget.signalsBlocked()
     if block_signals:
         widget.blockSignals(True)
+        
     try:
-        if isinstance(widget, QDoubleSpinBox):
+        # Rule 0: Zero-tolerance for uncast floats to Int-based widgets
+        if isinstance(widget, (QSpinBox, QAbstractSlider, QSlider)):
+            # Double-cast (float then int) handles string versions of floats like "1.0"
+            widget.setValue(int(float(value)) if value is not None else 0)
+            
+        elif isinstance(widget, QDoubleSpinBox):
             widget.setValue(float(value) if value is not None else 0.0)
-        elif isinstance(widget, (QSpinBox, QAbstractSlider)):
-            widget.setValue(int(value) if value is not None else 0)
+            
         elif isinstance(widget, QComboBox):
             if isinstance(value, int):
                 widget.setCurrentIndex(value)
@@ -105,14 +92,24 @@ def generic_set(
                     widget.setCurrentIndex(idx)
                 elif widget.isEditable():
                     widget.setEditText(str(value))
+                    
         elif isinstance(widget, QCheckBox):
-            widget.setChecked(bool(value))
+            if isinstance(value, str):
+                widget.setChecked(value.lower() in ('true', '1', 'yes', 'on'))
+            else:
+                widget.setChecked(bool(value))
+                
         elif isinstance(widget, (QLineEdit, QLabel)):
             widget.setText(str(value) if value is not None else "")
+            
         elif isinstance(widget, (QTextEdit, QPlainTextEdit)):
             widget.setPlainText(str(value) if value is not None else "")
+            
         elif hasattr(widget, "setValue") and callable(widget.setValue):
             widget.setValue(value)
+            
+    except Exception as e:
+        log.error(f"PySide6 Type Cast Error on {type(widget).__name__}: {e}")
     finally:
         if block_signals:
             widget.blockSignals(was_blocked)
@@ -122,12 +119,16 @@ def generic_set(
 # Signal auto-detection
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SIGNAL_MAP: Dict[type, str] = {
+# Standardized signal mappings.
+# QCheckBox uses 'toggled' to provide the boolean state directly to the callback.
+_SIGNAL_MAP: Dict[Type[QWidget], str] = {
     QDoubleSpinBox: "valueChanged",
     QSpinBox:       "valueChanged",
-    QComboBox:      "currentIndexChanged",
-    QCheckBox:      "stateChanged",
+    QAbstractSpinBox: "editingFinished", # Fallback for complex spinboxes
+    QComboBox:      "currentTextChanged",
+    QCheckBox:      "toggled",
     QSlider:        "valueChanged",
+    QAbstractSlider: "valueChanged",
     QLineEdit:      "textChanged",
     QTextEdit:      "textChanged",
     QPlainTextEdit: "textChanged",
@@ -135,16 +136,12 @@ _SIGNAL_MAP: Dict[type, str] = {
 
 
 def resolve_signal_name(widget: QWidget, explicit: Optional[str] = None) -> Optional[str]:
-    """Return the change-signal name for *widget*.
-
-    Resolution order:
-        1. *explicit* (caller override).
-        2. Built-in ``_SIGNAL_MAP``.
-        3. Custom-widget map from ``mirror_factories``.
-    """
+    """Return the change-signal name for *widget*."""
     if explicit is not None:
         return explicit
 
+    # Linear scan is safe for the small number of standard types; 
+    # MRO order is respected by checking specific types before base types.
     for cls, name in _SIGNAL_MAP.items():
         if isinstance(widget, cls):
             return name
@@ -154,13 +151,9 @@ def resolve_signal_name(widget: QWidget, explicit: Optional[str] = None) -> Opti
 
 def connect_change_signal(
     binding: WidgetBinding,
-    callback: callable,
+    callback: Callable,
 ) -> None:
-    """Auto-detect and connect the widget's change signal to *callback*.
-
-    The resolved signal name and slot reference are stored on the binding
-    for later disconnection.
-    """
+    """Rule 7: Connect and track signal for explicit lifecycle management."""
     sig_name = resolve_signal_name(binding.widget, binding.change_signal_name)
     if sig_name is None:
         return
@@ -178,7 +171,7 @@ def connect_change_signal(
 
 
 def disconnect_change_signal(binding: WidgetBinding) -> None:
-    """Disconnect the previously connected change signal."""
+    """Rule 7: Aggressively sever connection to allow GC reclamation."""
     if binding._connected_signal is None:
         return
     try:
@@ -187,6 +180,7 @@ def disconnect_change_signal(binding: WidgetBinding) -> None:
             try:
                 sig.disconnect(binding._slot_ref)
             except (RuntimeError, TypeError):
+                # Handle cases where C++ object or connection is already gone
                 pass
     except Exception as e:
         log.warning(f"Failed to disconnect signal for widget '{binding.port_name}': {e}")

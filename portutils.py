@@ -23,7 +23,7 @@ REPLACES duplicated code in:
 - nodetrace.py (DragTrace._detect_port_direction)
 """
 
-from typing import Optional, Any, Tuple, List, Set, TYPE_CHECKING
+from typing import Optional, Any, Tuple, List, Set, TYPE_CHECKING, Union
 import uuid  # Added for UUID support
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtWidgets import QGraphicsScene
@@ -47,6 +47,16 @@ HAS_NODE_PORT = True
 
 from weave.logger import get_logger
 log = get_logger("PortUtils")
+
+import os
+_DEBUG = os.environ.get("WEAVE_DEBUG", "0") == "1"
+
+def _dbg(msg: str) -> None:
+    """Module-local debug printer for connection logic."""
+    if _DEBUG:
+        print(f"[PortUtils] {msg}", flush=True)
+    log.debug(msg)
+
 
 class PortUtils:
     """
@@ -292,9 +302,9 @@ class PortUtils:
                 return True
             
             # If we have UUIDs available for both ports, use that instead of identity 
-            trace_source_uuid = getattr(trace_source, '_port_uuid', None)  
-            trace_target_uuid = getattr(trace_target, '_port_uuid', None)
-            port_b_uuid = getattr(port_b, '_port_uuid', None)
+            trace_source_uuid = PortUtils.get_port_uuid(trace_source)  
+            trace_target_uuid = PortUtils.get_port_uuid(trace_target)
+            port_b_uuid = PortUtils.get_port_uuid(port_b)
             
             if (trace_source_uuid is not None and 
                 trace_target_uuid is not None and
@@ -335,31 +345,87 @@ class PortUtils:
     # ==========================================================================
 
     @staticmethod
-    def get_port_uuid(port: 'NodePort') -> Optional[uuid.UUID]:
+    def get_port_uuid(port) -> Optional[uuid.UUID]:
         """
-        Get the UUID of a port.
+        Get the UUID of a port using unified interface.
         
         Args:
             port: The port to get UUID for
             
         Returns:
-            A uuid.UUID object or None if not available
+            uuid.UUID object or None
         """
-        return getattr(port, '_port_uuid', None)
+        if hasattr(port, 'get_uuid'):
+            return port.get_uuid()
+        # Fallback for legacy compatibility
+        return getattr(port, '_uuid', None) or getattr(port, '_port_uuid', None)
 
     @staticmethod
-    def port_matches_uuid(port: 'NodePort', target_uuid: uuid.UUID) -> bool:
+    def get_port_uuid_string(port) -> Optional[str]:
+        """Get port UUID as string."""
+        if hasattr(port, 'get_uuid_string'):
+            return port.get_uuid_string()
+        # Fallback
+        uuid_obj = PortUtils.get_port_uuid(port)
+        return str(uuid_obj) if uuid_obj else None
+
+    @staticmethod
+    def get_node_uuid(node) -> Optional[uuid.UUID]:
+        """Get node UUID using unified interface."""
+        if hasattr(node, 'get_uuid'):
+            return node.get_uuid()
+        # Fallbacks
+        uid = getattr(node, 'unique_id', None)
+        if uid:
+            try:
+                return uuid.UUID(str(uid))
+            except ValueError:
+                pass
+        return getattr(node, '_uuid', None)
+
+    @staticmethod
+    def get_node_uuid_string(node) -> Optional[str]:
+        """Get node UUID as string."""
+        if hasattr(node, 'get_uuid_string'):
+            return node.get_uuid_string()
+        return getattr(node, 'unique_id', None)
+
+    @staticmethod
+    def port_matches_uuid(port, target_uuid: Union[str, uuid.UUID]) -> bool:
         """
         Check if a port matches the given UUID.
-        
-        Args:
-            port: The port to check
-            target_uuid: The UUID to match against
-            
-        Returns:
-            True if the port's UUID matches, False otherwise
         """
-        return getattr(port, '_port_uuid', None) == target_uuid
+        if hasattr(port, 'matches_uuid'):
+            return port.matches_uuid(target_uuid)
+        
+        # Manual fallback
+        port_uuid = PortUtils.get_port_uuid(port)
+        if port_uuid is None:
+            return False
+        
+        if isinstance(target_uuid, uuid.UUID):
+            return port_uuid == target_uuid
+        try:
+            return port_uuid == uuid.UUID(str(target_uuid))
+        except ValueError:
+            return False
+
+    @staticmethod
+    def node_matches_uuid(node, target_uuid: Union[str, uuid.UUID]) -> bool:
+        """Check if a node matches the given UUID."""
+        if hasattr(node, 'matches_uuid'):
+            return node.matches_uuid(target_uuid)
+        
+        node_uuid = PortUtils.get_node_uuid(node)
+        if node_uuid is None:
+            return False
+        
+        if isinstance(target_uuid, uuid.UUID):
+            return node_uuid == target_uuid
+        try:
+            return node_uuid == uuid.UUID(str(target_uuid))
+        except ValueError:
+            return False
 
 
 class PortFinder:

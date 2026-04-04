@@ -211,6 +211,8 @@ class ProxyMixin:
 
         elif event.type() == QEvent.Type.KeyPress:
             from PySide6.QtGui import QKeyEvent
+            from PySide6.QtWidgets import QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox
+
             ke: QKeyEvent = event  # type: ignore[assignment]
             mod = ke.modifiers()
             ctrl = bool(mod & Qt.KeyboardModifier.ControlModifier)
@@ -218,6 +220,12 @@ class ProxyMixin:
             alt = bool(mod & Qt.KeyboardModifier.AltModifier)
 
             if ctrl and not alt and ke.key() == Qt.Key.Key_Z:
+                # Do not hijack Ctrl+Z if the user is typing in a text field —
+                # let the native Qt widget handle its own local undo/redo (§4).
+                if (getattr(obj, 'hasFocus', lambda: False)()
+                        and isinstance(obj, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox))):
+                    return False
+
                 proxy = self._find_proxy()
                 if proxy is not None:
                     scene = proxy.scene()

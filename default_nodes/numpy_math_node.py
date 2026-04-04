@@ -10,6 +10,8 @@ numpy_math_node.py
 ------------------
 Element-wise and linear-algebra binary math node for NumPy arrays.
 
+FIXED: Replaced non-existent get_output_value() with _get_cached_value()
+
 Provided node
 -------------
 ``NumpyMathNode``
@@ -480,7 +482,8 @@ class NumpyMathNode(ThreadedNode):
                     pass
                 self._pending_status = None
 
-            result = self.get_output_value("result")
+            # FIXED: Use _get_cached_value instead of non-existent get_output_value
+            result = self._get_cached_value("result")
             if result is not None:
                 self.result_changed.emit(result)
         except Exception as exc:

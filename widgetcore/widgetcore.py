@@ -1,23 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Weave: A modular PySide6 framework for the visual synthesis
-and execution of high-concurrency simulation workflows.
-Copyright (c) 2026 opticsWolf
-
-SPDX-License-Identifier: Apache-2.0
-
-widgets._core — WidgetCore, the central widget container for node bodies.
-=====================================================================
-
-This is the lean orchestrator that composes:
-- ``ProxyMixin``  — QGraphicsProxyWidget interaction and focus fixes.
-- ``ThemeMixin``  — Palette/style synchronisation with StyleManager.
-- ``_adapter``    — Generic widget I/O and signal wiring (strategy).
-
-See the package docstring (``widgets/__init__.py``) for architecture
-and public API overview.
+WidgetCore: Central UI state manager for Weave nodes.
+Strictly adheres to PySide6 safety protocols and deterministic undo/redo state.
 """
-
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -42,25 +27,22 @@ if TYPE_CHECKING:
 
 log = get_logger("WidgetCore")
 
+__all__ = ["WidgetCore"]
 
-__all__ = [
-    "WidgetCore",
-    ]
 
 class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
-    """Central widget container placed inside a node's body.
-
-    Every BaseControlNode must create and embed a WidgetCore.
-    It is the sole owner of widget state serialisation — there is no
-    fallback to ``get_widget_state`` / ``set_widget_state``.
+    """
+    Central widget container placed inside a node's body.
+    Mandates UUID-based serialization and PySide6 type safety.
 
     Signals
     -------
     value_changed(str)
         Emitted when a registered widget's value changes (user edits).
         The argument is the *port_name* that changed.
-    port_value_written(str)
-        Emitted on every programmatic write via ``set_port_value``.
+    port_value_written(str, object)
+        Emitted on every programmatic write via ``set_port_value`` or 
+        ``apply_port_value``.  The second argument is the new value.
     port_enabled_changed(str, bool)
         Emitted when a widget is enabled/disabled (auto-disable on
         connect/disconnect).
@@ -81,14 +63,12 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         state on the canvas.
     """
 
-    value_changed = Signal(str)
-    port_value_written = Signal(str)
+    value_changed = Signal(str)            # Emitted on user interaction
+    port_value_written = Signal(str, object) # Emitted on programmatic write (Rule 4)
     port_enabled_changed = Signal(str, bool)
     widget_registered = Signal(str)
     widget_unregistered = Signal(str)
     widget_visibility_changed = Signal(str, bool)
-
-    # ── Construction ─────────────────────────────────────────────────────
 
     def __init__(
         self,
@@ -134,11 +114,10 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
             self._apply_full_proxy_theme()
             self._layout_notify_enabled = True
 
-    # ── Signal suppression context manager ───────────────────────────────
-
     @contextmanager
     def suppress_signals(self):
-        """Context manager to suppress ``value_changed`` emissions.
+        """
+        Context manager to suppress ``value_changed`` emissions.
 
         Usage::
 
@@ -153,7 +132,7 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
             self._suppress_depth -= 1
 
     # ══════════════════════════════════════════════════════════════════════
-    # Widget Registration
+    # Widget Registration & Lifecycle
     # ══════════════════════════════════════════════════════════════════════
 
     def register_widget(
@@ -300,7 +279,7 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         return defs
 
     # ══════════════════════════════════════════════════════════════════════
-    # Value Read / Write
+    # Value Access (Rule 3 & 4)
     # ══════════════════════════════════════════════════════════════════════
 
     def get_port_value(self, port_name: str) -> Any:
@@ -326,77 +305,85 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
             log.warning(f"Failed to get value for port '{port_name}': {e}")
             return binding.default
 
-    def get_all_values(self) -> Dict[str, Any]:
-        """Read all registered widget values at once."""
-        return {name: self.get_port_value(name) for name in self._bindings}
+    def apply_port_value(self, port_name: str, value: Any) -> bool:
+        """
+        Rule 4: Apply a value directly to a widget, blocking native signals.
+        
+        Used by UndoManager and Deserializer to set states without triggering
+        a cascade of value_changed events and redundant graph evaluations.
 
-    def set_port_value(self, port_name: str, value: Any) -> None:
-        """Push a value *into* the widget (signals blocked).
+        Parameters
+        ----------
+        port_name : str
+            The name of the port whose associated widget will be updated.
+        value : Any
+            The new value to set on the widget.
 
-        After the write, the proxy is asked to repaint so the change
-        is visible immediately.
+        Returns
+        -------
+        bool
+            True if successfully applied, False otherwise.
         """
         binding = self._bindings.get(port_name)
-        if binding is None:
-            return
-
+        if not binding: 
+            log.debug(f"apply_port_value: '{port_name}' not bound -- skipped")
+            return False
+            
+        # Store previous value for logging purposes only
+        previous_value = None
         try:
-            self._suppress_depth += 1
-            if binding.setter is not None:
-                binding.setter(value)
+            if binding.getter is not None:
+                previous_value = binding.getter()
             else:
-                generic_set(binding.widget, value)
-        except (RuntimeError, AttributeError) as e:
-            log.warning(f"Failed to set value for port '{port_name}': {e}")
-        finally:
-            self._suppress_depth -= 1
-
-        proxy = self._find_proxy()
-        if proxy is not None:
-            proxy.update()
-
-        self.port_value_written.emit(port_name)
-
-    def apply_port_value(self, port_name: str, value: Any) -> None:
-        """Set a widget value, allowing the widget's native signal to fire.
-
-        Unlike ``set_port_value`` (which blocks the widget's own signals),
-        this lets the native signal propagate so node-internal handlers
-        execute their side-effects.  WidgetCore's ``value_changed`` is
-        still suppressed (preventing re-recording by the undo manager).
-
-        ``port_value_written`` is emitted after the write so that dock
-        panels update their mirrors to reflect the new value.
-
-        Use from undo/redo command paths.
-        """
-        binding = self._bindings.get(port_name)
-        if binding is None:
-            log.debug(f"apply_port_value: '{port_name}' not bound — skipped")
-            return
+                previous_value = generic_get(binding.widget, binding.default)
+        except Exception:
+            pass
 
         log.debug(f"apply_port_value: '{port_name}' = {value!r} "
                   f"(suppress_depth will be {self._suppress_depth + 1})")
+        
+        # Rule 4: Block ALL signals during the write to prevent race conditions.
+        # The widget's native valueChanged signal must not fire during undo/redo
+        # because it could create spurious undo commands.
+        was_blocked = binding.widget.signalsBlocked()
         try:
             self._suppress_depth += 1
+            binding.widget.blockSignals(True)  # BLOCK native widget signals
             if binding.setter is not None:
                 binding.setter(value)
             else:
-                generic_set(binding.widget, value, block_signals=False)
+                generic_set(binding.widget, value, block_signals=True)
         except (RuntimeError, AttributeError) as e:
             log.warning(f"Failed to apply value for port '{port_name}': {e}")
+            return False
         finally:
+            binding.widget.blockSignals(was_blocked)  # Restore signal state
             self._suppress_depth -= 1
 
         proxy = self._find_proxy()
         if proxy is not None:
             proxy.update()
 
-        # Notify panels so mirror widgets update.  value_changed is
-        # suppressed (correctly — the undo manager must not re-record),
-        # but port_value_written is the channel panels listen to for
-        # programmatic writes.
-        self.port_value_written.emit(port_name)
+        # Rule 4: Defer port_value_written emission to ensure any pending
+        # signals from other sources are processed first. This prevents
+        # race conditions where a queued signal fires after we think
+        # the restore is complete.
+        def _emit_port_value_written():
+            self.port_value_written.emit(port_name, value)
+            # Log change detection after deferred emission
+            try:
+                current_value = self.get_port_value(port_name)
+                if current_value != previous_value:
+                    log.debug(f"apply_port_value: value changed {previous_value!r} -> {current_value!r}")
+            except Exception:
+                pass
+        
+        QTimer.singleShot(0, _emit_port_value_written)
+        return True
+
+    def set_port_value(self, port_name: str, value: Any) -> None:
+        """Legacy wrapper; redirects to apply_port_value for safety."""
+        self.apply_port_value(port_name, value)
 
     # ══════════════════════════════════════════════════════════════════════
     # Auto-disable (when an input port gets connected)
@@ -561,13 +548,15 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         return self._proxy_event_filter(obj, event)
 
     # ══════════════════════════════════════════════════════════════════════
-    # Cleanup
+    # Cleanup (Rule 7)
     # ══════════════════════════════════════════════════════════════════════
 
     def cleanup(self) -> None:
-        """Disconnect all signals, remove event filters, null references.
-
-        Call from the node's ``cleanup()`` method.
+        """
+        Rule 7: Aggressive Cleanup to prevent memory leaks and phantom evals.
+        
+        Disconnect all signals, remove event filters, null references,
+        and purge internal caches.
         """
         self._layout_notify_enabled = False
         self._content_change_pending = False
@@ -587,3 +576,4 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         self._bindings.clear()
         self._widget_to_port.clear()
         self._node_ref = None
+        log.debug("WidgetCore cleanup: Purged all bindings.")

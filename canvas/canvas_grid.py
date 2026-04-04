@@ -227,8 +227,14 @@ class GridRenderer:
         x_coords = np.arange(f_left, right  + spacing, spacing)
         y_coords = np.arange(f_top,  bottom + spacing, spacing)
 
-        x_major = (x_coords // spacing) % _ACCENT_INTERVAL == 0  # (Nx,)
-        y_major = (y_coords // spacing) % _ACCENT_INTERVAL == 0  # (Ny,)
+        # GAP FIX: Cast coordinates to integer indices safely using np.round() 
+        # to prevent IEEE 754 floating-point precision errors from randomly 
+        # dropping major grid accents as the user pans the camera!
+        x_indices = np.round(x_coords / spacing).astype(np.int64)
+        y_indices = np.round(y_coords / spacing).astype(np.int64)
+
+        x_major = (x_indices % _ACCENT_INTERVAL) == 0  # (Nx,)
+        y_major = (y_indices % _ACCENT_INTERVAL) == 0  # (Ny,)
 
         xx, yy = np.meshgrid(x_coords, y_coords)          # (Ny, Nx)
         # A dot is major only when BOTH its column and row are accent lines.

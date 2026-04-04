@@ -95,9 +95,24 @@ def disconnect_selected_nodes(canvas, undo_manager=None) -> int:
     if not traces_to_remove:
         return 0
 
+    # Capture name-based trace tuples BEFORE removing them — once the
+    # trace is deleted its port/node references become invalid.
+    from weave.canvas.undo_commands import RemoveConnectionsCommand, get_node_uid
+    trace_tuples = []
+    for t in traces_to_remove:
+        src, dst = getattr(t, 'source', None), getattr(t, 'target', None)
+        if src and dst and getattr(src, 'node', None) and getattr(dst, 'node', None):
+            trace_tuples.append((
+                get_node_uid(src.node), getattr(src, 'name', ''),
+                get_node_uid(dst.node), getattr(dst, 'name', '')
+            ))
+
     if undo_manager:
         undo_manager.begin_macro(
             f"Disconnect {len(traces_to_remove)} traces")
+        # Push the command so the macro actually records the operation
+        if trace_tuples:
+            undo_manager.push(RemoveConnectionsCommand(trace_tuples))
 
     removed = 0
     for trace in traces_to_remove:

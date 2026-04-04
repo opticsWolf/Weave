@@ -20,16 +20,19 @@ from PySide6.QtGui import QPainter, QColor, QPainterPath, QFont, QBrush, QFontMe
 from weave.portregistry import PortRegistry
 from weave.stylemanager import StyleManager, StyleCategory
 from weave.node.node_enums import highlight_colors
+from weave.node.uuid_mixin import UUIDMixin  # <-- NEW IMPORT
 
-class NodePort(QGraphicsItem):
+
+class NodePort(UUIDMixin, QGraphicsItem):
     """
-    Simplified node port with complete state overlay functionality.
+    Simplified node port with unified UUID support.
     
     This version properly propagates state overlays to connected traces and 
     renders them visually.
     """
 
     __slots__ = (
+        '_uuid',                 # Memory slot for UUIDMixin
         'node', 
         'name', 
         'is_output', 
@@ -56,13 +59,15 @@ class NodePort(QGraphicsItem):
         '_style_manager',
         '_state_overlay_color',  # New attribute for state overlay color
         'is_summary_port',       # True for dummy ports on minimized nodes
-        '_port_uuid',            # Added for unique port identification
         '_auto_disable'          # When True, disables matching widget on connection
     )
 
     def __init__(self, parent: 'Node', name: str, datatype: str, is_output: bool, 
-                 port_description: str = ""):
+                 port_description: str = "", existing_uuid: Optional[str] = None):
+        # Must call super().__init__ before any Python attribute assignments
+        # to ensure the PySide6 C++ wrapper is fully instantiated first.
         super().__init__(parent)
+        self._init_uuid(existing_uuid)
         
         self.node = parent
         self.name = name
@@ -92,9 +97,6 @@ class NodePort(QGraphicsItem):
         # State overlay: a fully transparent QColor means "no overlay".
         # Always stored as QColor for reliable alpha() checks.
         self._state_overlay_color = QColor(0, 0, 0, 0)
-        
-        # ADD UUID GENERATION FOR PORT IDENTIFICATION
-        self._port_uuid = uuid.uuid4()
         
         # 2. Geometry Config - Get from StyleManager instead of node config
         self.cfg = self._get_port_config()
@@ -134,30 +136,6 @@ class NodePort(QGraphicsItem):
         self._style_manager.register(self, StyleCategory.TRACE)
 
 
-    def get_uuid(self) -> uuid.UUID:
-        """
-        Get the unique identifier for this port.
-        
-        This UUID provides a persistent way to identify ports across their lifetime,
-        even if other attributes like name or datatype change.
-        
-        Returns:
-            A uuid.UUID object that uniquely identifies this port instance.
-        """
-        return self._port_uuid
-    
-    def get_uuid_string(self) -> str:
-        """
-        Get the unique identifier for this port as a string representation.
-        
-        This is useful for serialization, logging, and other string-based operations
-        where working with UUID objects directly might be cumbersome.
-        
-        Returns:
-            A string representation of the port's UUID.
-        """
-        return str(self._port_uuid)
-    
     def _get_port_config(self) -> dict:
         """
         Get the current port configuration from StyleManager.
@@ -241,7 +219,6 @@ class NodePort(QGraphicsItem):
         self.update()
 
     def _highlight_colors(self, color: QColor, b_offset: int, s_offset: int = 0) -> QColor:
-        #print ('Node Port _highlight_colors', color, b_offset, s_offset)
         return highlight_colors(color, b_offset, s_offset)
 
     # ==========================================================================

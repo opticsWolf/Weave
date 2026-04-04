@@ -75,6 +75,8 @@ class NodeStyleSchema:
     header_slider_minimize_spacing: int = 10
     header_h_padding: int = 15
     header_item_spacing: int = 10
+    header_icon: bool = True
+    header_icon_default_width: int = 1.5
     
     # Minimize Button
     minimize_btn_size: int = 12
@@ -175,7 +177,7 @@ class NodeStyleSchema:
     # Font
     font_family: str = "Segoe UI"
     font_size: int = 10
-    font_weight: Union[str, int, QFont.Weight] = "bold"
+    font_weight: Union[str, int, QFont.Weight] = "normal"
     font_italic: bool = False
     sel_font_weight: Union[str, int, QFont.Weight] = "bold"
     sel_font_italic: bool = False

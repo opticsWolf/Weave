@@ -112,5 +112,5 @@ if __name__ == "__main__":
     from weave.dockadapter import NodeDockAdapter, DockMode
     from weave.logpane import LogPane
 
-    from weave.default_nodes import *          # register nodes
+    from weave.default_nodes import *  # register nodes
     main()
