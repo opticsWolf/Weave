@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 """
+Weave: A modular PySide6 framework for the visual synthesis 
+and execution of high-concurrency simulation workflows.
+Copyright (c) 2026 opticsWolf
+
+SPDX-License-Identifier: Apache-2.0
+
 Weave: Threaded Node Base Classes — FIXED VERSION
 Proper async fence management for undo stability and synchronized multi-input evaluation.
 """
@@ -95,6 +101,7 @@ class ThreadedNode(BaseControlNode):
     - Checks canvas._restoring to prevent callbacks during undo/redo
     - Ensures fence decrement even if node is removed from scene
     - Implements Dependency Synchronization (Barrier) for multi-input nodes
+    - Uses get_state() instead of get_all_values() for WidgetCore snapshots
     """
 
     compute_started   = Signal()
@@ -169,7 +176,8 @@ class ThreadedNode(BaseControlNode):
         wc = getattr(self, '_widget_core', None)
         if wc is not None:
             try:
-                return wc.get_all_values()
+                # FIXED: Mapped to get_state() per widgetcore.py
+                return wc.get_state()
             except Exception:
                 pass
         return {}
@@ -196,18 +204,39 @@ class ThreadedNode(BaseControlNode):
             QTimer.singleShot(0, self._start_worker_evaluation)
 
     def _start_worker_evaluation(self) -> None:
-        """Start worker with proper fence acquisition and dependency synchronization."""
+        """Start worker with proper fence acquisition and dependency synchronization.
+
+        FIXED:
+        - PASSTHROUGH mode now evaluates synchronously via the base class
+          instead of spawning a worker that calls ``compute()``.
+        - Barrier failure reschedules instead of silently dropping.
+        """
         self._eval_pending = False
         
         if not self._is_dirty or self._state == NodeState.DISABLED:
             return
 
         # CRITICAL: Do not compute if upstream nodes are still crunching numbers.
-        # When the last upstream node finishes, it will trigger set_dirty() on this
-        # node again, which will pass this check and finally start the worker.
+        # Reschedule so we try again on the next event-loop tick instead of
+        # relying solely on upstream _mark_downstream_dirty to wake us.
         if not self._are_inputs_ready():
+            if not self._eval_pending:
+                self._eval_pending = True
+                QTimer.singleShot(0, self._start_worker_evaluation)
             return
 
+        # ── PASSTHROUGH: synchronous, no worker needed ──
+        if self._state == NodeState.PASSTHROUGH:
+            self._increment_eval_fence()
+            try:
+                # Delegate to BaseControlNode.evaluate which calls
+                # _apply_passthrough → caches → _mark_downstream_dirty
+                super().evaluate(None)
+            finally:
+                self._decrement_eval_fence()
+            return
+
+        # ── NORMAL: threaded worker path ──
         # CRITICAL: Increment fence HERE, right before starting worker
         # This fence will be decremented only when worker truly finishes
         self._increment_eval_fence()
@@ -216,14 +245,23 @@ class ThreadedNode(BaseControlNode):
         self._is_computing = True
         
         try:
+            # 1. Gathers upstream data + local BIDIRECTIONAL fallbacks
             input_params = self._gather_inputs(None)
+            
+            # 2. Gathers the entire internal UI state (including INTERNAL combos)
             widget_snapshot = self.snapshot_widget_inputs()
+            
+            # 3. The Elegant Merge: Only inject UI state if the key isn't already 
+            # satisfied by a connected port or a bidirectional fallback.
             if widget_snapshot:
-                input_params.update(widget_snapshot)
+                for key, val in widget_snapshot.items():
+                    if key not in input_params or input_params[key] is None:
+                        input_params[key] = val
+                        
         except Exception as e:
             log.error(f"Input gathering failed: {e}")
             self._is_computing = False
-            self._release_worker_fence()  # Release fence on early exit
+            self._release_worker_fence()
             return
 
         self._pre_compute_state = self._state
@@ -268,11 +306,55 @@ class ThreadedNode(BaseControlNode):
             pass
         return False
 
+    # ── State transition routing ──────────────────────────────────
+
+    def _handle_state_transition(self, old_state: NodeState, new_state: NodeState) -> None:
+        """Route state transitions through the correct evaluation path.
+
+        The base class schedules ``_fenced_evaluate`` for transitions that
+        require re-evaluation.  That works for synchronous nodes, but
+        ``ThreadedNode.evaluate()`` is intentionally a no-op for NORMAL
+        mode (threaded compute goes through ``_start_worker_evaluation``).
+
+        Routing rules:
+        - Target is PASSTHROUGH → synchronous, base class ``_fenced_evaluate`` ✓
+        - Target is NORMAL (from DISABLED or PASSTHROUGH) → threaded worker
+        - Target is DISABLED → no evaluation, just notify downstream
+        """
+        # anything -> DISABLED: preserve + notify (no evaluation needed)
+        if new_state == NodeState.DISABLED:
+            self._mark_downstream_dirty("upstream_disabled")
+            return
+
+        # anything -> PASSTHROUGH: synchronous path via base class
+        if new_state == NodeState.PASSTHROUGH:
+            if old_state != NodeState.DISABLED:
+                self._cached_values.clear()
+            self._is_dirty = True
+            if not self._manual_mode:
+                self._eval_pending = True
+                QTimer.singleShot(0, self._fenced_evaluate)
+            return
+
+        # DISABLED -> NORMAL  or  PASSTHROUGH -> NORMAL: threaded worker path
+        if old_state == NodeState.DISABLED or old_state == NodeState.PASSTHROUGH:
+            if old_state == NodeState.PASSTHROUGH:
+                self._cached_values.clear()
+            self._is_dirty = True
+            if not self._manual_mode:
+                self._eval_pending = True
+                QTimer.singleShot(0, self._start_worker_evaluation)
+
     # ── Worker Callbacks (Main Thread) ────────────────────────────
 
     @Slot(object)
     def _on_worker_finished(self, results) -> None:
-        """Apply results - fence is still held until we release it."""
+        """Apply results - fence is still held until we release it.
+
+        FIXED: ``_mark_downstream_dirty`` moved to ``finally`` so
+        downstream nodes are always woken up, even if result
+        normalisation or cache building throws.
+        """
         # Always release fence first to prevent deadlock on error
         self._release_worker_fence()
         
@@ -284,6 +366,7 @@ class ThreadedNode(BaseControlNode):
             self._cleanup_after_worker(skip_results=True)
             return
 
+        _apply_succeeded = False
         try:
             results = self._normalize_results(results)
             timestamp = time.time()
@@ -299,11 +382,11 @@ class ThreadedNode(BaseControlNode):
 
             self._cached_values = new_cache
             self._is_dirty = False
+            _apply_succeeded = True
 
             for port_name, entry in new_cache.items():
                 self._last_valid_values[port_name] = entry.value
 
-            self._mark_downstream_dirty("upstream_threaded_result")
             self._restore_pre_compute_state()
             
             if hasattr(self, "on_evaluate_finished"):
@@ -314,6 +397,8 @@ class ThreadedNode(BaseControlNode):
             self._restore_pre_compute_state()
 
         finally:
+            if _apply_succeeded:
+                self._mark_downstream_dirty("upstream_threaded_result")
             self._cleanup_after_worker()
 
     @Slot(str)
@@ -404,3 +489,4 @@ class ThreadedManualNode(ThreadedNode):
         else:
             self._pending_dirty = True
             self.cancel_compute()
+

@@ -16,7 +16,7 @@ and proper cancellation mechanisms for long-running computations.
 
 from typing import Optional, Set, Any, Dict
 
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, Slot, QTimer
 
 from weave.threadednodes import ThreadedNode, ThreadedManualNode, _HAS_COMPUTING_STATE
 from weave.node.node_enums import NodeState
@@ -106,19 +106,15 @@ class _MultiprocessingMixin:
     def _prepare_inputs(self, visited: Optional[Set[int]]) -> Dict[str, Any]:
         """Gather upstream + widget snapshot (runs on main thread).
         
-        This method collects all input parameters from connected nodes and 
-        captures the current state of any widgets that are part of this node.
-        It ensures that all required data is available to the subprocess worker
-        when executing computations.
+        FIXED: Uses merge-only-if-missing instead of ``dict.update()``
+        to match ThreadedNode's behavior.  Connected port values must
+        take priority over widget snapshot values.
         
         Args:
             visited: Set of already-visited node IDs to prevent cycles
             
         Returns:
             Dict[str, Any]: Dictionary containing all input parameters for compute function
-            
-        Raises:
-            Exception: If gathering inputs fails, re-raises caught exception with logging
         """
         try:
             input_params = self._gather_inputs(visited)
@@ -128,28 +124,20 @@ class _MultiprocessingMixin:
         
         widget_snapshot = self.snapshot_widget_inputs()
         if widget_snapshot:
-            input_params.update(widget_snapshot)
+            for key, val in widget_snapshot.items():
+                if key not in input_params or input_params[key] is None:
+                    input_params[key] = val
         return input_params
     
     def _dispatch_worker(self, inputs: Dict[str, Any]) -> None:
         """Create and start the multiprocessing worker.
         
-        Initializes a new MultiprocessingWorker with the compute function,
-        input parameters, and cancellation token. Connects all necessary signals
-        for handling completion, errors, progress updates, and intermediate results.
-        
-        This method also sets up proper fence management by marking that the 
-        worker owns its own fence token (inherited from ThreadedNode).
+        FIXED: Properly acquires eval fence via ``_increment_eval_fence``
+        and tracks it with ``_worker_fence_token`` so the inherited
+        ``_release_worker_fence`` can release it when the worker finishes.
         
         Args:
             inputs: Dictionary of input parameters to pass to compute function
-            
-        Note:
-            The _worker_has_fence flag is set to True after starting the worker
-            ensuring proper synchronization with thread-based nodes.
-            
-        Raises:
-            Exception: If worker creation or signal connection fails
         """
         self._cancel_token = MultiprocessingCancellationToken()
         
@@ -164,7 +152,7 @@ class _MultiprocessingMixin:
             cancel_token=self._cancel_token,
         )
         
-        # Wire standard signals
+        # Wire standard signals (inherited from ThreadedNode)
         worker.signals.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         worker.signals.error.connect(self._on_worker_error, Qt.ConnectionType.QueuedConnection)
         worker.signals.cancelled.connect(self._on_worker_cancelled, Qt.ConnectionType.QueuedConnection)
@@ -174,11 +162,75 @@ class _MultiprocessingMixin:
         worker.signals.intermediate.connect(self._handle_intermediate_result, Qt.ConnectionType.QueuedConnection)
         
         self._current_worker = worker
-        
-        # FIXED: Mark that worker owns the fence (inherited from ThreadedNode)
-        self._worker_has_fence = True
-        
         self._thread_pool.start(worker)
+
+    def _start_worker_evaluation(self) -> None:
+        """Override ThreadedNode to dispatch via MultiprocessingWorker.
+
+        ThreadedNode.set_dirty schedules ``_start_worker_evaluation``
+        which creates a ``ComputeWorker`` (in-process threading).
+        Multiprocessing nodes need a ``MultiprocessingWorker`` instead,
+        so we override the dispatch here while reusing the same
+        barrier, PASSTHROUGH, and fence logic.
+        """
+        from weave.basenode import BaseControlNode
+
+        self._eval_pending = False
+
+        if not self._is_dirty or self._state == NodeState.DISABLED:
+            return
+
+        # Barrier: reschedule if upstream is still busy
+        if not self._are_inputs_ready():
+            if not self._eval_pending:
+                self._eval_pending = True
+                QTimer.singleShot(0, self._start_worker_evaluation)
+            return
+
+        # PASSTHROUGH → synchronous (no subprocess needed)
+        if self._state == NodeState.PASSTHROUGH:
+            self._increment_eval_fence()
+            try:
+                BaseControlNode.evaluate(self, None)
+            finally:
+                self._decrement_eval_fence()
+            return
+
+        # NORMAL → multiprocessing path
+        if self._is_computing:
+            self._pending_dirty = True
+            self.cancel_compute()
+            return
+
+        if not self._is_compute_picklable():
+            log.error(f"{self}: compute() must be a @staticmethod for multiprocessing")
+            return
+
+        self._is_computing = True
+
+        # Acquire fence — released by inherited _release_worker_fence
+        self._increment_eval_fence()
+        self._worker_fence_token = self._fence_token
+
+        try:
+            inputs = self._prepare_inputs(None)
+        except Exception:
+            self._is_computing = False
+            self._release_worker_fence()
+            return
+
+        self._pre_compute_state = self._state
+        if _HAS_COMPUTING_STATE:
+            try:
+                from weave.threadednodes import ThreadedNode as _TN
+                super(_TN, self).set_state(NodeState.COMPUTING)
+                if hasattr(self, '_start_computing_pulse'):
+                    self._start_computing_pulse()
+            except Exception:
+                pass
+
+        self.compute_started.emit()
+        self._dispatch_worker(inputs)
     
     @Slot(object)
     def _handle_intermediate_result(self, results: object) -> None:
@@ -338,68 +390,24 @@ class MultiprocessingNode(_MultiprocessingMixin, ThreadedNode):
         self._cancel_token: Optional[MultiprocessingCancellationToken] = None
     
     def evaluate(self, visited: Optional[Set[int]] = None) -> None:
-        """Override to use MultiprocessingWorker with proper fencing.
-        
-        This method handles the evaluation lifecycle for auto-evaluating nodes,
-        including checking cancellation status, preparing inputs, setting up 
-        state tracking, and launching the subprocess worker.
-        
-        The implementation ensures proper fence management by:
-            - Setting _worker_has_fence flag in _dispatch_worker
-            - Using inherited ThreadedNode.evaluate() path when passthrough
-            
-        Args:
-            visited: Set of already-visited node IDs to prevent cycles (optional)
-            
-        Note:
-            If compute function is not picklable, logs error and exits early.
-            Handles state transitions through COMPUTING if _HAS_COMPUTING_STATE enabled.
-            
-        Raises:
-            Exception: If input preparation fails during computation
+        """Evaluation entry point for pull model (request_data) and direct calls.
+
+        PASSTHROUGH is handled synchronously via the base class.
+        NORMAL mode delegates to ``_start_worker_evaluation`` which
+        manages barrier, fence, and multiprocessing dispatch.
         """
         if self._state == NodeState.DISABLED:
             return
-        
-        if _HAS_COMPUTING_STATE and self._state == NodeState.COMPUTING:
-            self._pending_dirty = True
-            return
-        
-        if self._is_computing:
-            self._pending_dirty = True
-            self.cancel_compute()
-            return
-        
+
         if self._state == NodeState.PASSTHROUGH:
-            # Use ThreadedNode's parent (BaseControlNode) for sync path
+            # Synchronous passthrough via BaseControlNode
             ThreadedNode.evaluate(self, visited)
             return
-        
-        self._is_computing = True
-        
-        if not self._is_compute_picklable():
-            log.error(f"{self}: compute() must be a @staticmethod for multiprocessing")
-            self._is_computing = False
-            return
-        
-        try:
-            inputs = self._prepare_inputs(visited)
-        except Exception:
-            self._is_computing = False
-            return
-        
-        self._pre_compute_state = self._state
-        if _HAS_COMPUTING_STATE:
-            try:
-                super(ThreadedNode, self).set_state(NodeState.COMPUTING)
-                if hasattr(self, '_start_computing_pulse'):
-                    self._start_computing_pulse()
-            except Exception:
-                pass
-        
-        self.compute_started.emit()
-        self._dispatch_worker(inputs)
-        # _worker_has_fence set in _dispatch_worker
+
+        # For NORMAL mode, trigger the async multiprocessing path.
+        # This is a no-op if already computing or pending.
+        if not self._is_computing and self._is_dirty:
+            self._start_worker_evaluation()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -462,71 +470,38 @@ class MultiprocessingManualNode(_MultiprocessingMixin, ThreadedManualNode):
     def execute(self) -> None:
         """Toggle between start and cancel.
         
-        This method handles the UI interaction for manual nodes. When called,
-        if currently computing it cancels execution; otherwise it sets dirty
-        flag and calls evaluate() to begin computation.
-        
-        Note:
-            Uses self._is_computing to determine whether to cancel or start.
+        Aligns with ThreadedManualNode.execute() — checks restoring
+        state and routes through ``_start_worker_evaluation`` which
+        handles multiprocessing dispatch via the mixin override.
         """
+        if self._is_restoring():
+            log.debug("execute: skipped, canvas is restoring")
+            return
+
         if self._is_computing:
             self.cancel_compute()
             return
+
         self._is_dirty = True
-        self.evaluate()
+        self._start_worker_evaluation()
     
     def evaluate(self, visited: Optional[Set[int]] = None) -> None:
-        """Override to use MultiprocessingWorker with proper fencing.
-        
-        This method handles the evaluation lifecycle for manual nodes,
-        including checking if already computing, preparing inputs, and 
-        launching the subprocess worker.
-        
-        The implementation ensures proper fence management by:
-            - Setting _worker_has_fence flag in _dispatch_worker
-            - Using inherited ThreadedManualNode.evaluate() path when passthrough
-            
-        Args:
-            visited: Set of already-visited node IDs to prevent cycles (optional)
-            
-        Note:
-            If compute function is not picklable, logs error and exits early.
-            Handles state transitions through COMPUTING if _HAS_COMPUTING_STATE enabled.
-            
-        Raises:
-            Exception: If input preparation fails during computation
+        """Evaluation entry point for manual multiprocessing nodes.
+
+        PASSTHROUGH is handled synchronously via the base class.
+        NORMAL mode delegates to ``_start_worker_evaluation`` which
+        manages barrier, fence, and multiprocessing dispatch.
         """
         if self._state == NodeState.DISABLED:
             return
-        
+
         if self._is_computing:
             return
-        
+
         if self._state == NodeState.PASSTHROUGH:
             ThreadedManualNode.evaluate(self, visited)
             return
-        
-        if not self._is_compute_picklable():
-            log.error(f"{self}: compute() must be a @staticmethod for multiprocessing")
-            return
-        
-        self._is_computing = True
-        
-        try:
-            inputs = self._prepare_inputs(visited)
-        except Exception:
-            self._is_computing = False
-            return
-        
-        self._pre_compute_state = self._state
-        if _HAS_COMPUTING_STATE:
-            try:
-                super(ThreadedManualNode, self).set_state(NodeState.COMPUTING)
-                if hasattr(self, '_start_computing_pulse'):
-                    self._start_computing_pulse()
-            except Exception:
-                pass
-        
-        self.compute_started.emit()
-        self._dispatch_worker(inputs)
-        # _worker_has_fence set in _dispatch_worker
+
+        # For NORMAL mode, trigger the async multiprocessing path.
+        if self._is_dirty:
+            self._start_worker_evaluation()

@@ -297,7 +297,7 @@ class GraphSerializer:
                     node.restore_state(state)
                 except Exception as e:
                     log.warning(f"Failed to restore state for {cls_name}: {e}")
-                
+            
         except Exception as e:
             log.error(f"Error creating/restoring node {cls_name}: {e}")
             return None
@@ -312,6 +312,23 @@ class GraphSerializer:
                     canvas.addItem(node)
             except Exception as e:
                 log.warning(f"Failed to add restored node to scene: {e}")
+
+        # ── POST-SCENE GEOMETRY REFRESH ──────────────────────────────
+        # restore_state() executed before the node had a scene, so every
+        # prepareGeometryChange() call inside it was a no-op.  Qt's
+        # scene manager therefore has no bounding-rect history for port
+        # labels or sub-components.  Without this forced refresh, stale
+        # label positions are never invalidated and appear as ghost
+        # artefacts until the next canvas interaction.
+        # The duplicate path does not suffer from this because the node
+        # is already in a scene when its geometry is calculated.
+        if node.scene() is not None:
+            node.prepareGeometryChange()
+            if hasattr(node, '_recalculate_paths'):
+                node._recalculate_paths()
+            if hasattr(node, 'update_geometry'):
+                node.update_geometry()
+            node.update()
 
         # Resume compute fence
         if hasattr(node, '_eval_pending'):
@@ -384,3 +401,63 @@ class GraphSerializer:
         """Restore viewport state."""
         # Placeholder for future implementation 
         pass
+
+    # =======================================================================
+    # FILE I/O METHODS (ADDED TO FIX THE MISSING METHODS)
+    # =======================================================================
+
+    def save_to_file(self, filepath: str, canvas, view=None) -> bool:
+        """
+        Save the graph state to a JSON file.
+        
+        Args:
+            filepath: Path where the file should be saved
+            canvas: The QtNodeCanvas (QGraphicsScene subclass)
+            view: Optional QGraphicsView for viewport state
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Serialize the graph data
+            json_string = self.serialize(canvas, view)
+            
+            # Write to file
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(json_string)
+                
+            return True
+            
+        except Exception as e:
+            log.error(f"Failed to save to file {filepath}: {e}")
+            return False
+
+    def load_from_file(self, filepath: str, canvas, view=None) -> bool:
+        """
+        Load graph state from a JSON file.
+        
+        Args:
+            filepath: Path of the file to load
+            canvas: The QtNodeCanvas (QGraphicsScene subclass)
+            view: Optional QGraphicsView for viewport restoration
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Read from file
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Deserialize the data
+            self.deserialize(content, canvas, view)
+            
+            # ── FULL CANVAS REFRESH ──
+            if hasattr(canvas, 'update'):
+                canvas.update()
+            
+            return True
+            
+        except Exception as e:
+            log.error(f"Failed to load from file {filepath}: {e}")
+            return False
