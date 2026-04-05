@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 import os
 from functools import partial
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from PySide6.QtWidgets import (
     QMenu, QGraphicsItem, QWidgetAction, QLineEdit,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy,
@@ -23,6 +23,7 @@ from weave.canvas.canvas_grid import GridType
 from weave.canvas.commands_mixin import CanvasCommandsMixin, HAS_NODE_COMPONENTS, HAS_SERIALIZER
 from weave.node.node_trace import NodeTrace, DragTrace
 from weave.canvas.canvas_icon_provider import get_menu_icon_provider
+from weave.portregistry import PortRegistry
 
 from weave.logger import get_logger
 log = get_logger("ContextMenu")
@@ -392,6 +393,458 @@ class _SearchEventFilter(QWidget):
         return super().eventFilter(obj, event)
 
 
+# ============================================================================
+# PORT SIGNATURE CACHE
+# ============================================================================
+
+def _node_display_name(node_cls) -> str:
+    """Module-level helper for resolving node display names."""
+    if HAS_REGISTRY and NODE_REGISTRY is not None:
+        return NODE_REGISTRY.get_node_display_name(node_cls)
+    return getattr(node_cls, 'node_name', None) or getattr(node_cls, '__name__', 'Unknown')
+
+
+class _PortSignatureCache:
+    """Lazy cache mapping each registered node class to its port signatures.
+
+    Built on first access by instantiating every registered node class
+    once (without adding it to a scene), reading its ``inputs`` and
+    ``outputs``, then tearing down the temporary instance.  Rebuilt
+    automatically when the registry grows (simple length check).
+
+    Each entry is a list of ``(port_name, datatype, is_output)`` tuples.
+    """
+
+    def __init__(self):
+        self._signatures: Dict[type, List[Tuple[str, str, bool]]] = {}
+        self._registry_size: int = 0
+
+    def get_all(self) -> Dict[type, List[Tuple[str, str, bool]]]:
+        """Return cached signatures, rebuilding if the registry has grown."""
+        if not HAS_REGISTRY or NODE_REGISTRY is None:
+            return {}
+        current_size = len(NODE_REGISTRY._flat_map)
+        if current_size != self._registry_size:
+            self._rebuild()
+        return self._signatures
+
+    def _rebuild(self):
+        """Instantiate each registered class once to read its ports."""
+        self._signatures.clear()
+        if not HAS_REGISTRY or NODE_REGISTRY is None:
+            return
+
+        all_classes = NODE_REGISTRY.get_all_nodes()
+        self._registry_size = len(all_classes)
+
+        for node_cls in all_classes:
+            try:
+                node = node_cls()
+                ports: List[Tuple[str, str, bool]] = []
+                for p in getattr(node, 'inputs', []):
+                    ports.append((
+                        getattr(p, 'name', ''),
+                        getattr(p, 'datatype', 'generic'),
+                        False,
+                    ))
+                for p in getattr(node, 'outputs', []):
+                    ports.append((
+                        getattr(p, 'name', ''),
+                        getattr(p, 'datatype', 'generic'),
+                        True,
+                    ))
+                self._signatures[node_cls] = ports
+                self._teardown(node)
+            except Exception as e:
+                log.debug(
+                    f"Port signature cache: skip {node_cls.__name__}: {e}"
+                )
+
+    @staticmethod
+    def _teardown(node):
+        """Unregister a temporary node from StyleManager and release it."""
+        try:
+            sm = StyleManager.instance()
+            all_ports = (
+                getattr(node, 'inputs', [])
+                + getattr(node, 'outputs', [])
+            )
+            for attr in ('_summary_input', '_summary_output'):
+                sp = getattr(node, attr, None)
+                if sp is not None:
+                    all_ports.append(sp)
+            for p in all_ports:
+                try:
+                    sm.unregister(p, StyleCategory.PORT)
+                    sm.unregister(p, StyleCategory.TRACE)
+                except Exception:
+                    pass
+            try:
+                sm.unregister(node, StyleCategory.NODE)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        if hasattr(node, 'cleanup'):
+            try:
+                node.cleanup()
+            except Exception:
+                pass
+
+
+_port_sig_cache = _PortSignatureCache()
+
+
+# ============================================================================
+# COMPATIBLE NODE FILTER
+# ============================================================================
+
+def _find_compatible_classes(
+    source_port,
+    signatures: Dict[type, List[Tuple[str, str, bool]]],
+) -> List[Tuple[type, str]]:
+    """Return node classes that have at least one port compatible with
+    *source_port*, together with the best matching port name.
+
+    Returns:
+        List of ``(node_class, best_port_name)`` sorted by match
+        quality (exact type first, then cast-compatible, then wildcard)
+        and then alphabetically by display name.
+    """
+    source_is_output = getattr(source_port, 'is_output', True)
+    source_datatype = getattr(source_port, 'datatype', 'generic')
+    source_ptype = PortRegistry.get(source_datatype)
+
+    WILDCARD = frozenset({'generic', 'any', 'object'})
+    source_is_wild = (
+        source_ptype.name.lower() in WILDCARD if source_ptype else False
+    )
+
+    results: List[Tuple[type, str, int]] = []
+
+    for node_cls, ports in signatures.items():
+        best_port: Optional[str] = None
+        best_score = 0  # 0=none  1=wildcard  2=cast  3=exact
+
+        for port_name, port_datatype, port_is_output in ports:
+            # Must be opposite direction
+            if port_is_output == source_is_output:
+                continue
+            # Skip dummy / summary ports
+            if port_datatype == 'dummy':
+                continue
+
+            port_ptype = PortRegistry.get(port_datatype)
+            port_is_wild = (
+                port_ptype.name.lower() in WILDCARD if port_ptype else False
+            )
+
+            if source_datatype == port_datatype:
+                score = 3
+            elif source_is_wild or port_is_wild:
+                score = 1
+            else:
+                # Direction-aware converter check
+                if source_is_output:
+                    is_valid, _ = PortRegistry.get_converter(
+                        source_ptype, port_ptype,
+                    )
+                else:
+                    is_valid, _ = PortRegistry.get_converter(
+                        port_ptype, source_ptype,
+                    )
+                score = 2 if is_valid else 0
+
+            if score > best_score:
+                best_score = score
+                best_port = port_name
+
+        if best_port is not None:
+            results.append((node_cls, best_port, best_score))
+
+    results.sort(key=lambda r: (
+        -r[2], _node_display_name(r[0]).lower()
+    ))
+    return [(cls, pn) for cls, pn, _ in results]
+
+
+# ============================================================================
+# COMPATIBLE NODE MENU CONTROLLER
+# ============================================================================
+
+class CompatibleNodeMenuController:
+    """Menu controller showing only nodes whose ports are compatible
+    with the drag source.  Includes a search bar that filters within
+    the pre-computed compatible subset.
+
+    Spawning an entry auto-connects the best matching port so the
+    user gets a connected node in one gesture.
+    """
+
+    def __init__(
+        self,
+        canvas,
+        source_port,
+        scene_pos: QPointF,
+        menu: QMenu,
+        compatible: List[Tuple[type, str]],
+    ):
+        self._canvas = canvas
+        self._source_port = source_port
+        self._source_is_output = getattr(source_port, 'is_output', True)
+        self._scene_pos = scene_pos
+        self._menu = menu
+        self._all_compatible = compatible
+
+        self._result_actions: List[QAction] = []
+        self._current_index: int = -1
+        self._search_timer: Optional[QTimer] = None
+        self._status_action: Optional[QAction] = None
+
+        self._setup()
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def _setup(self):
+        # ── Search input ──────────────────────────────────────────────
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(0)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        _ic = _icon("input-search")
+        if _ic is not None:
+            icon_label = QLabel()
+            icon_label.setPixmap(
+                _ic.pixmap(
+                    _ic.availableSizes()[0]
+                    if _ic.availableSizes() else 16
+                )
+            )
+            icon_label.setFixedSize(16, 16)
+            icon_label.setScaledContents(True)
+            row.addWidget(icon_label)
+
+        self._search_input = QLineEdit()
+        dtype = getattr(self._source_port, 'datatype', '?')
+        direction = "input" if self._source_is_output else "output"
+        self._search_input.setPlaceholderText(
+            f"Search compatible nodes ({dtype} → {direction})…"
+        )
+        self._search_input.setMinimumWidth(280)
+        self._search_input.setClearButtonEnabled(True)
+        row.addWidget(self._search_input)
+
+        outer.addLayout(row)
+        container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed,
+        )
+
+        widget_action = QWidgetAction(self._menu)
+        widget_action.setDefaultWidget(container)
+        self._menu.addAction(widget_action)
+        self._search_action = widget_action
+
+        # ── Status line ───────────────────────────────────────────────
+        self._status_action = QAction("", self._menu)
+        self._status_action.setEnabled(False)
+        self._menu.addAction(self._status_action)
+        self._update_status(len(self._all_compatible))
+
+        self._menu.addSeparator()
+
+        # ── Debounce timer ────────────────────────────────────────────
+        self._search_timer = QTimer()
+        self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self._apply_filter)
+
+        # ── Signals ───────────────────────────────────────────────────
+        self._search_input.textChanged.connect(self._on_text_changed)
+        self._search_input.returnPressed.connect(self._on_return_pressed)
+        self._search_input.installEventFilter(
+            _SearchEventFilter(self, self._search_input)
+        )
+
+        # ── Initial population ────────────────────────────────────────
+        self._populate(self._all_compatible)
+        QTimer.singleShot(0, self._search_input.setFocus)
+
+    # ------------------------------------------------------------------
+    # Populate / clear
+    # ------------------------------------------------------------------
+
+    def _populate(self, items: List[Tuple[type, str]]):
+        self._clear_results()
+        for node_cls, port_name in items:
+            display = _node_display_name(node_cls)
+            action = QAction(display, self._menu)
+
+            cat = getattr(node_cls, 'node_class', '')
+            sub = getattr(node_cls, 'node_subclass', '')
+            path = f"{cat} > {sub}" if sub else cat
+            action.setToolTip(f"{path}\nConnects to: {port_name}")
+            action.setData((node_cls, port_name))
+
+            if ic := _node_icon(node_cls):
+                action.setIcon(ic)
+
+            action.triggered.connect(
+                partial(self._spawn_and_connect, node_cls, port_name)
+            )
+            self._menu.addAction(action)
+            self._result_actions.append(action)
+
+        if self._result_actions:
+            self._current_index = 0
+            self._highlight_current()
+
+    def _clear_results(self):
+        for action in self._result_actions:
+            self._menu.removeAction(action)
+        self._result_actions.clear()
+        self._current_index = -1
+
+    def _update_status(self, count: int):
+        if self._status_action:
+            self._status_action.setText(
+                f"{count} compatible node{'s' if count != 1 else ''}"
+            )
+
+    # ------------------------------------------------------------------
+    # Search filtering
+    # ------------------------------------------------------------------
+
+    def _on_text_changed(self, text: str):
+        if self._search_timer:
+            self._search_timer.stop()
+        if not text.strip():
+            self._populate(self._all_compatible)
+            self._update_status(len(self._all_compatible))
+            return
+        self._search_timer.start(100)
+
+    def _apply_filter(self):
+        query = self._search_input.text().strip().lower()
+        if not query:
+            filtered = self._all_compatible
+        else:
+            terms = query.split()
+            filtered = []
+            for node_cls, port_name in self._all_compatible:
+                name = _node_display_name(node_cls).lower()
+                tags = ' '.join(
+                    getattr(node_cls, 'node_tags', None) or []
+                ).lower()
+                cat = getattr(node_cls, 'node_class', '').lower()
+                searchable = f"{name} {tags} {cat}"
+                if all(t in searchable for t in terms):
+                    filtered.append((node_cls, port_name))
+        self._populate(filtered)
+        self._update_status(len(filtered))
+
+    # ------------------------------------------------------------------
+    # Keyboard navigation  (interface expected by _SearchEventFilter)
+    # ------------------------------------------------------------------
+
+    def navigate_down(self):
+        if not self._result_actions:
+            return
+        self._current_index = (
+            (self._current_index + 1) % len(self._result_actions)
+        )
+        self._highlight_current()
+
+    def navigate_up(self):
+        if not self._result_actions:
+            return
+        self._current_index = (
+            (self._current_index - 1) % len(self._result_actions)
+        )
+        self._highlight_current()
+
+    def _highlight_current(self):
+        if (self._result_actions
+                and 0 <= self._current_index < len(self._result_actions)):
+            self._menu.setActiveAction(
+                self._result_actions[self._current_index]
+            )
+
+    def _on_return_pressed(self):
+        if (self._result_actions
+                and 0 <= self._current_index < len(self._result_actions)):
+            data = self._result_actions[self._current_index].data()
+            if data:
+                node_cls, port_name = data
+                self._spawn_and_connect(node_cls, port_name)
+
+    # ------------------------------------------------------------------
+    # Spawn + auto-connect
+    # ------------------------------------------------------------------
+
+    def _spawn_and_connect(self, node_cls, target_port_name: str):
+        """Spawn a node at the drop position and auto-connect.
+
+        The ``AddNodeCommand`` and ``AddConnectionCommand`` are bundled
+        inside a single undo macro so Ctrl+Z reverts both atomically.
+        """
+        if not node_cls or not self._canvas:
+            return
+
+        provider = getattr(self._canvas, '_context_menu_provider', None)
+        mgr = (
+            getattr(provider, '_undo_manager', None) if provider else None
+        )
+
+        if mgr:
+            mgr.begin_macro("Spawn and Connect Node")
+
+        try:
+            # 1. Spawn the node
+            node = node_cls()
+            self._canvas.add_node(
+                node, (self._scene_pos.x(), self._scene_pos.y()),
+            )
+
+            # 2. Push AddNodeCommand
+            if provider and mgr:
+                from weave.canvas.undo_commands import (
+                    AddNodeCommand, capture_node_snapshot,
+                )
+                uid, cls_name, state, npos = capture_node_snapshot(node)
+                mgr.push(AddNodeCommand(
+                    cls_name, state, uid, npos,
+                    provider._get_registry_map(),
+                ))
+
+            # 3. Find the matching port on the new node and connect
+            search_list = (
+                getattr(node, 'inputs', [])
+                if self._source_is_output
+                else getattr(node, 'outputs', [])
+            )
+            target_port = next(
+                (p for p in search_list if p.name == target_port_name),
+                None,
+            )
+            if target_port and self._source_port:
+                self._canvas._create_connection(
+                    self._source_port, target_port,
+                )
+        except Exception as e:
+            log.error(f"Spawn-and-connect failed: {e}")
+        finally:
+            if mgr:
+                mgr.end_macro()
+
+        self._menu.close()
+
+
 class ContextMenuProvider(CanvasCommandsMixin):
     """
     Provides context menu functionality for the canvas.
@@ -438,6 +891,46 @@ class ContextMenuProvider(CanvasCommandsMixin):
             self._build_registry_actions(menu, scene_pos)
         
         return menu if menu.actions() else None
+
+    def show_compatible_node_menu(
+        self, source_port, scene_pos: QPointF, screen_pos,
+    ) -> None:
+        """Show a menu of node types compatible with *source_port*.
+
+        Called when a connection drag is released on empty canvas.
+        The menu is pre-filtered to nodes whose ports are type-compatible
+        with the drag source, and includes a search bar for narrowing.
+        Selecting an entry spawns the node and auto-connects.
+
+        Args:
+            source_port: The port the drag originated from.
+            scene_pos:   Drop position in scene coordinates (spawn target).
+            screen_pos:  Drop position in screen coordinates (menu anchor).
+        """
+        # 1. Build / refresh the port signature cache
+        signatures = _port_sig_cache.get_all()
+        if not signatures:
+            return
+
+        # 2. Filter to compatible classes
+        compatible = _find_compatible_classes(source_port, signatures)
+        if not compatible:
+            return
+
+        # 3. Build menu
+        view = self._canvas.views()[0] if self._canvas.views() else None
+        menu = QMenu(parent=view)
+
+        self._compat_controller = CompatibleNodeMenuController(
+            canvas=self._canvas,
+            source_port=source_port,
+            scene_pos=scene_pos,
+            menu=menu,
+            compatible=compatible,
+        )
+
+        # 4. Show (blocks until dismissed)
+        menu.exec(screen_pos)
     
     def _build_node_actions(self, menu: QMenu, target_item: QGraphicsItem) -> None:
         """

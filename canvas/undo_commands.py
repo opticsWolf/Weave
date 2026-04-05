@@ -45,6 +45,26 @@ def get_port_uid(port) -> str:
     return uid if uid else f"port_{id(port)}"
 
 
+def _post_scene_geometry_refresh(node) -> None:
+    """Force a full geometry pass after a node enters a scene.
+
+    ``restore_state()`` typically executes before the node has a valid
+    scene, so every ``prepareGeometryChange()`` call inside it is a
+    no-op.  Qt's scene manager therefore has no bounding-rect history
+    for port labels or sub-components.  Calling this helper immediately
+    after ``add_node()`` / ``addItem()`` ensures the scene tracks all
+    child geometries correctly and prevents ghost artefacts.
+    """
+    if node is None or node.scene() is None:
+        return
+    node.prepareGeometryChange()
+    if hasattr(node, '_recalculate_paths'):
+        node._recalculate_paths()
+    if hasattr(node, 'update_geometry'):
+        node.update_geometry()
+    node.update()
+
+
 def resolve_node_by_uuid(canvas, node_uuid: Union[str, uuid.UUID]) -> Optional[QGraphicsItem]:
     """Safely resolve a UUID string to a live node instance."""
     if not node_uuid:
@@ -74,7 +94,6 @@ class UndoCommand(QUndoCommand):
         """Add a sub-command to enable macro groupings."""
         if cmd is not None and isinstance(cmd, UndoCommand):
             self._child_count += 1
-            super().add_child(cmd)
 
     def mergeWith(self, other: QUndoCommand) -> bool:
         return False
@@ -103,8 +122,19 @@ class CompoundCommand(UndoCommand):
         self._description = description
         self._children: List[UndoCommand] = []
         for cmd in commands:
-            self.add_child(cmd)
-            self._children.append(cmd)
+            if cmd is not None and isinstance(cmd, UndoCommand):
+                self._child_count += 1
+                self._children.append(cmd)
+
+    def undo(self, canvas) -> None:
+        """Execute all child undo commands in REVERSE order."""
+        for cmd in reversed(self._children):
+            cmd.undo(canvas)
+
+    def redo(self, canvas) -> None:
+        """Execute all child redo commands in FORWARD order."""
+        for cmd in self._children:
+            cmd.redo(canvas)
 
     def get_affected_node_uuids(self) -> Set[str]:
         uuids: Set[str] = set()
@@ -166,11 +196,17 @@ class AddNodeCommand(UndoCommand):
         else:
             canvas.addItem(node)
             node.setPos(*self._pos)
-            
+
+        _post_scene_geometry_refresh(node)
+
         if hasattr(node, '_eval_pending'):
             node._eval_pending = False
             
         self._created_node = node
+
+        # ── FULL CANVAS REFRESH ──
+        if hasattr(canvas, 'update'):
+            canvas.update()
 
     def get_affected_node_uuids(self) -> Set[str]:
         return {self._uid}
@@ -213,7 +249,9 @@ class RemoveNodesCommand(UndoCommand):
             else:
                 canvas.addItem(node)
                 node.setPos(pos[0], pos[1])
-            
+
+            _post_scene_geometry_refresh(node)
+
             if hasattr(node, '_eval_pending'):
                 node._eval_pending = False
 
@@ -229,6 +267,10 @@ class RemoveNodesCommand(UndoCommand):
 
             if src_port and dst_port:
                 ConnectionFactory.create(canvas, src_port, dst_port, validate=False, trigger_compute=True)
+
+        # ── FULL CANVAS REFRESH ──
+        if hasattr(canvas, 'update'):
+            canvas.update()
 
     def redo(self, canvas) -> None:
         # Execute the deletion
@@ -578,6 +620,51 @@ class RemoveConnectionsCommand(UndoCommand):
                         ConnectionFactory.remove(t, trigger_compute=True)
                         break
 
+class NodeTitleCommand(UndoCommand):
+    """Command to track and revert manual node title edits."""
+    
+    def __init__(self, node_uuid: str, old_title: str, new_title: str):
+        self.node_uuid = node_uuid
+        self.old_title = old_title
+        self.new_title = new_title
+
+    @property
+    def description(self) -> str:
+        return f"Rename Node to '{self.new_title}'"
+
+    def undo(self, canvas) -> None:
+        self._apply_title(canvas, self.old_title)
+
+    def redo(self, canvas) -> None:
+        self._apply_title(canvas, self.new_title)
+
+    def _apply_title(self, canvas, target_title: str) -> None:
+        """Applies the title to the data model and forces a UI repaint."""
+        # Safely resolve the node using its unique ID
+        node = next((n for n in canvas.items() if getattr(n, 'unique_id', None) == self.node_uuid), None)
+        if not node:
+            return
+
+        # 1. Commit to Source of Truth (The Node)
+        if hasattr(node, 'set_name') and callable(node.set_name):
+            node.set_name(target_title)
+        elif hasattr(node, 'name'):
+            node.name = target_title
+
+        # 2. Update the visual UI directly (bypassing user interaction events)
+        if hasattr(node, 'header') and hasattr(node.header, '_title'):
+            node.header._title.setToolTip(target_title)
+            node.header._title.setPlainText(target_title)
+            node.header._recalculate_layout()
+            node.header.update()
+
+        # 3. Recalculate Node bounds
+        if hasattr(node, 'enforce_min_dimensions'):
+            node.enforce_min_dimensions()
+
+        # 4. Notify external listeners (dock panel, property editors)
+        if hasattr(node, 'title_changed'):
+            node.title_changed.emit(target_title)
 
 # ======================================================================
 # Snapshot Helpers

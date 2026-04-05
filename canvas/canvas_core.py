@@ -829,6 +829,27 @@ class Canvas(QGraphicsScene):
                     provider._undo_manager.push(AddConnectionCommand(conn_tuple))
         return result
 
+    def show_compatible_node_menu(
+        self, source_port: NodePort, scene_pos: QPointF,
+    ) -> None:
+        """Show a filtered menu of nodes compatible with *source_port*.
+
+        Called by ``ConnectionDragState`` when a connection drag is
+        released on empty canvas.  The menu lists only node types that
+        have at least one port compatible with the drag source.
+        Selecting an entry spawns the node at *scene_pos* and
+        auto-connects the matching port.
+        """
+        provider = getattr(self, '_context_menu_provider', None)
+        if provider is None:
+            return
+        view = self.views()[0] if self.views() else None
+        if view is None:
+            return
+        view_pos = view.mapFromScene(scene_pos)
+        screen_pos = view.mapToGlobal(view_pos)
+        provider.show_compatible_node_menu(source_port, scene_pos, screen_pos)
+
     def _set_global_port_dimming(self, active: bool, source_port: Optional[NodePort]) -> None:
         """Dim incompatible ports during connection drag."""
         if not hasattr(self, '_node_manager'):

@@ -384,12 +384,26 @@ class UndoManager:
         QTimer.singleShot(0, self._exit_quiescence)
 
     def _exit_quiescence(self) -> None:
-        """Exit quiescence and finalize the restore operation."""
+        """Exit quiescence and finalize the restore operation.
+
+        FIXED: Re-wire any nodes that were restored while ``_restoring``
+        was True.  ``_on_node_added`` skips wiring during restore to
+        avoid capturing transient signal emissions as undo commands.
+        Once the restore is complete we must reconnect the WidgetCore
+        ``value_changed`` slots so future edits are tracked again.
+        """
         self._quiescence_pending = False
         self._restoring = False
         self._restore_retry_count = 0  # Reset for next time
+
+        # Re-wire nodes that appeared during the restore phase.
+        # _on_node_added() bailed out for these because _restoring was
+        # True, so their WidgetCore.value_changed is not connected yet.
+        self.wire_existing_nodes()
+
         self.snapshot_widget_baselines()
-        _dbg("_exit_quiescence: _restoring=False, baselines refreshed, quiescence ended")
+        _dbg("_exit_quiescence: _restoring=False, nodes re-wired, "
+             "baselines refreshed, quiescence ended")
 
     @property
     def can_undo(self) -> bool:
@@ -517,6 +531,7 @@ class UndoManager:
 
             if hasattr(node, 'port_removed'):
                 pr_slot = self._make_port_removed_slot(node_uuid)
+                node.port_removed.connect(pr_slot)
                 existing = self._port_slots.get(id(node), (node, None, None))
                 self._port_slots[id(node)] = (node, existing[1], pr_slot)
 
