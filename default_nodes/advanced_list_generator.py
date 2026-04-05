@@ -13,12 +13,12 @@ Advanced Range List Generator node with per-parameter auto-disable.
 Each parameter (start, stop, step) has both an input port AND a QSpinBox.
 Using the WidgetCore system's BIDIRECTIONAL role, when an upstream node
 connects to a parameter's input port, the corresponding widget is
-automatically disabled (greyed out) so the user cannot conflict with the
-incoming data. Disconnecting the trace re-enables the widget.
+automatically disabled (greyed out). Disconnecting the trace re-enables it.
 """
 
 import numpy as np
 from typing import Any, Dict, Optional, ClassVar, List
+
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QDoubleSpinBox, QFormLayout
 
@@ -32,14 +32,8 @@ log = get_logger("AdvancedListGen")
 
 @register_node
 class AdvancedRangeListNode(ThreadedNode):
-    """
-    Advanced list generator with auto-disabling spinboxes.
-
-    Inherits from ThreadedNode so that numpy work runs off the main thread.
-    Uses BIDIRECTIONAL widget registration to automatically manage port
-    creation, widget fallback values, and auto-disabling UI states when
-    upstream traces are connected.
-    """
+    """Generates numerical lists with framework-managed auto-disabling widgets."""
+    
     list_changed = Signal(list)
 
     # ── Registry metadata ────────────────────────────────────────────
@@ -55,19 +49,21 @@ class AdvancedRangeListNode(ThreadedNode):
         # Thread-safe handoff for the custom Qt Signal
         self._pending_list: Optional[list] = None
 
-        # ── Output port ──────────────────────────────────────────────
+        # ── 1. Ports (Graph Layer) ───────────────────────────────────
+        self.add_input("start", datatype="float")
+        self.add_input("stop", datatype="float")
+        self.add_input("step", datatype="float")
         self.add_output("list", datatype="list")
 
-        # ── Widget body (compact form layout) ────────────────────────
+        # ── 2. UI Layout (WidgetCore) ────────────────────────────────
         form = QFormLayout()
         form.setContentsMargins(5, 5, 5, 5)
         form.setSpacing(4)
         
-        # Weave WidgetCore initialized with our layout
         self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
-        # Initialize Qt Widgets (ensure strict typing at PySide boundary)
+        # Initialize Qt Widgets (strict PySide6 float casting)
         spin_start = QDoubleSpinBox()
         spin_start.setRange(float(-99999999), float(99999999))
         spin_start.setDecimals(3)
@@ -86,57 +82,35 @@ class AdvancedRangeListNode(ThreadedNode):
         spin_step.setSingleStep(1.0)
         spin_step.setValue(1.0)
 
-        # Place labelled rows in the form before registering with core
+        # Add to layout
         form.addRow("Start:", spin_start)
         form.addRow("Stop:",  spin_stop)
         form.addRow("Step:",  spin_step)
 
-        # Register each spinbox as BIDIRECTIONAL (UI ↔ upstream).
-        # This auto-creates the input ports and handles auto-disable on connect.
-        self._widget_core.register_widget(
-            port_name="start",
-            widget=spin_start,
-            role="BIDIRECTIONAL",
-            datatype="float",
-            default=0.0,
-            add_to_layout=False,
-        )
-        self._widget_core.register_widget(
-            port_name="stop",
-            widget=spin_stop,
-            role="BIDIRECTIONAL",
-            datatype="float",
-            default=10.0,
-            add_to_layout=False,
-        )
-        self._widget_core.register_widget(
-            port_name="step",
-            widget=spin_step,
-            role="BIDIRECTIONAL",
-            datatype="float",
-            default=1.0,
-            add_to_layout=False,
-        )
+        # ── 3. Binding (The Bridge) ──────────────────────────────────
+        # Registering as BIDIRECTIONAL tells the framework to auto-disable 
+        # these widgets when traces connect to the matching port names.
+        self._widget_core.register_widget("start", spin_start, role="BIDIRECTIONAL", datatype="float", default=0.0, add_to_layout=False)
+        self._widget_core.register_widget("stop",  spin_stop,  role="BIDIRECTIONAL", datatype="float", default=10.0, add_to_layout=False)
+        self._widget_core.register_widget("step",  spin_step,  role="BIDIRECTIONAL", datatype="float", default=1.0, add_to_layout=False)
+
+        # ── 4. The Critical Fix: UI Evaluation Link ──────────────────
+        # This ties the Qt widget interactions (like mouse wheel scrolls) 
+        # directly to the node's evaluation fence, eliminating lag and 
+        # properly grouping Undo commands.
+        self._widget_core.value_changed.connect(self.on_ui_change)
 
         self.set_content_widget(self._widget_core)
-        
-        # Patch and refresh palettes for styling integration
-        if hasattr(self._widget_core, 'patch_proxy'):
-            self._widget_core.patch_proxy()
-        if hasattr(self._widget_core, 'refresh_widget_palettes'):
-            self._widget_core.refresh_widget_palettes()
 
-    # ── Computation (worker thread — no Qt widget access) ────────────
+    # ── Computation (Worker Thread) ──────────────────────────────────
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Generates a list via numpy.arange.
-
-        Upstream port values take priority over widget fallbacks.
-        The framework automatically injects the BIDIRECTIONAL widget 
-        values into the `inputs` dict if no trace is connected.
+        """
+        Generates the list.
+        The framework automatically resolves whether 'inputs' come from 
+        an upstream trace or the local widget fallback.
         """
         try:
-            # Safely extract from framework-resolved inputs and cast 
             start = float(inputs.get("start", 0.0))
             stop  = float(inputs.get("stop", 10.0))
             step  = float(inputs.get("step", 1.0))
@@ -159,7 +133,7 @@ class AdvancedRangeListNode(ThreadedNode):
             log.error(f"Exception in AdvancedRangeListNode.compute: {e}")
             return {"list": []}
 
-    # ── Signal handling (main thread — safe for Qt GUI) ──────────────
+    # ── Main Thread Hooks ────────────────────────────────────────────
 
     def on_evaluate_finished(self) -> None:
         """Emit list_changed on the main thread after results are cached."""
@@ -168,8 +142,6 @@ class AdvancedRangeListNode(ThreadedNode):
             self._pending_list = None
             
         super().on_evaluate_finished()
-
-    # ── Cleanup ──────────────────────────────────────────────────────
 
     def cleanup(self) -> None:
         """Release resources and break reference cycles safely."""
