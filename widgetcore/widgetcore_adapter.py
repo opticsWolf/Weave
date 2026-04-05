@@ -87,7 +87,13 @@ def generic_set(
             if isinstance(value, int):
                 widget.setCurrentIndex(value)
             else:
-                idx = widget.findText(str(value))
+                # ── THE FIX: Look for hidden userData first ──
+                idx = widget.findData(value)
+                
+                # Fallback: If no userData matched, try exact Display Text
+                if idx < 0:
+                    idx = widget.findText(str(value))
+                    
                 if idx >= 0:
                     widget.setCurrentIndex(idx)
                 elif widget.isEditable():

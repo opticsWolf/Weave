@@ -342,6 +342,13 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         log.debug(f"apply_port_value: '{port_name}' = {value!r} "
                   f"(suppress_depth will be {self._suppress_depth + 1})")
         
+        # ── THE ARCHITECTURAL FIX: Hold the node's eval fence ──
+        # We must hold the fence BEFORE deferring the QTimer to ensure the 
+        # UndoManager's quiescence loop waits for all async layout shifts.
+        node = self.node
+        if node is not None and hasattr(node, '_increment_eval_fence'):
+            node._increment_eval_fence()
+
         # Rule 4: Block ALL signals during the write to prevent race conditions.
         # The widget's native valueChanged signal must not fire during undo/redo
         # because it could create spurious undo commands.
@@ -355,6 +362,9 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
                 generic_set(binding.widget, value, block_signals=True)
         except (RuntimeError, AttributeError) as e:
             log.warning(f"Failed to apply value for port '{port_name}': {e}")
+            # Release fence on failure
+            if node is not None and hasattr(node, '_decrement_eval_fence'):
+                node._decrement_eval_fence()
             return False
         finally:
             binding.widget.blockSignals(was_blocked)  # Restore signal state
@@ -369,14 +379,20 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         # race conditions where a queued signal fires after we think
         # the restore is complete.
         def _emit_port_value_written():
-            self.port_value_written.emit(port_name, value)
-            # Log change detection after deferred emission
             try:
-                current_value = self.get_port_value(port_name)
-                if current_value != previous_value:
-                    log.debug(f"apply_port_value: value changed {previous_value!r} -> {current_value!r}")
-            except Exception:
-                pass
+                self.port_value_written.emit(port_name, value)
+                # Log change detection after deferred emission
+                try:
+                    current_value = self.get_port_value(port_name)
+                    if current_value != previous_value:
+                        log.debug(f"apply_port_value: value changed {previous_value!r} -> {current_value!r}")
+                except Exception:
+                    pass
+            finally:
+                # ── THE ARCHITECTURAL FIX: Release the fence ──
+                # Released ONLY after all connected slots (and layout updates) execute.
+                if node is not None and hasattr(node, '_decrement_eval_fence'):
+                    node._decrement_eval_fence()
         
         QTimer.singleShot(0, _emit_port_value_written)
         return True
