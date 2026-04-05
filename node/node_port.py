@@ -353,42 +353,30 @@ class NodePort(UUIDMixin, QGraphicsItem):
         
         if trace not in self.connected_traces:
             self.connected_traces.append(trace)
-
+    
         # ── Auto-disable: grey-out the matching widget on connection ──
-        if self._auto_disable and not self.is_output:
-            self._set_widget_enabled(False)
-
+        # ARCHITECTURAL FIX: Notify the mediator (Node)
+        if hasattr(self.node, 'on_port_connection_changed'):
+            self.node.on_port_connection_changed(self)
+    
         self.refresh_label_style()
         self.update()
-
+    
     def remove_trace(self, trace: 'NodeTrace') -> None:
         if trace in self.connected_traces:
             self.connected_traces.remove(trace)
-
+    
             # ── Auto-disable: re-enable widget when last connection removed ──
-            if self._auto_disable and not self.is_output and not self.connected_traces:
-                self._set_widget_enabled(True)
-
+            # ARCHITECTURAL FIX: Notify the mediator (Node)
+            if hasattr(self.node, 'on_port_connection_changed'):
+                self.node.on_port_connection_changed(self)
+    
             self.refresh_label_style()
             self.update()
 
     def get_connections(self) -> List['NodeTrace']:
         """Returns a copy of the connected traces list."""
         return self.connected_traces.copy()
-
-    def _set_widget_enabled(self, enabled: bool) -> None:
-        """Enable or disable the matching widget in the owning node's WidgetCore.
-
-        Looks up this port's *name* in the node's ``_widget_core`` bindings.
-        If a binding exists, the widget is enabled/disabled via
-        ``WidgetCore.set_port_enabled``.  Silently does nothing when no
-        WidgetCore or no matching binding is found.
-        """
-        core = getattr(self.node, '_widget_core', None)
-        if core is None:
-            return
-        if hasattr(core, 'set_port_enabled') and core.has_binding(self.name):
-            core.set_port_enabled(self.name, enabled)
 
     def disconnect_all(self) -> None:
         """

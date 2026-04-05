@@ -432,37 +432,52 @@ class EditableTitle(QGraphicsTextItem):
 
     def focusOutEvent(self, event) -> None:
         """
-        Called when user clicks away. 
-        Saves the text to the Node and re-locks.
+        Called when user clicks away or hits Enter. 
+        Saves the text to the Node, pushes to UndoManager, and re-locks.
         """
         self._lock_interaction()
         
-        # 1. Clean the text (remove newlines from Enter key)
+        # 1. Clean the new text (remove newlines from Enter key)
         new_name = self.toPlainText().strip()
         
-        # 2. CRITICAL: Update ToolTip IMMEDIATELY.
-        # This ensures that if the Node update fails (or hasn't happened yet),
-        # _recalculate_layout will read this NEW value instead of the old one.
+        # 2. Capture the old name BEFORE overwriting the tooltip
+        old_name = self.toolTip()
+        
+        # 3. Update ToolTip IMMEDIATELY
         self.setToolTip(new_name)
         
-        # 3. Commit to Source of Truth (The Node)
-        # Handle 'set_name' method (standard) or 'name' property
         node = self._header._node
+
+        # 4. Push to UndoManager
+        if old_name and old_name != new_name:
+            try:
+                from weave.canvas.undo_manager import UndoManager
+                from weave.canvas.undo_commands import NodeTitleCommand, get_node_uid
+                
+                um = UndoManager.of(self.scene())
+                # Only push if we aren't currently in the middle of a programmatic undo/redo
+                if um is not None and not getattr(um, '_restoring', False):
+                    uid = get_node_uid(node)
+                    if uid:
+                        um.push(NodeTitleCommand(uid, old_name, new_name))
+            except ImportError:
+                pass # Fail silently if undo_commands isn't set up yet
+
+        # 5. Commit to Source of Truth (The Node)
         if hasattr(node, 'set_name') and callable(node.set_name):
             node.set_name(new_name)
         elif hasattr(node, 'name'):
-            # If it's a property/attribute, set it directly
             node.name = new_name
             
         super().focusOutEvent(event)
         
-        # 4. Trigger Layout Update
+        # 6. Trigger Layout Update
         if hasattr(node, 'enforce_min_dimensions'):
             node.enforce_min_dimensions()
         
         self._header._recalculate_layout()
 
-        # 5. Notify external listeners (dock panel, property editors …)
+        # 7. Notify external listeners
         if hasattr(node, 'title_changed'):
             node.title_changed.emit(new_name)
 
