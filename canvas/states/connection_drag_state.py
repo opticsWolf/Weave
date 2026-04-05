@@ -157,7 +157,18 @@ class ConnectionDragState(CanvasInteractionState):
         if self._detachment_occurred and mgr:
             mgr.end_macro()
 
+        # Capture before on_exit() cleans up drag visuals
+        released_on_empty = self.snapped_port is None
+        source_port = self.start_port
+        drop_pos = event.scenePos()
+
         self.request_transition("default")
+
+        # Show compatible node menu when released on empty canvas
+        if released_on_empty and source_port is not None:
+            if hasattr(self.canvas, 'show_compatible_node_menu'):
+                self.canvas.show_compatible_node_menu(source_port, drop_pos)
+
         return True
 
     # ------------------------------------------------------------------
