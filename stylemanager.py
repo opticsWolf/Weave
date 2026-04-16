@@ -536,6 +536,18 @@ class StyleManager(QObject):
         if theme_name not in THEMES:
             return False
 
+        # Skip the full reset → notify → persist cycle when the theme
+        # is already applied and the boot sequence has completed.
+        # Without this guard, CanvasView.showEvent (which calls
+        # apply_theme_and_prefs) triggers a redundant second apply on
+        # every startup — resetting schemas, re-notifying all subscribers,
+        # and re-persisting the same values.
+        if self._current_theme == theme_name and self._initialized:
+            _debug_print(
+                f"apply_theme('{theme_name}'): already active, skipping"
+            )
+            return True
+
         # Snapping is a workflow preference that must survive theme
         # switches.  Read the persisted value before the reset.
         persisted_snapping = self._read_persisted_snapping()
@@ -601,6 +613,14 @@ class StyleManager(QObject):
         the new theme's grid/trace defaults take effect and are persisted
         so the next session restores them correctly.
         """
+        # _boot() already applied the theme and workspace prefs.
+        # A second call from CanvasView.showEvent is redundant.
+        if self._current_theme == theme_name and self._initialized:
+            _debug_print(
+                f"apply_theme_and_prefs('{theme_name}'): "
+                f"already active, skipping"
+            )
+            return True
         if not self.apply_theme(theme_name):
             return False
         self._apply_workspace_prefs_silent()
