@@ -156,11 +156,13 @@ class CanvasCommandsMixin:
         )
 
         if filepath:
+            self._clear_canvas_silent()
             self._do_load(filepath)
 
     def cmd_open_recent(self, filepath: str) -> None:
         """Load a file from recent history by path."""
         if os.path.exists(filepath):
+            self._clear_canvas_silent()
             self._do_load(filepath)
 
     def cmd_open_recent_by_index(self, index: int) -> None:
@@ -169,12 +171,46 @@ class CanvasCommandsMixin:
             self.cmd_open_recent(self._file_history[index])
 
     def cmd_clear_canvas(self) -> None:
-        """Remove all managed nodes and close all panels."""
+        """Remove all managed nodes and close all panels (undoable)."""
+        from weave.canvas.undo_commands import (
+            RemoveNodesCommand, capture_node_snapshot, capture_node_connections,
+        )
         self.cmd_close_all_panels()
+
+        # Collect all movable, non-trace nodes currently on the canvas.
+        all_nodes = [
+            item for item in self._canvas.items()
+            if (item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+            and not (HAS_NODE_COMPONENTS and isinstance(item, (NodeTrace, DragTrace)))
+        ]
+
+        if not all_nodes:
+            self._canvas.clearSelection()
+            return
+
+        # Snapshot state BEFORE removal so the command can restore it on undo.
+        snapshots = []
+        all_conns = []
+        seen_conns: set = set()
+        for node in all_nodes:
+            if node.scene() != self._canvas:
+                continue
+            snapshots.append(capture_node_snapshot(node))
+            for conn in capture_node_connections(self._canvas, node):
+                if conn not in seen_conns:
+                    all_conns.append(conn)
+                    seen_conns.add(conn)
+
+        # Perform the actual removal via NodeManager.
         if hasattr(self._canvas, '_node_manager'):
             self._canvas._node_manager.clear_all()
         self._canvas.clearSelection()
-        self._undo_manager.clear()
+
+        # Push a single undoable command covering all removed nodes.
+        if snapshots:
+            self._undo_manager.push(
+                RemoveNodesCommand(snapshots, all_conns, self._get_registry_map())
+            )
 
     def cmd_select_all(self) -> None:
         """Select all movable nodes in the scene."""
@@ -882,6 +918,14 @@ class CanvasCommandsMixin:
     # =========================================================================
     # PRIVATE HELPERS
     # =========================================================================
+
+    def _clear_canvas_silent(self) -> None:
+        """Remove all managed nodes and close all panels."""
+        self.cmd_close_all_panels()
+        if hasattr(self._canvas, '_node_manager'):
+            self._canvas._node_manager.clear_all()
+        self._canvas.clearSelection()
+
 
     def _get_movable_selected(self) -> List[QGraphicsItem]:
         """Return selected movable non-trace nodes."""

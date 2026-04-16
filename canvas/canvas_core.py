@@ -647,6 +647,15 @@ class Canvas(QGraphicsScene):
 
         Other keys are passed to the parent implementation.
         """
+        mod = event.modifiers()
+        ctrl = bool(mod & Qt.KeyboardModifier.ControlModifier)
+        alt = bool(mod & Qt.KeyboardModifier.AltModifier)
+        
+        if ctrl and not alt and event.key() == Qt.Key.Key_Z:
+            if self._current_state.keyPressEvent(event):
+                event.accept()
+                return
+
         # ── Widget-editing guard ──────────────────────────────────────
         if self._is_widget_editing():
             if event.key() == Qt.Key.Key_Escape:
@@ -654,21 +663,15 @@ class Canvas(QGraphicsScene):
                 event.accept()
                 return
 
-            # Route to the focused proxy via standard QGraphicsScene
-            # delivery so the embedded widget receives the key.
-            # Accept unconditionally afterward so the scene's own
-            # default key handling (arrow-key moves, Tab focus cycling,
-            # etc.) is fully suppressed.
+            # Route to the focused proxy via standard QGraphicsScene delivery
             super().keyPressEvent(event)
             event.accept()
 
-            # Force the proxy to repaint so the cursor position /
-            # selection / blink state is shown immediately.
+            # Force the proxy to repaint so the cursor position / selection updates
             self._update_editing_proxy()
             return
-        # ── End widget-editing guard ──────────────────────────────────
 
-        # Delegate keyboard handling to current interaction state first
+        # Delegate remaining keyboard handling to current interaction state
         if self._current_state.keyPressEvent(event):
             event.accept()
             return

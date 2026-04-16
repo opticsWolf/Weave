@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 """
+Weave: A modular PySide6 framework for the visual synthesis
+and execution of high-concurrency simulation workflows.
+Copyright (c) 2026 opticsWolf
+
+SPDX-License-Identifier: Apache-2.0
+
 UndoManager — Command-pattern undo/redo with compute-fence tracking
 FIXED VERSION: 
 1. Added missing _merge_open initialization in __init__
