@@ -1,4 +1,12 @@
 # -*- coding: utf-8 -*-
+"""
+Weave: A modular PySide6 framework for the visual synthesis
+and execution of high-concurrency simulation workflows.
+Copyright (c) 2026 opticsWolf
+
+SPDX-License-Identifier: Apache-2.0
+"""
+
 from __future__ import annotations
 
 import numpy as np
