@@ -171,21 +171,27 @@ class CanvasView(QGraphicsView):
         )
 
     def wheelEvent(self, event):
-        """Zoom the canvas, or delegate to a proxy widget under the cursor.
-
-        Proxy-widget guard (cursor-position based)
-        ------------------------------------------
-        Only forward the event to the embedded widget when the mouse is
-        *physically over* a ``QGraphicsProxyWidget``.  Using
-        ``scene.focusItem()`` (keyboard focus) instead would cause canvas
-        zooming to be replaced by scrolling whenever a widget holds focus
-        but the cursor has moved away — the problem this guard prevents.
-        """
+        """Zoom the canvas, or delegate to a proxy widget under the cursor."""
         item = self.itemAt(event.position().toPoint())
+        
         # Walk up the item hierarchy: the hit item may be a child of the proxy.
         while item is not None:
             if isinstance(item, QGraphicsProxyWidget):
+                # 1. Save current canvas scrollbar positions
+                h_scroll = self.horizontalScrollBar().value()
+                v_scroll = self.verticalScrollBar().value()
+                
+                # 2. Pass the scroll event to the embedded text box/widget
                 super().wheelEvent(event)
+                
+                # 3. Undo Qt's default fallback canvas panning
+                # If the widget ignored the event (e.g. reached the end of its scroll),
+                # Qt naturally scrolled the canvas. This reverts it synchronously.
+                self.horizontalScrollBar().setValue(h_scroll)
+                self.verticalScrollBar().setValue(v_scroll)
+                
+                # 4. Force accept to prevent the event from bubbling up to parent windows
+                event.accept()
                 return
             item = item.parentItem()
 
