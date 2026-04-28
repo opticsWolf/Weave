@@ -5,12 +5,6 @@ and execution of high-concurrency simulation workflows.
 Copyright (c) 2026 opticsWolf
 
 SPDX-License-Identifier: Apache-2.0
-
-Weave: A modular PySide6 framework for the visual synthesis 
-and execution of high-concurrency simulation workflows.
-Copyright (c) 2026 opticsWolf
-
-SPDX-License-Identifier: Apache-2.0
 """
 
 import re
@@ -21,6 +15,9 @@ from enum import Enum
 from dataclasses import dataclass, field
 from typing import ClassVar, Dict, Optional, Type, Tuple, Union, Callable, Any
 from PySide6.QtGui import QColor, QImage, QPixmap
+
+from weave.logger import get_logger
+log = get_logger("PortRegistry")
 
 # --- Type Definitions ---
 ConverterFunc = Callable[[Any], Any]
@@ -103,8 +100,16 @@ class PortRegistry:
 
     @classmethod
     def next_color_index(cls) -> int:
-        """Return the next available color_index and increment the counter."""
-        idx = cls._next_color_index
+        """Return the next available ``color_index``, wrapped into the
+        valid palette range ``[0, 255]``.
+
+        The internal counter keeps growing monotonically so we still get
+        a deterministic walk through the palette across many custom
+        registrations; only the *returned* value is wrapped via modulo.
+        Duplicate colour usage between built-in and custom types is
+        permitted by design.
+        """
+        idx = cls._next_color_index % 256
         cls._next_color_index += 1
         return idx
 
@@ -128,8 +133,14 @@ class PortRegistry:
             if palette and 0 <= color_index < len(palette):
                 c = palette[color_index]
                 return c if isinstance(c, QColor) else QColor(*c)
-        except Exception:
-            pass
+            log.debug(
+                "resolve_color(%d): palette unavailable or index out of range "
+                "(palette_len=%s) — falling back to neutral gray",
+                color_index, len(palette) if palette else None,
+            )
+        except Exception as e:
+            log.debug("resolve_color(%d) failed (%s: %s) — falling back to neutral gray",
+                      color_index, type(e).__name__, e)
         # Hard fallback - neutral gray
         return QColor(128, 128, 128, 255)
 
@@ -144,22 +155,59 @@ class PortRegistry:
                  validator: Optional[ValidatorFunc] = None,
                  formatter: Optional[Callable[[Any], str]] = None,
                  casts_to: Optional[Dict[Union[int, str], ConverterFunc]] = None) -> PortType:
+        """Register a port type.
 
+        Idempotent on ``name``: if a port type with the same
+        (case-insensitive) name is already registered, the existing
+        :class:`PortType` is returned and all other arguments are
+        ignored.  This makes the function safe to call from modules
+        that may be re-imported (plugin reload, test runners, hot
+        module replacement, etc.) without raising ``ValueError``.
+
+        ``color_index`` is wrapped into the valid palette range
+        ``[0, 255]`` via modulo, so an out-of-range value such as 300
+        silently becomes 44.  Duplicate colour usage across different
+        port types is permitted by design.
+        """
         lower_name = name.lower()
+
+        # Idempotent re-registration: if the name is already known,
+        # return the existing entry and skip everything else. This
+        # prevents ValueError on re-imports / plugin reloads.
+        existing = cls._by_name.get(lower_name)
+        if existing is not None:
+            log.debug(
+                "Port type '%s' already registered (type_id=%d) — "
+                "returning existing instance",
+                existing.name, existing.type_id,
+            )
+            return existing
 
         # Auto-assign ID if not provided
         if type_id is None:
             type_id = cls.next_type_id()
 
-        # Auto-assign colour index if not provided
+        # Auto-assign colour index if not provided; otherwise wrap any
+        # caller-supplied value into the valid palette range so that
+        # resolve_color() can always find a slot.
         if color_index is None:
             color_index = cls.next_color_index()
+        else:
+            wrapped = color_index % 256
+            if wrapped != color_index:
+                log.debug("Port '%s': color_index %d wrapped to %d",
+                          name, color_index, wrapped)
+            color_index = wrapped
 
-        # Collision guards
+        # type_id collision is still a real error (the name guard is
+        # handled above by the idempotency short-circuit).
         if type_id in cls._by_id:
-            raise ValueError(f"type_id {type_id} already registered to '{cls._by_id[type_id].name}'")
-        if lower_name in cls._by_name:
-            raise ValueError(f"Port name '{name}' already registered")
+            existing_name = cls._by_id[type_id].name
+            log.error(
+                "Cannot register port '%s': type_id %d already taken by '%s'",
+                name, type_id, existing_name,
+            )
+            raise ValueError(f"type_id {type_id} already registered to '{existing_name}'")
 
         # Determine default factory
         fact = default if callable(default) else (lambda: default)
@@ -178,12 +226,23 @@ class PortRegistry:
         cls._by_name[lower_name] = new_type
         cls._by_id[type_id] = new_type
 
+        log.debug(
+            "Registered port type '%s' (type_id=%d, color_index=%d, base_type_id=%d)",
+            name, type_id, color_index, base_type_id,
+        )
+
         # Register explicit casts
         if casts_to:
             for target, converter in casts_to.items():
                 target_id = cls._resolve_target_id(target)
                 if target_id != -1:
                     cls._cast_registry[(type_id, target_id)] = converter
+                else:
+                    log.warning(
+                        "Port '%s': cast target %r is not a known port "
+                        "type — cast skipped",
+                        name, target,
+                    )
 
         return new_type
 
@@ -509,7 +568,7 @@ def setup_default_ports():
         _cast[(11, 80)] = lambda x: np.array(x)    # Float -> NdArray
         _cast[(12, 80)] = lambda x: np.array(x)    # Int -> NdArray
     except ImportError:
-        pass
+        log.info("numpy not available — 'NdArray' port type will not be registered")
 
     # --- Polars DataFrame ---
     try:
@@ -536,7 +595,7 @@ def setup_default_ports():
             _cast[(80, 81)] = lambda arr: pl.DataFrame({f"col_{i}": arr[:, i] for i in range(arr.shape[1])} if arr.ndim == 2 else {"col_0": arr})
             _cast[(81, 80)] = lambda df: df.to_numpy()
     except ImportError:
-        pass
+        log.info("polars not available — 'DataFrame' port type will not be registered")
 
     # ========================================================================
     # IMAGE TYPES
@@ -596,7 +655,7 @@ def setup_default_ports():
             _cast[(103, 80)] = lambda img: np.array(img)
             _cast[(80, 103)] = lambda arr: PILImageLib.fromarray(arr.astype('uint8'))
     except ImportError:
-        pass
+        log.info("Pillow not available — 'PILImage' port type will not be registered")
 
     # ========================================================================
     # UTILITIES
@@ -674,6 +733,11 @@ def setup_default_ports():
             30: lambda e: f"{type(e).__name__}: {e}",
             20: lambda e: False,
         }
+    )
+
+    log.info(
+        "PortRegistry initialised: %d port types, %d cast rules",
+        len(PortRegistry._by_id), len(PortRegistry._cast_registry),
     )
 
 

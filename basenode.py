@@ -23,7 +23,7 @@ import sys
 import uuid
 import weakref
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Final, ClassVar, Callable
+from typing import Any, Dict, List, Optional, Set, Final, ClassVar, Callable, Type
 from dataclasses import dataclass, field
 
 from pathlib import Path
@@ -695,6 +695,17 @@ class BaseControlNode(Node, NodeDataFlow):
                         scene._eval_fence = current - 1
                         _dbg(f"fence decrement: {current} -> {current - 1} "
                              f"(node holds {self._fence_token})")
+                        # Notify listeners (e.g. UndoManager) when the canvas
+                        # becomes idle — this lets them stop polling and
+                        # react immediately. Tolerant of canvases that do
+                        # not define the signal (graceful no-op).
+                        if scene._eval_fence == 0:
+                            sig = getattr(scene, 'eval_fence_idle', None)
+                            if sig is not None:
+                                try:
+                                    sig.emit()
+                                except (RuntimeError, AttributeError):
+                                    pass
                 else:
                     _dbg(f"WARNING: Cannot decrement fence, scene gone. "
                          f"Node held {self._fence_token + 1} -> {self._fence_token}")
@@ -773,6 +784,57 @@ class BaseControlNode(Node, NodeDataFlow):
             QTimer.singleShot(0, self._fenced_evaluate)
         elif self._manual_mode:
             self.update()
+
+    @classmethod
+    def register_port_type(cls,
+                           name: str,
+                           color_index: Optional[int] = None,
+                           type_id: Optional[int] = None,
+                           python_type: Optional[Type] = None,
+                           base_type_id: int = -1,
+                           default: Any = None,
+                           validator: Optional[Callable[[Any], bool]] = None,
+                           formatter: Optional[Callable[[Any], str]] = None,
+                           casts_to: Optional[Dict[Any, Callable[[Any], Any]]] = None) -> "PortType":
+        """Register a custom port type with the global :class:`PortRegistry`.
+    
+        Thin convenience wrapper so subclasses don't have to import
+        ``PortRegistry`` directly.  All arguments are forwarded verbatim.
+    
+        Args:
+            name:         Unique human-readable type name (e.g. ``"Vector3"``).
+            color_index:  Index into the active theme's
+                          ``trace_color_palette`` (``StyleCategory.TRACE``).
+                          Built-in types occupy 0–255; custom types should
+                          use indices ≥256, or pass ``None`` to auto-assign
+                          from the next free slot.
+            type_id:      Unique numeric ID.  ``None`` auto-assigns from 200+.
+            python_type:  Python type the port carries.
+            base_type_id: Parent type ID for upcasting (``-1`` = no parent).
+            default:      Default value or zero-arg factory.
+            validator:    ``Callable[[Any], bool]`` validating values.
+            formatter:    ``Callable[[Any], str]`` for UI display.
+            casts_to:     ``{target_id_or_name: converter_fn}`` explicit
+                          outbound casts from this type.
+    
+        Returns:
+            The newly registered :class:`PortType`.
+    
+        Raises:
+            ValueError: If ``name`` or ``type_id`` is already registered.
+        """
+        from weave.node.portregistry import PortRegistry
+        return PortRegistry.register(
+            name=name,
+            color_index=color_index,
+            type_id=type_id,
+            python_type=python_type,
+            base_type_id=base_type_id,
+            default=default,
+            validator=validator,
+            formatter=formatter,
+            casts_to=casts_to,
+        )
 
     def on_port_connection_changed(self, port) -> None:
         """
