@@ -157,19 +157,69 @@ class ConnectionDragState(CanvasInteractionState):
         if self._detachment_occurred and mgr:
             mgr.end_macro()
 
-        # Capture before on_exit() cleans up drag visuals
+        # Capture connection details
         released_on_empty = self.snapped_port is None
         source_port = self.start_port
         drop_pos = event.scenePos()
 
-        self.request_transition("default")
-
-        # Show compatible node menu when released on empty canvas
+        # Show compatible node menu when released on empty canvas BEFORE transitioning.
+        # This keeps the drag trace visible in the scene while the (blocking) menu is active.
         if released_on_empty and source_port is not None:
             if hasattr(self.canvas, 'show_compatible_node_menu'):
                 self.canvas.show_compatible_node_menu(source_port, drop_pos)
+                
+        # Transition to default state, which calls on_exit() and cleans up the trace visuals.
+        # This will now only execute after the user has interacted with or closed the menu.
+        self.request_transition("default")
 
         return True
+
+    # def on_mouse_release(self, event: QGraphicsSceneMouseEvent) -> bool:
+    #     if event.button() != Qt.MouseButton.LeftButton:
+    #         return True
+
+    #     # Pending detach that never moved far enough → keep original
+    #     if self._pending_detach_port and not self._detachment_occurred:
+    #         self.request_transition("default")
+    #         return True
+
+    #     mgr = None
+    #     provider = getattr(self.canvas, "_context_menu_provider", None)
+    #     if provider and hasattr(provider, "_undo_manager"):
+    #         mgr = provider._undo_manager
+
+    #     # Open an Undo macro to bundle detachment and (optional) reconnection
+    #     if self._detachment_occurred and mgr:
+    #         mgr.begin_macro("Reconnect Trace" if self.snapped_port else "Disconnect Trace")
+    #         if self._detached_trace_tuple:
+    #             from weave.canvas.undo_commands import RemoveConnectionsCommand
+    #             mgr.push(RemoveConnectionsCommand([self._detached_trace_tuple]))
+
+    #     if self.snapped_port:
+    #         self._finalize_connection()
+    #     elif self._detachment_occurred and self._detached_target_node is not None:
+    #         node = self._detached_target_node
+    #         if hasattr(node, "set_dirty"):
+    #             node.set_dirty("disconnect")
+    #         elif hasattr(node, "evaluate"):
+    #             node.evaluate()
+
+    #     if self._detachment_occurred and mgr:
+    #         mgr.end_macro()
+
+    #     # Capture before on_exit() cleans up drag visuals
+    #     released_on_empty = self.snapped_port is None
+    #     source_port = self.start_port
+    #     drop_pos = event.scenePos()
+
+    #     self.request_transition("default")
+
+    #     # Show compatible node menu when released on empty canvas
+    #     if released_on_empty and source_port is not None:
+    #         if hasattr(self.canvas, 'show_compatible_node_menu'):
+    #             self.canvas.show_compatible_node_menu(source_port, drop_pos)
+
+    #     return True
 
     # ------------------------------------------------------------------
     # Internal
