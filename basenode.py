@@ -823,7 +823,7 @@ class BaseControlNode(Node, NodeDataFlow):
         Raises:
             ValueError: If ``name`` or ``type_id`` is already registered.
         """
-        from weave.node.portregistry import PortRegistry
+        from weave.portregistry import PortRegistry
         return PortRegistry.register(
             name=name,
             color_index=color_index,
