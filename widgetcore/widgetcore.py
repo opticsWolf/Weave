@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 """
+Weave: A modular PySide6 framework for the visual synthesis
+and execution of high-concurrency simulation workflows.
+Copyright (c) 2026 opticsWolf
+
+SPDX-License-Identifier: Apache-2.0
+
 WidgetCore: Central UI state manager for Weave nodes.
 Strictly adheres to PySide6 safety protocols and deterministic undo/redo state.
 """
@@ -9,7 +15,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, Union
 
 from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLayout
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLayout, QCheckBox, QRadioButton
 
 from weave.logger import get_logger
 from weave.stylemanager import StyleManager, StyleCategory
@@ -208,7 +214,9 @@ class WidgetCore(QWidget, ProxyMixin, ThemeMixin):
         self._bindings[port_name] = binding
         self._widget_to_port[id(widget)] = port_name
 
-        widget.setAutoFillBackground(True)
+        #widget.setAutoFillBackground(True)
+        if not isinstance(widget, (QCheckBox, QRadioButton)):
+            widget.setAutoFillBackground(True)
 
         if add_to_layout and self.layout() is not None:
             self.layout().addWidget(widget)
