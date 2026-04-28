@@ -9,57 +9,6 @@ SPDX-License-Identifier: Apache-2.0
 numpy_complex_combiner_node.py
 -------------------------------
 Combines two numeric inputs into a single complex-valued NumPy array.
-
-Provided node
--------------
-``NumpyComplexCombinerNode``
-    Takes a *Real* input and an *Imaginary* input and assembles them
-    into a ``complex128`` ``ndarray``.
-
-    Accepted input types
-    ~~~~~~~~~~~~~~~~~~~~
-    ========================= ==========================================
-    Incoming type              Behaviour
-    ========================= ==========================================
-    ``ndarray`` complex dtype  ``.real`` / ``.imag`` extracted
-    ``ndarray`` real/int dtype values used as-is
-    ``list`` / ``tuple``       converted via ``numpy.asarray``; if the
-                               conversion fails an ERROR is logged and
-                               the fallback spinbox value is used
-    ``int`` / ``float``        wrapped in a length-1 array
-    Not connected / ``None``   fallback spinbox value used
-    Any other type             WARNING logged, fallback used
-    ========================= ==========================================
-
-    Dimension alignment
-    ~~~~~~~~~~~~~~~~~~~
-    When the two arrays have different numbers of dimensions the
-    higher-rank array is reduced to match the lower rank by merging
-    its leading axes:
-
-    * ``(2, 3, 4)`` → 2-D : reshape to ``(6, 4)``
-    * ``(2, 3, 4)`` → 1-D : reshape to ``(24,)``
-
-    Shape mismatch behaviour (axis-0 length)
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    Controlled by the *Mismatch* combo in the node body:
-
-    ============= ==========================================================
-    Truncate      Clip both arrays to ``min(len_re, len_im)``.
-    Continue      Extend the shorter array by repeating its last element
-                  until both arrays reach ``max(len_re, len_im)``.
-    Fill          Extend the shorter array with zeros until both arrays
-                  reach ``max(len_re, len_im)``.
-    ============= ==========================================================
-
-    Every adjustment is reported at ``INFO`` level via the Weave logger.
-
-    Outputs
-    -------
-    array : ndarray (complex128)
-        ``real_part + 1j * imag_part``
-
-    Type: Active (propagates downstream on any change).
 """
 
 from __future__ import annotations
@@ -67,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Signal, Slot
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -78,8 +27,8 @@ from PySide6.QtWidgets import (
 
 from weave.threadednodes import ThreadedNode
 from weave.noderegistry import register_node
-from weave.widgetcore import WidgetCore
-
+from weave.widgetcore import WidgetCore, PortRole
+from weave.node import VerticalSizePolicy
 from weave.logger import get_logger
 
 log = get_logger("NumpyComplexCombinerNode")
@@ -130,11 +79,6 @@ class NumpyComplexCombinerNode(ThreadedNode):
     -------
     array : ndarray (complex128)
         ``real_part + 1j * imag_part``
-
-    Parameters
-    ----------
-    title : str
-        Node title (default ``"Complex Combiner"``).
     """
 
     array_changed = Signal(object)   # emits ndarray
@@ -145,39 +89,43 @@ class NumpyComplexCombinerNode(ThreadedNode):
     node_description: ClassVar[Optional[str]] = (
         "Combines real and imaginary inputs into a complex128 ndarray"
     )
-    node_tags: ClassVar[Optional[List[str]]] = [
+    node_tags: ClassVar[List[str]] = [
         "numpy", "complex", "combiner", "array", "real", "imaginary",
         "generator", "primitive",
     ]
+    vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
     def __init__(self, title: str = "Complex Combiner", **kwargs: Any) -> None:
         super().__init__(title=title, **kwargs)
 
-        # ── Input ports (auto-disable matching spinboxes) ─────────────
-        self.add_input("real", "ndarray"); self.inputs[-1]._auto_disable = True
-        self.add_input("imag", "ndarray"); self.inputs[-1]._auto_disable = True
+        # ── Input ports (auto-disable matching spinboxes when connected) ──
+        self.add_input("real", "ndarray")
+        self.inputs[-1]._auto_disable = True
+        
+        self.add_input("imag", "ndarray")
+        self.inputs[-1]._auto_disable = True
 
         self.add_output("array", "ndarray")
 
-        # ── Form layout ───────────────────────────────────────────────
+        # ── Form layout & WidgetCore initialization ───────────────────
         form = QFormLayout()
         form.setContentsMargins(5, 5, 5, 5)
         form.setSpacing(4)
         self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
-        # ── Mismatch behaviour combo (internal) ───────────────────────
+        # ── Mismatch behaviour combo (internal state → inputs dict) ───
         self._combo_mismatch = QComboBox()
         for label, _ in _MISMATCH_OPTIONS:
             self._combo_mismatch.addItem(label)
         form.addRow("Mismatch:", self._combo_mismatch)
         self._widget_core.register_widget(
-            "mismatch", self._combo_mismatch,
-            role="internal", datatype="string", default="truncate",
-            add_to_layout=False,
+            "mismatch_mode", self._combo_mismatch,
+            role=PortRole.INTERNAL, datatype="string", default="truncate",
+            add_to_layout=False
         )
 
-        # ── Scalar fallbacks ──────────────────────────────────────────
+        # ── Scalar fallbacks (internal state → inputs dict) ───────────
         form.addRow(_make_separator())
         form.addRow(QLabel("Fallback scalars:"))
 
@@ -185,48 +133,33 @@ class NumpyComplexCombinerNode(ThreadedNode):
         form.addRow("Real:", self._spin_real)
         self._widget_core.register_widget(
             "real_fallback", self._spin_real,
-            role="internal", datatype="float", default=0.0,
-            add_to_layout=False,
+            role=PortRole.INTERNAL, datatype="float", default=0.0,
+            add_to_layout=False
         )
 
         self._spin_imag = self._make_spin(0.0)
         form.addRow("Imag:", self._spin_imag)
         self._widget_core.register_widget(
             "imag_fallback", self._spin_imag,
-            role="internal", datatype="float", default=0.0,
-            add_to_layout=False,
+            role=PortRole.INTERNAL, datatype="float", default=0.0,
+            add_to_layout=False
         )
 
-        # ── Status display ────────────────────────────────────────────
+        # ── Status display (main-thread only) ────────────────────────
         form.addRow(_make_separator())
         self._label_status = QLabel("--")
         self._label_status.setEnabled(False)
         self._label_status.setWordWrap(True)
         form.addRow(self._label_status)
 
-        self._widget_core.value_changed.connect(self._on_core_changed)
+        # ── Signal wiring & content attachment ───────────────────────
+        self._widget_core.value_changed.connect(self.on_ui_change)
         self.set_content_widget(self._widget_core)
-        self._widget_core.patch_proxy()
-        self._widget_core.refresh_widget_palettes()
+        
+        if hasattr(self._widget_core, 'patch_proxy'):
+            self._widget_core.patch_proxy()
 
-        self._pending_status: Optional[str] = None
-
-    # ── Widget snapshot (main thread → worker thread) ─────────────────────────
-
-    def snapshot_widget_inputs(self) -> Dict[str, Any]:
-        """Capture combo and spinbox fallbacks before worker dispatch."""
-        idx = self._combo_mismatch.currentIndex()
-        return {
-            "_ui_mismatch":      (
-                _MISMATCH_OPTIONS[idx][1]
-                if 0 <= idx < len(_MISMATCH_OPTIONS) else "truncate"
-            ),
-            "_ui_real_fallback": self._spin_real.value(),
-            "_ui_imag_fallback": self._spin_imag.value(),
-        }
-
-    # ── Widget factory ────────────────────────────────────────────────────────
-
+    # ── Widget factory ───────────────────────────────────────────────
     @staticmethod
     def _make_spin(default: float) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
@@ -236,259 +169,144 @@ class NumpyComplexCombinerNode(ThreadedNode):
         spin.setMinimumWidth(110)
         return spin
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    # ── Type conversion ───────────────────────────────────────────────────────
-
+    # ── Type conversion helper ───────────────────────────────────────
     @classmethod
     def _to_float64(
-        cls,
-        value: Any,
-        component: str,   # "real" or "imag" — for complex ndarray extraction
-        fallback: float,
-        port_name: str,
+        cls, value: Any, component: str, fallback: float, port_name: str
     ) -> Tuple[np.ndarray, bool]:
-        """
-        Convert *value* to a float64 ndarray representing *component*.
-
-        Returns ``(array, is_fallback)``.  *is_fallback* is ``True``
-        whenever the spinbox default was used instead of the input.
-
-        Accepted types
-        --------------
-        None             → fallback scalar (not connected)
-        int / float      → length-1 array
-        list / tuple     → ``np.asarray``; ERROR + zero fallback on failure
-        ndarray complex  → ``.real`` or ``.imag`` extracted
-        ndarray other    → cast to float64 as-is
-        anything else    → WARNING + zero fallback
-        """
-        # ── Not connected ─────────────────────────────────────────────
         if value is None:
             return np.array([fallback], dtype=np.float64), True
 
-        # ── Scalar int / float ────────────────────────────────────────
         if isinstance(value, bool):
-            # bool is a subclass of int — treat as numeric 0/1
             return np.array([float(value)], dtype=np.float64), False
         if isinstance(value, (int, float)):
             return np.array([float(value)], dtype=np.float64), False
 
-        # ── list / tuple ──────────────────────────────────────────────
         if isinstance(value, (list, tuple)):
             try:
                 arr = np.asarray(value, dtype=np.float64)
-                if arr.ndim == 0:
-                    arr = arr.reshape(1)
-                return arr, False
+                return arr.reshape(1) if arr.ndim == 0 else arr, False
             except (ValueError, TypeError) as exc:
-                log.error(
-                    "Port '%s': cannot convert %s to float64 ndarray -- %s"
-                    " -- using fallback value 0",
-                    port_name, type(value).__name__, exc,
-                )
+                log.error("Port '%s': conversion failed -- %s", port_name, exc)
                 return np.array([0.0], dtype=np.float64), True
 
-        # ── ndarray ───────────────────────────────────────────────────
         if isinstance(value, np.ndarray):
             if np.issubdtype(value.dtype, np.complexfloating):
                 part = value.real if component == "real" else value.imag
                 return part.astype(np.float64), False
             return value.astype(np.float64), False
 
-        # ── Unsupported type ──────────────────────────────────────────
-        log.warning(
-            "Port '%s': unsupported type %s -- using fallback value 0",
-            port_name, type(value).__name__,
-        )
+        log.warning("Port '%s': unsupported type %s", port_name, type(value).__name__)
         return np.array([0.0], dtype=np.float64), True
 
-    # ── Dimension helpers ─────────────────────────────────────────────────────
-
+    # ── Dimension alignment helpers ──────────────────────────────────
     @staticmethod
     def _reduce_dims(arr: np.ndarray, target_ndim: int) -> np.ndarray:
-        """
-        Reduce *arr* to *target_ndim* dimensions by merging leading axes.
-
-        ``(2, 3, 4)`` → target 2 → ``(6, 4)``
-        ``(2, 3, 4)`` → target 1 → ``(24,)``
-        """
         if arr.ndim <= target_ndim:
             return arr
-        leading   = arr.ndim - target_ndim
-        merged    = int(np.prod(arr.shape[:leading + 1]))
-        new_shape = (merged,) + arr.shape[leading + 1:]
-        return arr.reshape(new_shape)
+        leading = arr.ndim - target_ndim
+        merged  = int(np.prod(arr.shape[:leading + 1]))
+        return arr.reshape((merged,) + arr.shape[leading + 1:])
 
     @staticmethod
-    def _align_length(
-        re: np.ndarray,
-        im: np.ndarray,
-        mode: str,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Align the axis-0 lengths of *re* and *im* according to *mode*.
-
-        truncate
-            Clip both to ``min(len_re, len_im)``.
-        continue
-            Extend the shorter array by repeating its last element.
-        fill
-            Extend the shorter array with zeros.
-
-        Returns the (possibly modified) pair ``(re, im)``.
-        """
-        lr, li = re.shape[0], im.shape[0]
+    def _align_length(re_arr: np.ndarray, im_arr: np.ndarray, mode: str) -> Tuple[np.ndarray, np.ndarray]:
+        lr, li = re_arr.shape[0], im_arr.shape[0]
         if lr == li:
-            return re, im
+            return re_arr, im_arr
 
         if mode == "truncate":
             n = min(lr, li)
-            return re[:n], im[:n]
+            return re_arr[:n], im_arr[:n]
 
         n = max(lr, li)
-
         if mode == "continue":
             if lr < n:
-                pad = np.repeat(re[-1:], n - lr, axis=0)
-                re  = np.concatenate([re, pad], axis=0)
+                pad = np.repeat(re_arr[-1:], n - lr, axis=0)
+                re_arr = np.concatenate([re_arr, pad], axis=0)
             if li < n:
-                pad = np.repeat(im[-1:], n - li, axis=0)
-                im  = np.concatenate([im, pad], axis=0)
-
+                pad = np.repeat(im_arr[-1:], n - li, axis=0)
+                im_arr = np.concatenate([im_arr, pad], axis=0)
         elif mode == "fill":
             if lr < n:
-                pad = np.zeros((n - lr,) + re.shape[1:], dtype=re.dtype)
-                re  = np.concatenate([re, pad], axis=0)
+                pad = np.zeros((n - lr,) + re_arr.shape[1:], dtype=re_arr.dtype)
+                re_arr = np.concatenate([re_arr, pad], axis=0)
             if li < n:
-                pad = np.zeros((n - li,) + im.shape[1:], dtype=im.dtype)
-                im  = np.concatenate([im, pad], axis=0)
+                pad = np.zeros((n - li,) + im_arr.shape[1:], dtype=im_arr.dtype)
+                im_arr = np.concatenate([im_arr, pad], axis=0)
+        return re_arr, im_arr
 
-        return re, im
-
-    # ── Slots ─────────────────────────────────────────────────────────────────
-
-    @Slot(str)
-    def _on_core_changed(self, _port_name: str) -> None:
-        try:
-            self.on_ui_change()
-        except Exception as exc:
-            log.error(
-                "Exception in NumpyComplexCombinerNode._on_core_changed: %s", exc
-            )
-
-    # ── Computation ───────────────────────────────────────────────────────────
-
+    # ── Background Computation (STRICTLY THREAD-SAFE) ────────────────
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        1. Convert both inputs to float64 ndarrays.
-        2. Align rank (reduce higher-D to lower-D by merging leading axes).
-        3. Align axis-0 length using the selected mismatch strategy.
-        4. Combine into complex128.
+        if self.is_compute_cancelled():
+            return {"array": np.array([], dtype=np.complex128)}
 
-        Runs on the worker thread — no Qt widget access.
-        Fallback scalars and mismatch mode arrive pre-snapshotted.
-        """
         try:
-            fb_real  = float(inputs.get("_ui_real_fallback", 0.0))
-            fb_imag  = float(inputs.get("_ui_imag_fallback", 0.0))
-            mismatch = inputs.get("_ui_mismatch", "truncate")
+            fb_real  = float(inputs.get("real_fallback", 0.0))
+            fb_imag  = float(inputs.get("imag_fallback", 0.0))
+            
+            # Handle combo box value (may be string or index depending on Weave version)
+            raw_mode = inputs.get("mismatch_mode", "truncate")
+            if isinstance(raw_mode, int):
+                mode = _MISMATCH_OPTIONS[raw_mode][1] if 0 <= raw_mode < len(_MISMATCH_OPTIONS) else "truncate"
+            else:
+                mode = str(raw_mode).lower()
 
-            re, re_fallback = self._to_float64(
-                inputs.get("real"), "real", fb_real, "real"
-            )
-            im, im_fallback = self._to_float64(
-                inputs.get("imag"), "imag", fb_imag, "imag"
-            )
+            re_arr, re_fb = self._to_float64(inputs.get("real"), "real", fb_real, "real")
+            im_arr, im_fb = self._to_float64(inputs.get("imag"), "imag", fb_imag, "imag")
 
-            # ── Step 1 — Dimension alignment ──────────────────────────
-            if re.ndim != im.ndim:
-                target_ndim = min(re.ndim, im.ndim)
+            # Dimension alignment
+            if re_arr.ndim != im_arr.ndim:
+                target_ndim = min(re_arr.ndim, im_arr.ndim)
+                if re_arr.ndim > target_ndim:
+                    old_s = re_arr.shape
+                    re_arr = self._reduce_dims(re_arr, target_ndim)
+                    log.info("Real reduced %s → %s", old_s, re_arr.shape)
+                if im_arr.ndim > target_ndim:
+                    old_s = im_arr.shape
+                    im_arr = self._reduce_dims(im_arr, target_ndim)
+                    log.info("Imag reduced %s → %s", old_s, im_arr.shape)
 
-                if re.ndim > target_ndim:
-                    old_shape = re.shape
-                    re = self._reduce_dims(re, target_ndim)
-                    log.info(
-                        "Real: reduced from %d-D %s to %d-D %s "
-                        "(merged leading axes to match imaginary rank)",
-                        len(old_shape), old_shape, re.ndim, re.shape,
-                    )
+            # Axis-0 length alignment
+            if re_arr.shape[0] != im_arr.shape[0]:
+                log.info("Aligning axis-0: real=%d, imag=%d (mode='%s')", 
+                         re_arr.shape[0], im_arr.shape[0], mode)
+                re_arr, im_arr = self._align_length(re_arr, im_arr, mode)
 
-                if im.ndim > target_ndim:
-                    old_shape = im.shape
-                    im = self._reduce_dims(im, target_ndim)
-                    log.info(
-                        "Imag: reduced from %d-D %s to %d-D %s "
-                        "(merged leading axes to match real rank)",
-                        len(old_shape), old_shape, im.ndim, im.shape,
-                    )
-
-            # ── Step 2 — Axis-0 length alignment ──────────────────────
-            len_re = re.shape[0]
-            len_im = im.shape[0]
-
-            if len_re != len_im:
-                log.info(
-                    "Shape mismatch: real axis-0=%d, imag axis-0=%d "
-                    "-- applying '%s' strategy",
-                    len_re, len_im, mismatch,
-                )
-                re, im = self._align_length(re, im, mismatch)
-                log.info(
-                    "After alignment: real=%s, imag=%s",
-                    re.shape, im.shape,
-                )
-
-            # ── Step 3 — Combine ──────────────────────────────────────
-            result: np.ndarray = re + 1j * im   # always complex128
-
-            # ── Build status label ────────────────────────────────────
-            shape_str = "x".join(str(d) for d in result.shape)
-            status = f"shape: ({shape_str})\ndtype: complex128"
-            if re_fallback or im_fallback:
-                parts = []
-                if re_fallback:
-                    parts.append(f"real={fb_real:.4g}")
-                if im_fallback:
-                    parts.append(f"imag={fb_imag:.4g}")
-                status += f"\nfallback: {', '.join(parts)}"
-            self._pending_status = status
+            # Combine
+            result = (re_arr + 1j * im_arr).astype(np.complex128)
+            
+            if self.is_compute_cancelled():
+                return {"array": np.array([], dtype=np.complex128)}
 
             return {"array": result}
 
         except Exception as exc:
-            log.error(
-                "Exception in NumpyComplexCombinerNode.compute: %s", exc
-            )
-            self._pending_status = f"error: {exc}"
+            log.error("NumpyComplexCombinerNode.compute failed: %s", exc)
             return {"array": np.array([], dtype=np.complex128)}
 
-    # ── Post-evaluation UI flush ──────────────────────────────────────────────
-
+    # ── Main-Thread Post-Evaluation Hook ─────────────────────────────
     def on_evaluate_finished(self) -> None:
-        """Flush status label and emit array_changed on the main thread."""
         try:
-            if self._pending_status is not None:
-                try:
-                    self._label_status.setText(self._pending_status)
-                except RuntimeError:
-                    pass
-                self._pending_status = None
+            result = self._get_cached_value("array")
+            
+            if result is not None and isinstance(result, np.ndarray):
+                shape_str = "×".join(str(d) for d in result.shape) or "scalar"
+                status_text = f"shape: ({shape_str})\ndtype: complex128"
+                self._label_status.setText(status_text)
+            else:
+                self._label_status.setText("--")
 
-            result = self.get_output_value("array")
             if result is not None:
                 self.array_changed.emit(result)
+                
         except Exception as exc:
-            log.error(
-                "Exception in NumpyComplexCombinerNode.on_evaluate_finished: %s",
-                exc,
-            )
+            log.error("Exception in on_evaluate_finished: %s", exc)
         finally:
             super().on_evaluate_finished()
 
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-
+    # ── Lifecycle Cleanup ────────────────────────────────────────────
     def cleanup(self) -> None:
-        self._pending_status = None
+        if hasattr(self, 'cancel_compute'):
+            self.cancel_compute()
         self._widget_core.cleanup()
         super().cleanup()

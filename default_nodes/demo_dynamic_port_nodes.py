@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Dict, List, Optional
 
-from PySide6.QtCore import Signal, Slot
+from PySide6.QtCore import Slot
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
@@ -53,8 +53,8 @@ from PySide6.QtWidgets import (
 
 from weave.basenode import ActiveNode
 from weave.noderegistry import register_node
-from weave.widgetcore import WidgetCore
-
+from weave.widgetcore import WidgetCore, PortRole
+from weave.node import VerticalSizePolicy
 from weave.logger import get_logger
 
 log = get_logger("DemoDynamicPorts")
@@ -75,21 +75,6 @@ class TypeAdapterNode(ActiveNode):
     """
     Passthrough node that adapts its output port type to match
     whatever is connected to its input.
-
-    Starts with:
-        input  ``data_in``   datatype = ``"generic"``
-        output ``data_out``  datatype = ``"generic"``
-
-    When a trace connects to ``data_in``, ``compute()`` reads the
-    source port's ``datatype`` attribute.  If it differs from the
-    current output, the old output port is removed and a new one is
-    created with the matching type.  On disconnect the output reverts
-    to ``"generic"``.
-
-    The node body shows a read-only status label reflecting the
-    current adapted type.
-
-    Type: Active (propagates downstream immediately).
     """
 
     node_class:       ClassVar[str]            = "Demo"
@@ -101,60 +86,64 @@ class TypeAdapterNode(ActiveNode):
     node_tags: ClassVar[Optional[List[str]]] = [
         "demo", "adapter", "type", "dynamic", "passthrough",
     ]
+    # R3.1: Required for dynamic UI nodes
+    vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
     def __init__(self, title: str = "Type Adapter", **kwargs: Any) -> None:
+        # R4.1: Step 1 - super init
         super().__init__(title=title, **kwargs)
 
         _dbg("TypeAdapterNode.__init__: creating ports")
 
-        # ── Ports ─────────────────────────────────────────────────────
-        self.add_input("data_in", "generic")
-        self.add_output("data_out", "generic")
+        # R4.1: Step 1 - Add ports (R5.1: lowercase datatypes, "any" replaces "generic")
+        self.add_input("data_in", datatype="any")
+        self.add_output("data_out", datatype="any")
 
         _dbg(f"  inputs:  {[p.name for p in self.inputs]}")
         _dbg(f"  outputs: {[p.name for p in self.outputs]}")
 
-        # Track the current output datatype so we know when to swap
-        self._current_out_type: str = "generic"
+        self._current_out_type: str = "any"
 
-        # ── Widget: status label ──────────────────────────────────────
-        form = QFormLayout()
-        form.setContentsMargins(5, 5, 5, 5)
-        form.setSpacing(4)
+        # R4.1: Step 2 - Layout + WidgetCore
+        form = QFormLayout(); form.setContentsMargins(5, 5, 5, 5); form.setSpacing(4)
         self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
-        self._label_type = QLabel("generic")
+        # R4.1: Step 3 - Create widget & place in layout
+        self._label_type = QLabel("any")
         self._label_type.setEnabled(False)
         self._label_type.setMinimumWidth(120)
         form.addRow("Type:", self._label_type)
 
+        # R4.1: Step 4 - Wire signals (R7.1/R7.2)
+        self._widget_core.value_changed.connect(self._on_value_changed)
+        self._widget_core.port_value_written.connect(self._on_port_value_written)
+
+        # R4.1: Step 5 & 6 - Mount + Patch
         self.set_content_widget(self._widget_core)
-        self._widget_core.patch_proxy()
+        if hasattr(self._widget_core, 'patch_proxy'):
+            self._widget_core.patch_proxy()
         self._widget_core.refresh_widget_palettes()
 
         _dbg("TypeAdapterNode.__init__: done")
 
     # ── Port type adaptation ──────────────────────────────────────────────
 
-    def _detect_input_type(self) -> str:
-        """Read the datatype of the port connected to ``data_in``."""
-        in_port = self.find_port("data_in", is_output=False)
-        if in_port is None:
-            return "generic"
-
-        traces = getattr(in_port, 'connected_traces', [])
-        if not traces:
-            return "generic"
-
-        src_port = getattr(traces[0], 'source', None)
-        if src_port is None:
-            return "generic"
-
-        dtype = getattr(src_port, 'datatype', "generic")
-        _dbg(f"_detect_input_type: source port '{src_port.name}' "
-             f"datatype='{dtype}'")
-        return dtype
+    def _detect_input_type(self, value: Any) -> str:
+        """R9.3: Inspect value type instead of port internals for thread-safety."""
+        if value is None:
+            return "any"
+        if isinstance(value, (int, float)):
+            return "float"
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, str):
+            return "str"
+        if isinstance(value, (list, tuple)):
+            return "list"
+        if isinstance(value, dict):
+            return "json"
+        return "any"
 
     def _adapt_output_type(self, new_type: str) -> None:
         """Remove the current output port and create a new one with
@@ -163,13 +152,11 @@ class TypeAdapterNode(ActiveNode):
         if new_type == self._current_out_type:
             return
 
-        old_type = self._current_out_type
-        _dbg(f"_adapt_output_type: '{old_type}' → '{new_type}'")
+        _dbg(f"_adapt_output_type: '{self._current_out_type}' → '{new_type}'")
 
-        # Remove old output
-        self.remove_port("data_out", is_output=True)
+        # R5.8: remove_ports is plural and takes a list
+        self.remove_ports(["data_out"], is_output=True)
 
-        # Create new output
         self.add_output("data_out", new_type)
         self._current_out_type = new_type
 
@@ -178,13 +165,24 @@ class TypeAdapterNode(ActiveNode):
         except RuntimeError:
             pass
 
+    # ── Slots ─────────────────────────────────────────────────────────────
+
+    @Slot(str)
+    def _on_value_changed(self, _port: str) -> None:
+        self.on_ui_change()
+
+    @Slot(str, object)
+    def _on_port_value_written(self, _port: str, _value: Any) -> None:
+        # R7.3: Structural sync mirror (no-op here, but required for undo safety)
+        pass
+
     # ── Computation ───────────────────────────────────────────────────────
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        detected = self._detect_input_type()
-        self._adapt_output_type(detected)
-
+        # R9.2: Read inputs via dict
         value = inputs.get("data_in")
+        detected = self._detect_input_type(value)
+        self._adapt_output_type(detected)
         return {"data_out": value}
 
     # ── Serialisation ────────────────────────────────────────────────────
@@ -197,20 +195,26 @@ class TypeAdapterNode(ActiveNode):
         return state
 
     def restore_state(self, state: Dict[str, Any]) -> None:
+        # R14.3: 1. Static restore first
         super().restore_state(state)
 
         ta = state.get("type_adapter", {})
-        self._current_out_type = ta.get("current_out_type", "generic")
+        self._current_out_type = ta.get("current_out_type", "any")
 
         try:
             self._label_type.setText(self._current_out_type)
         except RuntimeError:
             pass
 
+        # Rebuild output port if type changed during save
+        if self._current_out_type != "any":
+            self.remove_ports(["data_out"], is_output=True)
+            self.add_output("data_out", self._current_out_type)
+
     # ── Cleanup ──────────────────────────────────────────────────────────
 
     def cleanup(self) -> None:
-        self._widget_core.cleanup()
+        # R16.1: super() last
         super().cleanup()
 
 
@@ -222,24 +226,6 @@ class TypeAdapterNode(ActiveNode):
 class MultiFloatOutputNode(ActiveNode):
     """
     Node with a configurable number of float output ports.
-
-    A *Count* ``QSpinBox`` (range 1–16) controls how many outputs
-    exist.  Each output ``float_0``, ``float_1``, … has a matching
-    ``QDoubleSpinBox`` **registered with WidgetCore** via
-    ``register_widget()``.
-
-    When the count increases, new spinboxes are registered —
-    ``WidgetCore`` emits ``widget_registered`` and any connected dock
-    panel adds a mirror row automatically.
-
-    When the count decreases, spinboxes are unregistered —
-    ``WidgetCore`` emits ``widget_unregistered`` and dock panels
-    remove the mirror row.  No full panel rebuild is needed.
-
-    An integer input port ``count`` drives the spinbox value with
-    ``_auto_disable``.
-
-    Type: Active (propagates downstream on every change).
     """
 
     MAX_OUTPUTS: ClassVar[int] = 16
@@ -254,6 +240,8 @@ class MultiFloatOutputNode(ActiveNode):
     node_tags: ClassVar[Optional[List[str]]] = [
         "demo", "float", "multi", "dynamic", "generator",
     ]
+    # R3.1
+    vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
     # ── Construction ──────────────────────────────────────────────────────
 
@@ -263,56 +251,54 @@ class MultiFloatOutputNode(ActiveNode):
         initial_count: int = 2,
         **kwargs: Any,
     ) -> None:
+        # R4.1: Step 1
         super().__init__(title=title, **kwargs)
 
         _dbg("MultiFloatOutputNode.__init__: start")
 
-        # ── Count input port (auto-disables the spinbox) ──────────
-        self.add_input("count", "int")
-        self.inputs[-1]._auto_disable = True
+        # R4.1: Step 1 - Ports
+        self.add_input("count", datatype="int")
 
-        # ── Widget layout ─────────────────────────────────────────
-        form = QFormLayout()
-        form.setContentsMargins(5, 5, 5, 5)
-        form.setSpacing(4)
+        # R4.1: Step 2
+        form = QFormLayout(); form.setContentsMargins(5, 5, 5, 5); form.setSpacing(4)
         self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
-        # Count spinbox — registered with WidgetCore for mirroring
+        # R4.1: Step 3 - Widgets
         self._spin_count = QSpinBox()
         self._spin_count.setRange(1, self.MAX_OUTPUTS)
         self._spin_count.setValue(initial_count)
         self._spin_count.setMinimumWidth(60)
         form.addRow("Count:", self._spin_count)
 
+        # R6.1: Use PortRole enum. BIDIRECTIONAL drives auto-disable on connection.
         self._widget_core.register_widget(
             "count", self._spin_count,
-            role="bidirectional", datatype="int", default=2,
+            role=PortRole.BIDIRECTIONAL, datatype="int", default=2,
             add_to_layout=False,
         )
 
-        # Separator
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setFrameShadow(QFrame.Shadow.Sunken)
         form.addRow(sep)
 
-        # ── Dynamic state ─────────────────────────────────────────
         self._current_count: int = 0
 
-        # ── Finalise ──────────────────────────────────────────────
+        # R4.1: Step 4 - Wire BOTH signals for structural sync (R7.3)
+        self._widget_core.value_changed.connect(self._on_value_changed)
+        self._widget_core.port_value_written.connect(self._on_port_value_written)
+
+        # R4.1: Step 5 & 6
         self.set_content_widget(self._widget_core)
-        self._widget_core.patch_proxy()
+        if hasattr(self._widget_core, 'patch_proxy'):
+            self._widget_core.patch_proxy()
 
         # Build initial outputs (signals blocked to avoid mid-init compute)
         self._spin_count.blockSignals(True)
         self._set_count(initial_count)
         self._spin_count.blockSignals(False)
 
-        # Wire count change — the spinbox drives _set_count directly,
-        # and WidgetCore's value_changed handles upstream count changes.
-        self._spin_count.valueChanged.connect(self._on_count_changed)
-        self._widget_core.value_changed.connect(self._on_core_changed)
         self._widget_core.refresh_widget_palettes()
 
         _dbg(f"MultiFloatOutputNode.__init__: done, "
@@ -351,13 +337,11 @@ class MultiFloatOutputNode(ActiveNode):
         spin.setMinimumWidth(100)
         form.addRow(f"Float {i}:", spin)
 
-        # Register with WidgetCore — this:
-        #   1. Wires the spinbox's valueChanged → wc.value_changed
-        #   2. Emits widget_registered(port_name) so dock panels add a mirror
+        # R6.1: Use PortRole.OUTPUT enum
         self._widget_core.register_widget(
             port_name, spin,
-            role="output", datatype="float", default=self._DEFAULT_VALUE,
-            add_to_layout=False,  # already placed in the form above
+            role=PortRole.OUTPUT, datatype="float", default=self._DEFAULT_VALUE,
+            add_to_layout=False,
         )
 
         self.add_output(port_name, "float")
@@ -366,22 +350,13 @@ class MultiFloatOutputNode(ActiveNode):
              f"outputs now={[p.name for p in self.outputs]}")
 
     def _remove_float_outputs(self, from_idx: int, to_idx: int) -> None:
-        """Remove float outputs from *to_idx - 1* down to *from_idx* (LIFO).
-
-        For each output:
-        1. Unregister the widget from WidgetCore (emits ``widget_unregistered``
-           so dock panels remove the mirror row).
-        2. Remove the spinbox row from the node body's form layout.
-        3. Batch-remove the output ports.
-        """
+        """Remove float outputs from *to_idx - 1* down to *from_idx* (LIFO)."""
         form: QFormLayout = self._widget_core.layout()
 
         for i in range(to_idx - 1, from_idx - 1, -1):
             port_name = f"float_{i}"
             _dbg(f"  removing widget + port '{port_name}'")
 
-            # Unregister from WidgetCore — disconnects signals, emits
-            # widget_unregistered so any connected panel drops the mirror.
             spin = self._widget_core.unregister_widget(port_name)
             if spin is not None:
                 try:
@@ -389,54 +364,45 @@ class MultiFloatOutputNode(ActiveNode):
                 except Exception as exc:
                     _dbg(f"  form.removeRow failed for {port_name}: {exc}")
 
-        # Batch-remove ports for a single geometry rebuild.
+        # R5.8: remove_ports is plural, takes a list
         port_names = [f"float_{i}" for i in range(from_idx, to_idx)]
         _dbg(f"  batch removing ports: {port_names}")
-        removed = self.remove_ports(port_names, is_output=True)
-        _dbg(f"  remove_ports returned: {removed}")
+        self.remove_ports(port_names, is_output=True)
+        _dbg(f"  remove_ports succeeded")
 
     # ── Slots ─────────────────────────────────────────────────────────────
 
-    @Slot(int)
-    def _on_count_changed(self, value: int) -> None:
-        """Rebuild outputs when the count spinbox changes."""
-        _dbg(f"_on_count_changed: value={value}")
-        try:
-            self._set_count(value)
-            self.on_ui_change()
-            self._widget_core.refresh_widget_palettes()
-        except Exception as exc:
-            log.error(f"Exception in _on_count_changed: {exc}")
-            _dbg(f"  EXCEPTION: {exc}")
-
     @Slot(str)
-    def _on_core_changed(self, port_name: str) -> None:
-        """Handle WidgetCore value changes."""
-        _dbg(f"_on_core_changed: port_name='{port_name}'")
+    def _on_value_changed(self, port: str) -> None:
+        """R7.1: User edits → structural sync + mark dirty."""
+        _dbg(f"_on_value_changed: port='{port}'")
         try:
-            if port_name == "count":
-                # Count changed via upstream connection → rebuild
+            if port == "count":
                 val = self._widget_core.get_port_value("count")
                 if val is not None:
                     self._set_count(int(val))
             self.on_ui_change()
         except Exception as exc:
-            log.error(f"Exception in _on_core_changed: {exc}")
+            log.error(f"Exception in _on_value_changed: {exc}")
+
+    @Slot(str, object)
+    def _on_port_value_written(self, port: str, value: Any) -> None:
+        """R7.2/R7.3: Programmatic/undo writes → structural sync only."""
+        _dbg(f"_on_port_value_written: port='{port}'")
+        try:
+            if port == "count":
+                self._set_count(int(value))
+            # NOTE: Do NOT call on_ui_change() here
+        except Exception as exc:
+            log.error(f"Exception in _on_port_value_written: {exc}")
 
     # ── Computation ───────────────────────────────────────────────────────
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Read each float spinbox via WidgetCore and emit on the matching
-        output port.
-
-        The ``count`` input (if connected) drives the spinbox; by the
-        time ``compute`` runs, ``_on_core_changed`` has already called
-        ``_set_count`` so the port count is current.
-        """
+        """R9.2/R9.3: Read strictly from inputs dict. No WidgetCore/Qt access."""
         _dbg(f"MultiFloatOutputNode.compute: "
-             f"count={self._current_count}, inputs={inputs}")
+             f"count={self._current_count}, inputs={list(inputs.keys())}")
 
-        # Handle upstream count
         count_val = inputs.get("count")
         if count_val is not None:
             new_count = max(1, min(self.MAX_OUTPUTS, int(count_val)))
@@ -447,10 +413,8 @@ class MultiFloatOutputNode(ActiveNode):
         result: Dict[str, Any] = {}
         for i in range(self._current_count):
             port_name = f"float_{i}"
-            # Read via WidgetCore — the single source of truth.
-            val = self._widget_core.get_port_value(port_name)
-            if val is None:
-                val = self._DEFAULT_VALUE
+            # R9.2: Framework merges registered widget values into inputs
+            val = inputs.get(port_name, self._DEFAULT_VALUE)
             result[port_name] = float(val)
 
         _dbg(f"  result keys: {list(result.keys())}")
@@ -472,6 +436,7 @@ class MultiFloatOutputNode(ActiveNode):
         return state
 
     def restore_state(self, state: Dict[str, Any]) -> None:
+        # R14.3: Strict restore sequence
         _dbg("MultiFloatOutputNode.restore_state: start")
         super().restore_state(state)
 
@@ -481,17 +446,12 @@ class MultiFloatOutputNode(ActiveNode):
         _dbg(f"  saved count={count}, "
              f"current outputs={[p.name for p in self.outputs]}")
 
-        # ── Clean up stale state from __init__ + base restore ─────
-        # Base class re-created float_N ports from saved data.
-        # Remove them so _set_count can rebuild with matching widgets.
-        float_ports = [p for p in list(self.outputs)
-                       if p.name.startswith("float_")]
+        # 2. Tear down stale dynamic widgets/ports
+        float_ports = [p for p in list(self.outputs) if p.name.startswith("float_")]
         if float_ports:
-            _dbg(f"  removing stale float ports: "
-                 f"{[p.name for p in float_ports]}")
-            self.remove_ports(float_ports)
+            _dbg(f"  removing stale float ports: {[p.name for p in float_ports]}")
+            self.remove_ports([p.name for p in float_ports], is_output=True)
 
-        # Remove stale widget bindings from __init__'s _set_count
         form: QFormLayout = self._widget_core.layout()
         for i in range(self._current_count):
             port_name = f"float_{i}"
@@ -503,19 +463,20 @@ class MultiFloatOutputNode(ActiveNode):
                     pass
         self._current_count = 0
 
-        # ── Rebuild from scratch ──────────────────────────────────
-        self._spin_count.blockSignals(True)
-        self._spin_count.setValue(count)
-        self._spin_count.blockSignals(False)
+        # 3. Rebuild fresh, signals suppressed
+        with self._widget_core.suppress_signals():
+            self._spin_count.blockSignals(True)
+            self._spin_count.setValue(count)
+            self._spin_count.blockSignals(False)
+            self._set_count(count)
 
-        self._set_count(count)
+            # 4. Apply per-widget saved values
+            for i_str, val in mf.get("values", {}).items():
+                port_name = f"float_{int(i_str)}"
+                if self._widget_core.has_binding(port_name):
+                    self._widget_core.set_port_value(port_name, float(val))
 
-        # Restore individual float values via WidgetCore
-        for i_str, val in mf.get("values", {}).items():
-            port_name = f"float_{int(i_str)}"
-            if self._widget_core.has_binding(port_name):
-                self._widget_core.set_port_value(port_name, float(val))
-
+        # 5. Re-sync visibility/palettes
         self._widget_core.refresh_widget_palettes()
 
         _dbg(f"MultiFloatOutputNode.restore_state: done, "
@@ -526,10 +487,6 @@ class MultiFloatOutputNode(ActiveNode):
 
     def cleanup(self) -> None:
         _dbg("MultiFloatOutputNode.cleanup")
-        try:
-            self._spin_count.valueChanged.disconnect(self._on_count_changed)
-        except RuntimeError:
-            pass
-
-        self._widget_core.cleanup()
+        # WidgetCore manages widget signal lifecycle automatically.
+        # No manual disconnects needed.
         super().cleanup()

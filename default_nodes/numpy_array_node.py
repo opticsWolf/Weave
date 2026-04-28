@@ -19,55 +19,11 @@ Provided node
     additional ``QSpinBox`` row is inserted into the node body and
     **registered with WidgetCore** (``register_widget``), plus a
     matching auto-disable input port is added so upstream nodes can
-    drive individual axis sizes.  Reducing the dimensionality
-    unregisters the widgets (``unregister_widget``) and removes the
-    excess rows and ports in reverse order.
+    drive individual axis sizes. 
 
-    All widgets are registered with ``WidgetCore`` so that dock panels
-    (both inspector and mirror) automatically mirror every control —
-    including dynamically created dim spinboxes — with proper labels,
-    visibility, and bidirectional sync.
-
-    Additional controls
-    ~~~~~~~~~~~~~~~~~~~
-    *Fill* — how the array values are populated:
-
-    =========== =================================================
-    Zeros       All elements are 0 (default).
-    Ones        All elements are 1.
-    Full        All elements equal the *Value* spinbox.
-    Rand Uniform  Uniform [0, 1) random values.
-    Rand Normal   Standard-normal (μ=0, σ=1) random values.
-    Eye / Identity  Identity matrix (2-D); zeros elsewhere for
-                    higher-rank tensors with a unit 2-D slice at
-                    index [..., 0, 0].
-    =========== =================================================
-
-    *Dtype* — output array dtype (float64, float32, int64, int32,
-    complex128, bool).
-
-    *Value* — fill constant; visible only when Fill = *Full*.
-
-Dynamic behaviour
------------------
-* Increasing *Dims* → appends ``QSpinBox`` rows labelled
-  ``Dim 0:``, ``Dim 1:``, … and calls ``register_widget("dim_0", …)``
-  which emits ``widget_registered`` — dock panels add a mirror row
-  automatically.
-* Decreasing *Dims* → calls ``unregister_widget("dim_N")`` which emits
-  ``widget_unregistered`` — dock panels remove the mirror row.  Then
-  tears down widget rows and batch-removes ports.
-* The ``_sync_fill_value_visibility`` method calls ``setVisible()`` on
-  the fill-value spinbox.  WidgetCore's event filter detects the
-  ``Show``/``Hide`` event and emits ``widget_visibility_changed`` —
-  dock panels hide/show the entire mirror row (label + widget).
-
-Serialisation
--------------
-All widgets (fill, dtype, value, dims, dim_N) are registered with
-WidgetCore.  Static widgets (fill, dtype, value, dims) are serialised
-by WidgetCore's ``get_state()`` / ``set_state()``.  Dynamic dim widgets
-and the count are serialised in the ``"numpy_array_node"`` sub-key.
+    Upgraded to ThreadedNode to ensure high-dimensional tensor allocations
+    do not freeze the UI. Dynamic port generation accurately waits for
+    the main thread synchronisation cycle.
 """
 
 from __future__ import annotations
@@ -85,9 +41,10 @@ from PySide6.QtWidgets import (
     QSpinBox,
 )
 
-from weave.basenode import ActiveNode
+from weave.threadednodes import ThreadedNode
 from weave.noderegistry import register_node
 from weave.widgetcore import WidgetCore
+from weave.widgetcore.widgetcore_port_models import PortRole
 from weave.node.node_enums import VerticalSizePolicy
 
 from weave.logger import get_logger
@@ -121,11 +78,11 @@ _DTYPE_OPTIONS: Tuple[Tuple[str, str], ...] = (
 # ══════════════════════════════════════════════════════════════════════════════
 
 @register_node
-class NumpyArrayNode(ActiveNode):
+class NumpyArrayNode(ThreadedNode):
     """
     Advanced multidimensional NumPy array generator.
 
-    Type: Active (propagates downstream on any widget or port change).
+    Type: Threaded (propagates downstream automatically, evaluated in background).
     """
 
     MAX_DIMS: ClassVar[int] = 8
@@ -174,7 +131,7 @@ class NumpyArrayNode(ActiveNode):
         form.addRow("Dims:", self._spin_dims)
         self._widget_core.register_widget(
             "dims", self._spin_dims,
-            role="bidirectional", datatype="int", default=1,
+            role=PortRole.BIDIRECTIONAL, datatype="int", default=1,
             add_to_layout=False,
         )
 
@@ -187,12 +144,12 @@ class NumpyArrayNode(ActiveNode):
 
         # ── Fill mode combobox (internal) ─────────────────────────────
         self._combo_fill = QComboBox()
-        for label, _ in _FILL_MODES:
-            self._combo_fill.addItem(label)
+        for label, value in _FILL_MODES:
+            self._combo_fill.addItem(label, userData=value)
         form.addRow("Fill:", self._combo_fill)
         self._widget_core.register_widget(
             "fill_type", self._combo_fill,
-            role="internal", datatype="string", default="zeros",
+            role=PortRole.INTERNAL, datatype="string", default="zeros",
             add_to_layout=False,
         )
 
@@ -206,18 +163,18 @@ class NumpyArrayNode(ActiveNode):
         form.addRow(self._label_fill_val, self._spin_fill_val)
         self._widget_core.register_widget(
             "fill_value", self._spin_fill_val,
-            role="internal", datatype="float", default=0.0,
+            role=PortRole.INTERNAL, datatype="float", default=0.0,
             add_to_layout=False,
         )
 
         # ── Dtype combobox (internal) ─────────────────────────────────
         self._combo_dtype = QComboBox()
-        for label, _ in _DTYPE_OPTIONS:
-            self._combo_dtype.addItem(label)
+        for label, value in _DTYPE_OPTIONS:
+            self._combo_dtype.addItem(label, userData=value)
         form.addRow("Dtype:", self._combo_dtype)
         self._widget_core.register_widget(
             "dtype", self._combo_dtype,
-            role="internal", datatype="string", default="float64",
+            role=PortRole.INTERNAL, datatype="string", default="float64",
             add_to_layout=False,
         )
 
@@ -226,13 +183,16 @@ class NumpyArrayNode(ActiveNode):
 
         # ── Central dispatch: all WidgetCore value changes ────────────
         self._widget_core.value_changed.connect(self._on_wc_value_changed)
+        self._widget_core.port_value_written.connect(self._on_port_value_written)
 
         # ── Dynamic dimension state ───────────────────────────────────
         self._current_dims: int = 0
 
         # ── Finalise widget tree ──────────────────────────────────────
         self.set_content_widget(self._widget_core)
-        self._widget_core.patch_proxy()
+        
+        if hasattr(self._widget_core, 'patch_proxy'):
+            self._widget_core.patch_proxy()
 
         # Build initial dim rows (block WidgetCore signal to avoid
         # mid-init compute / panel reactions).
@@ -242,7 +202,8 @@ class NumpyArrayNode(ActiveNode):
         # Sync fill-value visibility for the initial fill mode.
         self._sync_fill_value_visibility()
 
-        self._widget_core.refresh_widget_palettes()
+        if hasattr(self._widget_core, 'refresh_widget_palettes'):
+            self._widget_core.refresh_widget_palettes()
 
     # ── Static helpers ────────────────────────────────────────────────────────
 
@@ -257,22 +218,15 @@ class NumpyArrayNode(ActiveNode):
         idx = self._combo_fill.currentIndex()
         return _FILL_MODES[idx][1] if 0 <= idx < len(_FILL_MODES) else "zeros"
 
-    def _get_dtype(self) -> "np.dtype":
-        idx = self._combo_dtype.currentIndex()
-        key = _DTYPE_OPTIONS[idx][1] if 0 <= idx < len(_DTYPE_OPTIONS) else "float64"
-        return np.dtype(key)
-
     def _sync_fill_value_visibility(self) -> None:
-        """Show the fill-value row only when Fill = Full.
-
-        ``setVisible()`` on ``_spin_fill_val`` fires a ``QEvent.Show``
-        or ``QEvent.Hide`` which WidgetCore's event filter picks up and
-        emits ``widget_visibility_changed("fill_value", …)``.  Any
-        connected dock panel hides/shows the mirror row automatically.
-        """
+        """Show the fill-value row only when Fill = Full."""
         is_full = self._get_fill_mode() == "full"
         self._label_fill_val.setVisible(is_full)
         self._spin_fill_val.setVisible(is_full)
+        
+        # Notify the dock system that dimensions and visibilities have shifted
+        if hasattr(self._widget_core, 'resume_content_notify'):
+            self._widget_core.resume_content_notify(True)
 
     # ── Dynamic dimension management ──────────────────────────────────────────
 
@@ -302,33 +256,23 @@ class NumpyArrayNode(ActiveNode):
         spin.setMinimumWidth(80)
         form.addRow(f"Dim {d}:", spin)
 
-        # Register with WidgetCore — wires valueChanged, emits
-        # widget_registered so any connected panel adds a mirror.
         self._widget_core.register_widget(
             port_name, spin,
-            role="bidirectional", datatype="int",
+            role=PortRole.BIDIRECTIONAL, datatype="int",
             default=self._DEFAULT_DIM_SIZE,
             add_to_layout=False,
         )
 
-        # Input port with auto-disable.
         self.add_input(port_name, "int")
         self.inputs[-1]._auto_disable = True
 
     def _remove_dims(self, from_idx: int, to_idx: int) -> None:
-        """Remove dim widgets from *to_idx - 1* down to *from_idx* (LIFO).
-
-        For each dimension:
-        1. Unregister from WidgetCore (emits ``widget_unregistered``).
-        2. Remove the spinbox row from the node form.
-        3. Batch-remove all excess input ports.
-        """
+        """Remove dim widgets from *to_idx - 1* down to *from_idx* (LIFO)."""
         form: QFormLayout = self._widget_core.layout()
 
         for d in range(to_idx - 1, from_idx - 1, -1):
             port_name = f"dim_{d}"
 
-            # Unregister — disconnects signals, emits widget_unregistered.
             spin = self._widget_core.unregister_widget(port_name)
             if spin is not None:
                 try:
@@ -338,7 +282,6 @@ class NumpyArrayNode(ActiveNode):
                         f"NumpyArrayNode: removeRow failed for dim {d}: {exc}"
                     )
 
-        # Batch-remove ports for a single geometry rebuild.
         port_names = [f"dim_{d}" for d in range(from_idx, to_idx)]
         removed = self.remove_ports(port_names, is_output=False)
         if removed != len(port_names):
@@ -351,17 +294,15 @@ class NumpyArrayNode(ActiveNode):
 
     @Slot(str)
     def _on_wc_value_changed(self, port_name: str) -> None:
-        """Central handler for all WidgetCore value changes.
-
-        Dispatches to specialised logic for dims and fill_type, then
-        always calls ``on_ui_change()`` so the graph propagates.
-        """
+        """Central handler for internal user UI changes."""
         try:
             if port_name == "dims":
                 val = self._widget_core.get_port_value("dims")
                 if val is not None:
+                    # Explicit user interactions safely update GUI layouts directly
                     self._set_dims(int(val))
-                    self._widget_core.refresh_widget_palettes()
+                    if hasattr(self._widget_core, 'refresh_widget_palettes'):
+                        self._widget_core.refresh_widget_palettes()
             elif port_name == "fill_type":
                 self._sync_fill_value_visibility()
 
@@ -369,65 +310,68 @@ class NumpyArrayNode(ActiveNode):
         except Exception as exc:
             log.error(f"Exception in NumpyArrayNode._on_wc_value_changed: {exc}")
 
-    # ── Computation ───────────────────────────────────────────────────────────
+    @Slot(str, object)
+    def _on_port_value_written(self, port_name: str, value: Any) -> None:
+        """Handle programmatic widget changes (like Undo/Redo)."""
+        try:
+            if port_name == "dims":
+                self._set_dims(int(value))
+                if hasattr(self._widget_core, 'refresh_widget_palettes'):
+                    self._widget_core.refresh_widget_palettes()
+            elif port_name == "fill_type":
+                self._sync_fill_value_visibility()
+                
+            # RULE 7.3: DO NOT call self.on_ui_change() here.
+            # Programmatic writes (Undo/Redo) automatically manage evaluation logic post-restoration.
+        except Exception as exc:
+            log.error(f"Exception in NumpyArrayNode._on_port_value_written: {exc}")
+
+    # ── Computation (Background Worker) ───────────────────────────────────────
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """Build the ndarray from current state.
 
-        For each axis the upstream port value is preferred; the local
-        spinbox (read via WidgetCore) is the fallback.
+        Executes on a background QRunnable. The `inputs` dict is pre-merged
+        by ThreadedNode to contain upstream data falling back to local widgets.
+        No Qt elements are accessed here to guarantee thread safety.
         """
-        try:
-            # ── Determine Rank (Number of Dimensions) ─────────────────────
-            # Check upstream first, then fallback to widget value
-            upstream_dims = inputs.get("dims")
-            if upstream_dims is not None:
-                new_dims = max(1, min(self.MAX_DIMS, int(upstream_dims)))
-            else:
-                val = self._widget_core.get_port_value("dims")
-                new_dims = int(val) if val is not None else 1
+        if self.is_compute_cancelled():
+            return {"array": np.array([], dtype=np.float64)}
 
-            # If the rank changed via port, sync the UI rows
-            if new_dims != self._current_dims:
-                # We use signals blocked to prevent infinite loops during compute
-                with self._widget_core.suppress_signals():
-                    self._set_dims(new_dims)
+        try:
+            # ── Determine Rank ──────────────────────────────────────────
+            dims_val = inputs.get("dims")
+            new_dims = max(1, min(self.MAX_DIMS, int(dims_val) if dims_val is not None else 1))
 
             # ── Shape ─────────────────────────────────────────────────
             shape: List[int] = []
-            for d in range(self._current_dims):
-                upstream = inputs.get(f"dim_{d}")
-                if upstream is not None:
-                    size = max(1, int(upstream))
-                else:
-                    val = self._widget_core.get_port_value(f"dim_{d}")
-                    size = int(val) if val is not None else 1
-                shape.append(size)
+            for d in range(new_dims):
+                size_val = inputs.get(f"dim_{d}")
+                size = int(size_val) if size_val is not None else self._DEFAULT_DIM_SIZE
+                shape.append(max(1, size))
 
             if not shape:
                 shape = [1]
 
-            # ── Dtype ─────────────────────────────────────────────────
-            dtype = self._get_dtype()
+            # ── Parameters ────────────────────────────────────────────
+            dtype = np.dtype(inputs.get("dtype", "float64"))
+            mode = inputs.get("fill_type", "zeros")
 
-            # ── Fill ──────────────────────────────────────────────────
-            mode = self._get_fill_mode()
-
+            # ── Processing ────────────────────────────────────────────
             if mode == "zeros":
                 arr = np.zeros(shape, dtype=dtype)
             elif mode == "ones":
                 arr = np.ones(shape, dtype=dtype)
             elif mode == "full":
-                fill_val = float(
-                    self._widget_core.get_port_value("fill_value") or 0.0
-                )
+                fill_val = float(inputs.get("fill_value", 0.0))
                 arr = np.full(shape, fill_val, dtype=dtype)
             elif mode == "random_uniform":
                 arr = np.random.uniform(0.0, 1.0, shape).astype(dtype)
             elif mode == "random_normal":
                 arr = np.random.normal(0.0, 1.0, shape).astype(dtype)
             elif mode == "eye":
-                rows, cols = shape[0], (shape[1] if len(shape) > 1 else shape[0])
+                rows = shape[0]
+                cols = shape[1] if len(shape) > 1 else shape[0]
                 eye_2d = np.eye(rows, cols, dtype=dtype)
                 if len(shape) == 1:
                     arr = np.ones(shape, dtype=dtype)
@@ -441,12 +385,33 @@ class NumpyArrayNode(ActiveNode):
             else:
                 arr = np.zeros(shape, dtype=dtype)
 
-            self.array_changed.emit(arr)
-            return {"array": arr}
+            if self.is_compute_cancelled():
+                return {"array": np.array([], dtype=np.float64)}
+
+            # Returns the array and a marker for the main thread to resync UI ports dynamically
+            return {"array": arr, "_sync_dims": new_dims}
 
         except Exception as exc:
             log.error(f"Exception in NumpyArrayNode.compute: {exc}")
             return {"array": np.array([], dtype=np.float64)}
+
+    # ── Main Thread Result Hook ───────────────────────────────────────────────
+
+    def on_evaluate_finished(self) -> None:
+        """Main thread callback bridging threaded output back to UI state."""
+        # Detect if dimensions changed entirely via upstream traces
+        sync_dims = self._get_cached_value("_sync_dims")
+        if sync_dims is not None and sync_dims != self._current_dims:
+            with self._widget_core.suppress_signals():
+                self._set_dims(sync_dims)
+                if hasattr(self._widget_core, 'refresh_widget_palettes'):
+                    self._widget_core.refresh_widget_palettes()
+
+        result = self._get_cached_value("array")
+        if result is not None:
+            self.array_changed.emit(result)
+            
+        super().on_evaluate_finished()
 
     # ── Serialisation ─────────────────────────────────────────────────────────
 
@@ -467,14 +432,8 @@ class NumpyArrayNode(ActiveNode):
         ns = state.get("numpy_array_node", {})
         num_dims = ns.get("num_dims", 1)
 
-        log.debug(
-            f"NumpyArrayNode.restore_state: saved num_dims={num_dims}, "
-            f"current inputs={[p.name for p in self.inputs]}"
-        )
-
         # ── 1. Remove stale dim ports from __init__ + base restore ────
-        stale_dim_ports = [p for p in list(self.inputs)
-                           if p.name.startswith("dim_")]
+        stale_dim_ports = [p.name for p in self.inputs if p.name.startswith("dim_")]
         if stale_dim_ports:
             self.remove_ports(stale_dim_ports)
 
@@ -501,18 +460,13 @@ class NumpyArrayNode(ActiveNode):
             if self._widget_core.has_binding(port_name):
                 self._widget_core.set_port_value(port_name, int(size))
 
-        # Re-sync visibility now that fill_type has been restored.
         self._sync_fill_value_visibility()
-        self._widget_core.refresh_widget_palettes()
-
-        log.debug(
-            f"NumpyArrayNode.restore_state: done, "
-            f"num_dims={self._current_dims}, "
-            f"inputs={[(p.name, p.datatype) for p in self.inputs]}"
-        )
+        if hasattr(self._widget_core, 'refresh_widget_palettes'):
+            self._widget_core.refresh_widget_palettes()
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def cleanup(self) -> None:
-        self._widget_core.cleanup()
+        if hasattr(self, 'cancel_compute'):
+            self.cancel_compute()
         super().cleanup()

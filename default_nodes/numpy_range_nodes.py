@@ -17,8 +17,7 @@ from PySide6.QtWidgets import QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QL
 
 from weave.threadednodes import ThreadedNode
 from weave.noderegistry import register_node
-from weave.widgetcore.widgetcore import WidgetCore
-from weave.widgetcore.widgetcore_port_models import PortRole
+from weave.widgetcore import WidgetCore, PortRole
 from weave.node.node_enums import VerticalSizePolicy
 from weave.logger import get_logger
 
@@ -59,7 +58,7 @@ def _make_step_spin(default: float) -> QDoubleSpinBox:
 
 def _make_int_spin(default: int) -> QSpinBox:
     spin = QSpinBox()
-    spin.setRange(2, 1000000)
+    spin.setRange(2, 1_000_000)
     spin.setValue(int(default))
     return spin
 
@@ -72,10 +71,11 @@ def _make_int_spin(default: int) -> QSpinBox:
 class NumpyRange1DNode(ThreadedNode):
     array_changed = Signal(object)
 
-    node_class: ClassVar[str] = "Numpy"
-    node_subclass: ClassVar[str] = "Generator"
-    node_name: ClassVar[Optional[str]] = "Numpy Range 1D"
-    node_tags: ClassVar[Optional[List[str]]] = ["numpy", "array", "1d", "range"]
+    node_class:        ClassVar[str]                 = "Numpy"
+    node_subclass:     ClassVar[str]                 = "Generator"
+    node_name:         ClassVar[Optional[str]]       = "Numpy Range 1D"
+    node_description:  ClassVar[Optional[str]]       = "Generates 1D numpy arrays using arange or linspace."
+    node_tags:         ClassVar[Optional[List[str]]] = ["numpy", "array", "1d", "range"]
     vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
     def __init__(self, title: str = "Numpy Range 1D", **kwargs: Any) -> None:
@@ -127,7 +127,6 @@ class NumpyRange1DNode(ThreadedNode):
         form.addRow(self._label_num, self._spin_num)
 
         # ── Signals & Initialization ──
-        self._combo_mode.currentIndexChanged.connect(self._on_mode_changed)
         self._widget_core.value_changed.connect(self._on_core_changed)
         self._widget_core.port_value_written.connect(self._on_port_value_written)
         
@@ -135,9 +134,7 @@ class NumpyRange1DNode(ThreadedNode):
         self._sync_mode_visibility()
 
     def _sync_mode_visibility(self) -> None:
-        """Update widget visibility based on selected mode and notify layout system."""
-        idx = self._combo_mode.currentIndex()
-        is_arange = _GEN_MODES[idx][1] == "arange"
+        is_arange = self._combo_mode.currentData() == "arange"
         
         self._label_step.setVisible(is_arange)
         self._spin_step.setVisible(is_arange)
@@ -147,10 +144,6 @@ class NumpyRange1DNode(ThreadedNode):
         if hasattr(self._widget_core, 'resume_content_notify'):
             self._widget_core.resume_content_notify(True)
 
-    @Slot(int)
-    def _on_mode_changed(self, _index: int) -> None:
-        self._sync_mode_visibility()
-
     @Slot(str)
     def _on_core_changed(self, port_name: str) -> None:
         if port_name == "mode":
@@ -158,13 +151,13 @@ class NumpyRange1DNode(ThreadedNode):
         self.on_ui_change()
 
     @Slot(str, object)
-    def _on_port_value_written(self, port_name: str, value: Any) -> None:
+    def _on_port_value_written(self, port_name: str, _value: Any) -> None:
         if port_name == "mode":
             self._sync_mode_visibility()
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         if self.is_compute_cancelled():
-            return {"array": np.array([])}
+            return {"array": np.empty(0)}
 
         mode = inputs.get("mode", "arange")
         dtype = np.dtype(inputs.get("dtype", "float64"))
@@ -201,10 +194,11 @@ class NumpyRange1DNode(ThreadedNode):
 class NumpyRange2DNode(ThreadedNode):
     array_changed = Signal(object)
 
-    node_class: ClassVar[str] = "Numpy"
-    node_subclass: ClassVar[str] = "Generator"
-    node_name: ClassVar[Optional[str]] = "Numpy Range 2D"
-    node_tags: ClassVar[Optional[List[str]]] = ["numpy", "array", "2d", "range"]
+    node_class:        ClassVar[str]                 = "Numpy"
+    node_subclass:     ClassVar[str]                 = "Generator"
+    node_name:         ClassVar[Optional[str]]       = "Numpy Range 2D"
+    node_description:  ClassVar[Optional[str]]       = "Generates 2D numpy arrays via meshgrid, outer product, or column stack."
+    node_tags:         ClassVar[Optional[List[str]]] = ["numpy", "array", "2d", "range"]
     vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
     def __init__(self, title: str = "Numpy Range 2D", **kwargs: Any) -> None:
@@ -290,7 +284,6 @@ class NumpyRange2DNode(ThreadedNode):
         form.addRow(self._label_num_1, self._spin_num_1)
 
         # ── Signals & Initialization ──
-        self._combo_mode.currentIndexChanged.connect(self._on_mode_changed)
         self._widget_core.value_changed.connect(self._on_core_changed)
         self._widget_core.port_value_written.connect(self._on_port_value_written)
         
@@ -298,8 +291,7 @@ class NumpyRange2DNode(ThreadedNode):
         self._sync_mode_visibility()
 
     def _sync_mode_visibility(self) -> None:
-        idx = self._combo_mode.currentIndex()
-        is_arange = _GEN_MODES[idx][1] == "arange"
+        is_arange = self._combo_mode.currentData() == "arange"
         
         for label, spin in ((self._label_step_0, self._spin_step_0), (self._label_step_1, self._spin_step_1)):
             label.setVisible(is_arange)
@@ -312,10 +304,6 @@ class NumpyRange2DNode(ThreadedNode):
         if hasattr(self._widget_core, 'resume_content_notify'):
             self._widget_core.resume_content_notify(True)
 
-    @Slot(int)
-    def _on_mode_changed(self, _index: int) -> None:
-        self._sync_mode_visibility()
-
     @Slot(str)
     def _on_core_changed(self, port_name: str) -> None:
         if port_name == "mode":
@@ -323,7 +311,7 @@ class NumpyRange2DNode(ThreadedNode):
         self.on_ui_change()
 
     @Slot(str, object)
-    def _on_port_value_written(self, port_name: str, value: Any) -> None:
+    def _on_port_value_written(self, port_name: str, _value: Any) -> None:
         if port_name == "mode":
             self._sync_mode_visibility()
 
@@ -342,7 +330,7 @@ class NumpyRange2DNode(ThreadedNode):
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         if self.is_compute_cancelled():
-            return {"array": np.empty((0, 0))}
+            return {"array": np.empty(0)}
 
         dtype       = np.dtype(inputs.get("dtype", "float64"))
         mode        = inputs.get("mode", "arange")
