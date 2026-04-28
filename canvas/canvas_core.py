@@ -81,9 +81,15 @@ class Canvas(QGraphicsScene):
     node_removed = Signal(QGraphicsItem)
     connection_created = Signal(object, object)  # (source_port, target_port)
     selection_changed_custom = Signal(list)
+    eval_fence_idle = Signal()  # NEW: fired by BaseControlNode._decrement_eval_fence
+                                # when scene._eval_fence transitions to 0;
+                                # UndoManager listens to wake macro/restore checks.
 
     def __init__(self, parent=None, config=None):
         super().__init__(parent)
+
+        # pending-evaluation counter; managed by BaseControlNode._{increment,decrement}_eval_fence
+        self._eval_fence: int = 0  
 
         # Initialize Style Manager singleton access
         self._style_manager = StyleManager.instance()

@@ -407,17 +407,18 @@ def _node_display_name(node_cls) -> str:
 class _PortSignatureCache:
     """Lazy cache mapping each registered node class to its port signatures.
 
-    Built on first access by instantiating every registered node class
-    once (without adding it to a scene), reading its ``inputs`` and
-    ``outputs``, then tearing down the temporary instance.  Rebuilt
-    automatically when the registry grows (simple length check).
-
-    Each entry is a list of ``(port_name, datatype, is_output)`` tuples.
+    FIXED: Uses the "Template Node" pattern. Instead of rapidly creating 
+    and destroying dummy nodes (which corrupts PySide6's C++ style cache), 
+    it keeps one template instance of each node alive in a hidden background scene.
     """
 
     def __init__(self):
         self._signatures: Dict[type, List[Tuple[str, str, bool]]] = {}
         self._registry_size: int = 0
+        
+        # Hidden scene to keep dummy nodes alive and safe from C++ deletion
+        self._dummy_scene = None
+        self._template_nodes = []
 
     def get_all(self) -> Dict[type, List[Tuple[str, str, bool]]]:
         """Return cached signatures, rebuilding if the registry has grown."""
@@ -429,17 +430,29 @@ class _PortSignatureCache:
         return self._signatures
 
     def _rebuild(self):
-        """Instantiate each registered class once to read its ports."""
+        """Instantiate each registered class once and keep it alive to read ports."""
         self._signatures.clear()
         if not HAS_REGISTRY or NODE_REGISTRY is None:
             return
+
+        # Initialize the hidden scene once
+        if self._dummy_scene is None:
+            from PySide6.QtWidgets import QGraphicsScene
+            self._dummy_scene = QGraphicsScene()
 
         all_classes = NODE_REGISTRY.get_all_nodes()
         self._registry_size = len(all_classes)
 
         for node_cls in all_classes:
             try:
+                # 1. Instantiate the node and anchor it to the hidden scene
                 node = node_cls()
+                self._dummy_scene.addItem(node)
+                
+                # Prevent Python garbage collection from killing it
+                self._template_nodes.append(node) 
+
+                # 2. Extract signatures
                 ports: List[Tuple[str, str, bool]] = []
                 for p in getattr(node, 'inputs', []):
                     ports.append((
@@ -454,43 +467,12 @@ class _PortSignatureCache:
                         True,
                     ))
                 self._signatures[node_cls] = ports
-                self._teardown(node)
+                
+                # NOTE: We intentionally DO NOT teardown or destroy the node here.
+                # It lives peacefully in the background scene forever.
+
             except Exception as e:
-                log.debug(
-                    f"Port signature cache: skip {node_cls.__name__}: {e}"
-                )
-
-    @staticmethod
-    def _teardown(node):
-        """Unregister a temporary node from StyleManager and release it."""
-        try:
-            sm = StyleManager.instance()
-            all_ports = (
-                getattr(node, 'inputs', [])
-                + getattr(node, 'outputs', [])
-            )
-            for attr in ('_summary_input', '_summary_output'):
-                sp = getattr(node, attr, None)
-                if sp is not None:
-                    all_ports.append(sp)
-            for p in all_ports:
-                try:
-                    sm.unregister(p, StyleCategory.PORT)
-                    sm.unregister(p, StyleCategory.TRACE)
-                except Exception:
-                    pass
-            try:
-                sm.unregister(node, StyleCategory.NODE)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        if hasattr(node, 'cleanup'):
-            try:
-                node.cleanup()
-            except Exception:
-                pass
-
+                log.debug(f"Port signature cache: skip {node_cls.__name__}: {e}")
 
 _port_sig_cache = _PortSignatureCache()
 

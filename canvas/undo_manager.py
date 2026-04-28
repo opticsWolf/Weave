@@ -14,6 +14,18 @@ FIXED VERSION:
 4. Deferred baseline snapshot to ensure all signals are processed
 5. CIRCUIT BREAKER: Detects stuck fence and forces completion
 6. Added descriptions for UI and fixed encapsulation leak
+7. Initialized _last_macro_size in __init__ and clear() (no more lazy getattr)
+8. Circuit breaker now resets the leaked fence on trip, so a single leak
+   doesn't cascade into every subsequent undo/redo operation
+9. Circuit breaker now also covers fence oscillation (0 → >0 → 0 → ...)
+   via a shared _trip_fence_circuit_breaker helper used by both
+   _try_finish_restore and _restore_final_check; retry counter now
+   accumulates across all reschedules within a single restore
+10. Event-driven fence wakeup (Option A: canvas.eval_fence_idle signal,
+    Option B: per-node compute_finished signal) replaces 0ms busy-poll
+    while waiting for long-running computes. Polling is retained as a
+    250ms safety-net fallback. _max_fence_retries bumped to 480 so the
+    circuit breaker is now a meaningful 120s wall-clock timeout.
 """
 
 from __future__ import annotations
@@ -34,6 +46,13 @@ from weave.logger import get_logger
 log = get_logger("UndoManager")
 
 _DEBUG = os.environ.get("WEAVE_UNDO_DEBUG", "0") == "1"
+
+# Slow-poll fallback interval used when waiting for the canvas eval_fence to
+# drop. Event-driven wakeups (Option A: canvas.eval_fence_idle, Option B:
+# node.compute_finished) are the primary signal — this poll only exists as
+# a safety net for cases where neither signal fires (e.g. fence leak,
+# external fence manipulation, canvas without the signal defined).
+_FENCE_WAIT_INTERVAL_MS = 250
 
 def _dbg(msg: str) -> None:
     if _DEBUG:
@@ -80,24 +99,99 @@ class UndoManager:
         self._macro_stack: List[UndoCommand] = []
         self._macro_check_scheduled: bool = False
         self._macro_stability_counter: int = 0
+        self._last_macro_size: int = 0
 
         self._restore_check_scheduled: bool = False
         
         self._quiescence_pending: bool = False
         self._pending_widget_signals: int = 0
 
-        # CIRCUIT BREAKER: Track retry counts for stuck fence detection
+        # CIRCUIT BREAKER: Track retry counts for stuck fence detection.
+        # With _FENCE_WAIT_INTERVAL_MS=250 and event-driven wakeups as the
+        # primary mechanism, the breaker is now a wall-clock timeout: 480
+        # retries × 250ms = 120s budget. This must outlast the worst-case
+        # cancellation latency of any in-flight worker during restore (NOT
+        # the worst-case compute time — workers are cancelled by undo via
+        # set_dirty before the restore-finish wait begins).
         self._restore_retry_count: int = 0
-        self._max_fence_retries: int = 100  # Max retries before forcing completion
+        self._max_fence_retries: int = 480
+
+        # Event-driven fence wakeup (Options A + B).
+        # _fence_wakeup_pending dedupes the case where many nodes finish
+        # compute simultaneously — we only schedule one wakeup per pending
+        # check, no matter how many signals fire.
+        self._fence_wakeup_pending: bool = False
+        self._compute_finished_slots: Dict[int, Tuple[Any, Callable]] = {}
 
         if hasattr(canvas, 'node_added'):
             canvas.node_added.connect(self._on_node_added)
         if hasattr(canvas, 'node_removed'):
             canvas.node_removed.connect(self._on_node_removed)
 
+        # Option A: subscribe to canvas-level fence-idle signal if defined.
+        # The signal is emitted by BaseControlNode._decrement_eval_fence
+        # whenever the canvas eval_fence transitions to 0. Graceful no-op
+        # if the canvas class doesn't declare the signal.
+        idle_sig = getattr(canvas, 'eval_fence_idle', None)
+        if idle_sig is not None:
+            try:
+                idle_sig.connect(self._on_fence_idle)
+                _dbg("connected to canvas.eval_fence_idle (Option A)")
+            except (RuntimeError, TypeError):
+                pass
+
     def _eval_fence(self) -> int:
         """Read the scene-level pending-evaluation counter."""
         return getattr(self._canvas, '_eval_fence', 0)
+
+    # ── Event-driven fence wakeup (Options A + B) ─────────────────────
+    #
+    # Polling at _FENCE_WAIT_INTERVAL_MS is only a fallback. The common
+    # case is woken by these slots: canvas eval_fence_idle (A) or per-node
+    # compute_finished (B). Both route through _request_fence_wakeup,
+    # which is intentionally minimal (no synchronous fence work) so it
+    # adds zero latency to the emitting path.
+
+    def _on_fence_idle(self) -> None:
+        """Slot for canvas.eval_fence_idle — fence just hit 0."""
+        _dbg("event: canvas.eval_fence_idle fired")
+        self._request_fence_wakeup()
+
+    def _on_compute_finished(self) -> None:
+        """Slot for node.compute_finished — a worker just released its fence."""
+        _dbg("event: node.compute_finished fired")
+        self._request_fence_wakeup()
+
+    def _request_fence_wakeup(self) -> None:
+        """Queue an immediate fence re-check if one is currently pending.
+
+        Lightweight by design: no fence read, no work — just sets a flag
+        and posts a 0ms timer. Multiple simultaneous emissions (e.g. 100
+        nodes finishing at once) dedupe to a single scheduled wakeup via
+        _fence_wakeup_pending.
+        """
+        if self._fence_wakeup_pending:
+            return
+        if not (self._macro_check_scheduled or self._restore_check_scheduled):
+            # Nothing waiting on the fence — nothing to wake up.
+            return
+        self._fence_wakeup_pending = True
+        QTimer.singleShot(0, self._do_fence_wakeup)
+
+    def _do_fence_wakeup(self) -> None:
+        """Run any pending fence checks now that an event indicated progress.
+
+        The pending 250ms slow-poll timers will still fire later, but the
+        _in_macro / _restoring guards at the top of each check method
+        make those redundant invocations safe no-ops. The check methods
+        also reset their own *_check_scheduled flags at entry, so we do
+        not need to clear them here.
+        """
+        self._fence_wakeup_pending = False
+        if self._in_macro and self._macro_check_scheduled:
+            self._try_close_macro()
+        if self._restoring and self._restore_check_scheduled:
+            self._try_finish_restore()
 
     @property
     def next_undo_description(self) -> str:
@@ -201,8 +295,11 @@ class UndoManager:
 
         if fence > 0:
             self._macro_stability_counter = 0
-            _dbg("  → fence > 0, rescheduling")
-            self._schedule_macro_check()
+            _dbg(f"  → fence > 0, rescheduling in {_FENCE_WAIT_INTERVAL_MS}ms")
+            # Slow-poll fallback. Event-driven wakeup via compute_finished /
+            # eval_fence_idle will fire the check sooner if it can.
+            self._macro_check_scheduled = True
+            QTimer.singleShot(_FENCE_WAIT_INTERVAL_MS, self._try_close_macro)
             return
 
         self._macro_stability_counter += 1
@@ -212,7 +309,7 @@ class UndoManager:
             self._schedule_macro_check()
             return
 
-        if size > getattr(self, '_last_macro_size', 0):
+        if size > self._last_macro_size:
             self._last_macro_size = size
             self._macro_stability_counter = 0
             _dbg("  → macro grew, resetting stability")
@@ -325,11 +422,46 @@ class UndoManager:
             self._schedule_restore_check()
 
     def _schedule_restore_check(self) -> None:
-        """Schedule a fence check for restore completion."""
+        """Schedule a fence check for restore completion.
+
+        Note: the retry counter is reset by undo()/redo() at restore start
+        (once per restore operation). It must NOT be reset here — it must
+        accumulate across reschedules so the circuit breaker can detect
+        fence oscillation (0 → >0 → 0 → ...), not just a stuck-high fence.
+        """
         if not self._restore_check_scheduled:
             self._restore_check_scheduled = True
-            self._restore_retry_count = 0  # Reset counter on new schedule
             QTimer.singleShot(0, self._try_finish_restore)
+
+    def _trip_fence_circuit_breaker(self, fence: int, where: str) -> bool:
+        """Increment retry counter; if exceeded, force completion.
+
+        Returns True if the breaker tripped (caller MUST return immediately).
+        Returns False if the caller should continue with its normal path.
+
+        When the breaker trips, the leaked fence is reset to 0 so subsequent
+        undo/redo operations don't immediately re-trip on the same leak. The
+        underlying caller bug is NOT masked: the loud log.error above remains
+        the diagnostic, and points at the actual root cause.
+        """
+        self._restore_retry_count += 1
+        if self._restore_retry_count > self._max_fence_retries:
+            log.error(
+                f"UndoManager: FENCE STUCK at {fence} for "
+                f"{self._restore_retry_count} ticks in {where}. "
+                f"Forcing completion and resetting fence to break the leak. "
+                f"This indicates a fence leak in node add/remove. "
+                f"Check that _decrement_eval_fence is called even when "
+                f"scene is None."
+            )
+            try:
+                setattr(self._canvas, '_eval_fence', 0)
+            except (AttributeError, RuntimeError):
+                pass
+            self._restore_retry_count = 0
+            self._enter_quiescence()
+            return True
+        return False
 
     def _try_finish_restore(self) -> None:
         """Clear _restoring when fence==0 + 1 stable tick."""
@@ -338,32 +470,25 @@ class UndoManager:
             return
 
         fence = self._eval_fence()
-        
-        # CIRCUIT BREAKER: Increment retry counter
-        self._restore_retry_count += 1
-        
-        _dbg(f"_try_finish_restore: fence={fence}, retry={self._restore_retry_count}")
+        _dbg(f"_try_finish_restore: fence={fence}, "
+             f"retry={self._restore_retry_count}")
 
         if fence > 0:
-            # CIRCUIT BREAKER: Check if we've exceeded max retries
-            if self._restore_retry_count > self._max_fence_retries:
-                log.error(
-                    f"UndoManager: FENCE STUCK at {fence} for {self._restore_retry_count} ticks. "
-                    f"Forcing completion. This indicates a fence leak in node add/remove. "
-                    f"Check that _decrement_eval_fence is called even when scene is None."
-                )
-                self._restore_retry_count = 0
-                self._enter_quiescence()
+            if self._trip_fence_circuit_breaker(fence, "_try_finish_restore"):
                 return
-            
-            _dbg(f"  → fence > 0, rescheduling (retry {self._restore_retry_count})")
+            _dbg(f"  → fence > 0, rescheduling in {_FENCE_WAIT_INTERVAL_MS}ms "
+                 f"(retry {self._restore_retry_count})")
+            # Slow-poll fallback. compute_finished / eval_fence_idle will
+            # wake us sooner if the fence drops naturally.
             self._restore_check_scheduled = True
-            QTimer.singleShot(0, self._try_finish_restore)
+            QTimer.singleShot(_FENCE_WAIT_INTERVAL_MS, self._try_finish_restore)
             return
 
-        # Fence is 0 — one more tick for deferred widget updates
+        # Fence is 0 — one more tick for deferred widget updates.
+        # NOTE: do NOT reset _restore_retry_count here — the breaker must
+        # accumulate ticks across the full restore so fence oscillation
+        # (0 → >0 → 0 → ...) can also be detected.
         _dbg("  → fence=0, one more check")
-        self._restore_retry_count = 0
         self._restore_check_scheduled = True
         QTimer.singleShot(0, self._restore_final_check)
 
@@ -374,11 +499,18 @@ class UndoManager:
             return
 
         fence = self._eval_fence()
-        _dbg(f"_restore_final_check: fence={fence}")
+        _dbg(f"_restore_final_check: fence={fence}, "
+             f"retry={self._restore_retry_count}")
 
         if fence > 0:
-            _dbg("  → fence > 0 again, restarting")
-            self._schedule_restore_check()
+            if self._trip_fence_circuit_breaker(fence, "_restore_final_check"):
+                return
+            _dbg(f"  → fence > 0 again, rescheduling in {_FENCE_WAIT_INTERVAL_MS}ms")
+            # Oscillation case: fence dropped, we scheduled this final
+            # check, but fence came back up. Slow-poll until it settles.
+            # Event-driven wakeup will pre-empt this if compute completes.
+            self._restore_check_scheduled = True
+            QTimer.singleShot(_FENCE_WAIT_INTERVAL_MS, self._try_finish_restore)
             return
 
         self._enter_quiescence()
@@ -425,10 +557,12 @@ class UndoManager:
         self._macro_stack.clear()
         self._macro_check_scheduled = False
         self._macro_stability_counter = 0
+        self._last_macro_size = 0
         self._restoring = False
         self._restore_check_scheduled = False
         self._quiescence_pending = False
         self._restore_retry_count = 0  # Reset circuit breaker
+        self._fence_wakeup_pending = False  # Reset event-driven wakeup state
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._disconnect_all_cores()
@@ -530,6 +664,22 @@ class UndoManager:
             wc.value_changed.connect(slot)
             self._connected_cores[id(node)] = (wc, slot)
 
+            # Option B: subscribe to compute_finished if the node defines it.
+            # ThreadedNode emits this in _cleanup_after_worker, AFTER the
+            # fence has been released, making it a reliable "fence may have
+            # just dropped" hint. The slot is intentionally minimal — it
+            # only flags a wakeup, never does fence work synchronously, so
+            # it cannot add latency to compute completion.
+            if hasattr(node, 'compute_finished'):
+                try:
+                    node.compute_finished.connect(self._on_compute_finished)
+                    self._compute_finished_slots[id(node)] = (
+                        node, self._on_compute_finished
+                    )
+                    _dbg(f"  → connected compute_finished (Option B)")
+                except (RuntimeError, TypeError):
+                    pass
+
             if hasattr(node, 'port_added'):
                 pa_slot = self._make_port_added_slot(node_uuid, wc)
                 node.port_added.connect(pa_slot)
@@ -628,6 +778,16 @@ class UndoManager:
                 pass
         self._connected_cores.clear()
 
+        # Option B: disconnect compute_finished slots
+        for node_ref, cf_slot in self._compute_finished_slots.values():
+            if node_ref is None:
+                continue
+            try:
+                node_ref.compute_finished.disconnect(cf_slot)
+            except (RuntimeError, TypeError):
+                pass
+        self._compute_finished_slots.clear()
+
         for node_ref, pa_slot, pr_slot in self._port_slots.values():
             if node_ref is None:
                 continue
@@ -665,6 +825,15 @@ class UndoManager:
                     _dbg(f"node_removed: cleared baseline {key[0][:8]}:{key[1]}")
                 self._active_node_uuids.discard(node_uuid)
             except (RuntimeError, AttributeError):
+                pass
+
+        # Option B: disconnect compute_finished
+        cf_entry = self._compute_finished_slots.pop(id(node), None)
+        if cf_entry is not None:
+            _node_ref, cf_slot = cf_entry
+            try:
+                node.compute_finished.disconnect(cf_slot)
+            except (RuntimeError, TypeError):
                 pass
                 
         port_entry = self._port_slots.pop(id(node), None)
