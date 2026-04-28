@@ -3,42 +3,34 @@
 Weave: A modular PySide6 framework for the visual synthesis
 and execution of high-concurrency simulation workflows.
 Copyright (c) 2026 opticsWolf
-
 SPDX-License-Identifier: Apache-2.0
-
 basic_nodes.py
 ------------------
 Fundamental source and display nodes for the five base types used
 throughout the Weave node graph.
 
-Provided nodes
+Provided Nodes
 --------------
 ``IntInputNode``
-    Source node with a ``QSpinBox``.  Outputs the current integer value
-    immediately on every change.
-
+    Source node with a ``QSpinBox``. Outputs the current integer value.
 ``FloatInputNode``
-    Source node with a ``QDoubleSpinBox``.  Outputs the current float
-    value immediately on every change.
-
+    Source node with a ``QDoubleSpinBox``. Outputs the current float value.
 ``StringInputNode``
-    Source node with a single-line ``QLineEdit``.  Outputs the current
-    text immediately on every keystroke.
-
+    Source node with a single-line ``QLineEdit``. Outputs the current text.
 ``TextBoxInputNode``
-    Source / utility node with a multi-line ``QTextEdit``.  Accepts an
-    optional upstream ``text_in`` string to replace the editor contents
-    while still exposing the result downstream.
+    Source / utility node with a multi-line ``QTextEdit``.
+``RangeListNode``
+    List generator node using Python's built-in ``range``.
+``TextListNode``
+    Source node that emits a ``list[str]`` built from newline-separated editor text.
 
-Design notes
+Design Notes
 ------------
-* All nodes follow the ``ActiveNode`` + ``WidgetCore`` convention
-  established in ``simple_nodes.py`` and ``text_nodes.py``.
-* ``_widget_core`` is always the attribute name so
-  ``BaseControlNode.get_state()`` / ``restore_state()`` can reach it
-  for serialisation automatically.
-* UI updates for sink nodes are deferred to ``on_evaluate_finished()``
-  to avoid triggering redraws during the evaluation cycle itself.
+* All nodes follow the ``ActiveNode`` + ``WidgetCore`` convention.
+* Construction strictly follows the canonical 6-step recipe (§4).
+* Widget roles use ``PortRole`` enums; datatypes are lowercase strings.
+* ``compute()`` reads exclusively from ``inputs`` per §9.2.
+* Custom signals are emitted in ``on_evaluate_finished()`` to ensure graph consistency (§12.1).
 """
 
 from __future__ import annotations
@@ -57,8 +49,8 @@ from PySide6.QtWidgets import (
 
 from weave.basenode import ActiveNode
 from weave.noderegistry import register_node
-from weave.widgetcore import WidgetCore
-
+from weave.widgetcore import WidgetCore, PortRole
+from weave.node import VerticalSizePolicy
 from weave.logger import get_logger
 
 log = get_logger("PrimitiveNodes")
@@ -67,563 +59,522 @@ log = get_logger("PrimitiveNodes")
 # ══════════════════════════════════════════════════════════════════════════════
 # IntInputNode
 # ══════════════════════════════════════════════════════════════════════════════
-
 @register_node
 class IntInputNode(ActiveNode):
-    """
-    Source node that emits an integer via an editable ``QSpinBox``.
-
-    Type: Active (propagates downstream on every value change).
-    """
+    """Source node that emits an integer via an editable ``QSpinBox``."""
 
     value_changed = Signal(int)
 
-    node_class: ClassVar[str] = "Basic"
-    node_subclass: ClassVar[str] = "Input"
-    node_name: ClassVar[str] = "Integer Value"
-    node_description: ClassVar[str] = "Integer value source"
-    node_tags: ClassVar[List[str]] = ["int", "integer", "number", "input", "primitive"]
-    node_icon: ClassVar[str] = "node"
+    node_class:        ClassVar[str]                 = "Basic"
+    node_subclass:     ClassVar[str]                 = "Input"
+    node_name:         ClassVar[Optional[str]]       = "Integer Value"
+    node_description:  ClassVar[Optional[str]]       = "Integer value source"
+    node_tags:         ClassVar[Optional[List[str]]] = ["int", "integer", "number", "input", "primitive"]
+    vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
-    def __init__(
-        self,
-        title: str = "Integer Value",
-        initial_value: int = 0,
-        minimum: int = -2_147_483_648,
-        maximum: int = 2_147_483_647,
-        step: int = 1,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, title: str = "Integer Value", initial_value: int = 0, minimum: int = -2_147_483_648, maximum: int = 2_147_483_647, step: int = 1, **kwargs: Any) -> None:
         super().__init__(title=title, **kwargs)
 
-        # ── WidgetCore + QSpinBox ─────────────────────────────────────
-        self._widget_core = WidgetCore()
+        # Step 1: Add ports
+        self.add_output("value", datatype="int")
+
+        # Step 2: Build layout + WidgetCore
+        form = QFormLayout()
+        form.setContentsMargins(5, 5, 5, 5)
+        form.setSpacing(4)
+        self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
+        # Step 3: Create widgets, place in layout, register with WidgetCore
         spin = QSpinBox()
-        # Enforce C++ boundary type safety
         spin.setRange(int(minimum), int(maximum))
         spin.setSingleStep(int(step))
         spin.setValue(int(initial_value))
         spin.setMinimumWidth(100)
+        form.addRow("Value:", spin)
 
         self._widget_core.register_widget(
-            port_name="value",
-            widget=spin,
-            role="OUTPUT",
-            datatype="int",
-            default=0,
+            "value", spin,
+            role=PortRole.OUTPUT, datatype="int", default=int(initial_value),
+            add_to_layout=False,
         )
 
-        self.add_output("value", datatype="int")
+        # Step 4: Wire signals
+        self._widget_core.value_changed.connect(self._on_value_changed)
+        self._widget_core.port_value_written.connect(self._on_port_value_written)
 
-        self._widget_core.value_changed.connect(self._on_core_changed)
+        # Step 5 + 6: Mount & patch proxy
         self.set_content_widget(self._widget_core)
-        
         if hasattr(self._widget_core, 'patch_proxy'):
             self._widget_core.patch_proxy()
-        if hasattr(self._widget_core, 'refresh_widget_palettes'):
-            self._widget_core.refresh_widget_palettes()
-
-        self._cached_values["value"] = int(initial_value)
 
     @Slot(str)
-    def _on_core_changed(self, port_name: str) -> None:
+    def _on_value_changed(self, port: str) -> None:
         try:
-            if port_name == "value":
-                self.on_ui_change()
-                self.value_changed.emit(
-                    int(self._widget_core.get_port_value("value"))
-                )
+            # Mark dirty to trigger re-evaluation
+            self.on_ui_change()
         except Exception as exc:
-            log.error(f"Exception in IntInputNode._on_core_changed: {exc}")
+            log.error(f"Exception in {self.__class__.__name__}._on_value_changed: {exc}")
+
+    @Slot(str, object)
+    def _on_port_value_written(self, port: str, value: Any) -> None:
+        # Structural sync hook for undo-replay. No structural changes here.
+        pass
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Returns the current spinbox integer."""
         try:
-            return {"value": int(self._widget_core.get_port_value("value"))}
+            val = inputs.get("value")
+            return {"value": int(val) if val is not None else 0}
         except Exception as exc:
-            log.error(f"Exception in IntInputNode.compute: {exc}")
+            log.error(f"Exception in {self.__class__.__name__}.compute: {exc}")
             return {"value": 0}
 
+    def on_evaluate_finished(self) -> None:
+        # Emit custom signal only after graph cache is updated (§12.1)
+        val = self._get_cached_value("value")
+        if val is not None:
+            self.value_changed.emit(val)
+        super().on_evaluate_finished()
+
     def cleanup(self) -> None:
-        """Release resources and break reference cycles safely."""
         super().cleanup()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FloatInputNode
 # ══════════════════════════════════════════════════════════════════════════════
-
 @register_node
 class FloatInputNode(ActiveNode):
-    """
-    Source node that emits a float via an editable ``QDoubleSpinBox``.
-
-    Type: Active (propagates downstream on every value change).
-    """
+    """Source node that emits a float via an editable ``QDoubleSpinBox``."""
 
     value_changed = Signal(float)
 
-    node_class: ClassVar[str] = "Basic"
-    node_subclass: ClassVar[str] = "Input"
-    node_name: ClassVar[str] = "Float Value"
-    node_description: ClassVar[str] = "Floating-point value source"
-    node_tags: ClassVar[List[str]] = ["float", "number", "input", "primitive"]
-    node_icon: ClassVar[str] = "node"
+    node_class:        ClassVar[str]                 = "Basic"
+    node_subclass:     ClassVar[str]                 = "Input"
+    node_name:         ClassVar[Optional[str]]       = "Float Value"
+    node_description:  ClassVar[Optional[str]]       = "Floating-point value source"
+    node_tags:         ClassVar[Optional[List[str]]] = ["float", "number", "input", "primitive"]
+    vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
-    def __init__(
-        self,
-        title: str = "Float Value",
-        initial_value: float = 0.0,
-        minimum: float = -1e9,
-        maximum: float = 1e9,
-        step: float = 0.1,
-        decimals: int = 4,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, title: str = "Float Value", initial_value: float = 0.0, minimum: float = -1e9, maximum: float = 1e9, step: float = 0.1, decimals: int = 4, **kwargs: Any) -> None:
         super().__init__(title=title, **kwargs)
 
-        # ── WidgetCore + QDoubleSpinBox ───────────────────────────────
-        self._widget_core = WidgetCore()
+        # Step 1: Add ports
+        self.add_output("value", datatype="float")
+
+        # Step 2: Build layout + WidgetCore
+        form = QFormLayout()
+        form.setContentsMargins(5, 5, 5, 5)
+        form.setSpacing(4)
+        self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
+        # Step 3: Create widgets, place in layout, register with WidgetCore
         spin = QDoubleSpinBox()
-        # Enforce C++ boundary type safety
         spin.setRange(float(minimum), float(maximum))
         spin.setSingleStep(float(step))
         spin.setDecimals(int(decimals))
         spin.setValue(float(initial_value))
         spin.setMinimumWidth(110)
+        form.addRow("Value:", spin)
 
         self._widget_core.register_widget(
-            port_name="value",
-            widget=spin,
-            role="OUTPUT",
-            datatype="float",
-            default=0.0,
+            "value", spin,
+            role=PortRole.OUTPUT, datatype="float", default=float(initial_value),
+            add_to_layout=False,
         )
 
-        self.add_output("value", datatype="float")
+        # Step 4: Wire signals
+        self._widget_core.value_changed.connect(self._on_value_changed)
+        self._widget_core.port_value_written.connect(self._on_port_value_written)
 
-        self._widget_core.value_changed.connect(self._on_core_changed)
+        # Step 5 + 6: Mount & patch proxy
         self.set_content_widget(self._widget_core)
-        
         if hasattr(self._widget_core, 'patch_proxy'):
             self._widget_core.patch_proxy()
-        if hasattr(self._widget_core, 'refresh_widget_palettes'):
-            self._widget_core.refresh_widget_palettes()
-
-        self._cached_values["value"] = float(initial_value)
 
     @Slot(str)
-    def _on_core_changed(self, port_name: str) -> None:
+    def _on_value_changed(self, port: str) -> None:
         try:
-            if port_name == "value":
-                self.on_ui_change()
-                self.value_changed.emit(
-                    float(self._widget_core.get_port_value("value"))
-                )
+            # Mark dirty to trigger re-evaluation
+            self.on_ui_change()
         except Exception as exc:
-            log.error(f"Exception in FloatInputNode._on_core_changed: {exc}")
+            log.error(f"Exception in {self.__class__.__name__}._on_value_changed: {exc}")
+
+    @Slot(str, object)
+    def _on_port_value_written(self, port: str, value: Any) -> None:
+        pass
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Returns the current spinbox float."""
         try:
-            return {"value": float(self._widget_core.get_port_value("value"))}
+            val = inputs.get("value")
+            return {"value": float(val) if val is not None else 0.0}
         except Exception as exc:
-            log.error(f"Exception in FloatInputNode.compute: {exc}")
+            log.error(f"Exception in {self.__class__.__name__}.compute: {exc}")
             return {"value": 0.0}
 
+    def on_evaluate_finished(self) -> None:
+        # Emit custom signal only after graph cache is updated (§12.1)
+        val = self._get_cached_value("value")
+        if val is not None:
+            self.value_changed.emit(val)
+        super().on_evaluate_finished()
+
     def cleanup(self) -> None:
-        """Release resources and break reference cycles safely."""
         super().cleanup()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # StringInputNode
 # ══════════════════════════════════════════════════════════════════════════════
-
 @register_node
 class StringInputNode(ActiveNode):
-    """
-    Source node that emits a string via an editable single-line
-    ``QLineEdit``.  Responds immediately on every keystroke.
-
-    Type: Active (propagates downstream on every keystroke).
-    """
+    """Source node that emits a string via an editable single-line ``QLineEdit``."""
 
     text_changed = Signal(str)
 
-    node_class: ClassVar[str] = "Basic"
-    node_subclass: ClassVar[str] = "Input"
-    node_name: ClassVar[str] = "String Value"
-    node_description: ClassVar[str] = "Single-line string source"
-    node_tags: ClassVar[List[str]] = ["string", "text", "input", "primitive"]
-    node_icon: ClassVar[str] = "node"
+    node_class:        ClassVar[str]                 = "Basic"
+    node_subclass:     ClassVar[str]                 = "Input"
+    node_name:         ClassVar[Optional[str]]       = "String Value"
+    node_description:  ClassVar[Optional[str]]       = "Single-line string source"
+    node_tags:         ClassVar[Optional[List[str]]] = ["string", "text", "input", "primitive"]
+    vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
-    def __init__(
-        self,
-        title: str = "String Value",
-        initial_text: str = "",
-        placeholder: str = "Enter text…",
-        max_length: int = 0,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, title: str = "String Value", initial_text: str = "", placeholder: str = "Enter text…", max_length: int = 0, **kwargs: Any) -> None:
         super().__init__(title=title, **kwargs)
 
-        # ── WidgetCore + QLineEdit ────────────────────────────────────
-        self._widget_core = WidgetCore()
+        # Step 1: Add ports
+        self.add_output("text", datatype="str")
+
+        # Step 2: Build layout + WidgetCore
+        form = QFormLayout()
+        form.setContentsMargins(5, 5, 5, 5)
+        form.setSpacing(4)
+        self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
+        # Step 3: Create widgets, place in layout, register with WidgetCore
         line_edit = QLineEdit()
         line_edit.setText(str(initial_text))
         line_edit.setPlaceholderText(str(placeholder))
         line_edit.setMinimumWidth(130)
-        
         if int(max_length) > 0:
             line_edit.setMaxLength(int(max_length))
 
+        form.addRow("Text:", line_edit)
+
         self._widget_core.register_widget(
-            port_name="text",
-            widget=line_edit,
-            role="OUTPUT",
-            datatype="string",
-            default="",
+            "text", line_edit,
+            role=PortRole.OUTPUT, datatype="str", default=str(initial_text),
+            add_to_layout=False,
         )
 
-        self.add_output("text", datatype="string")
+        # Step 4: Wire signals
+        self._widget_core.value_changed.connect(self._on_value_changed)
+        self._widget_core.port_value_written.connect(self._on_port_value_written)
 
-        self._widget_core.value_changed.connect(self._on_core_changed)
+        # Step 5 + 6: Mount & patch proxy
         self.set_content_widget(self._widget_core)
-        
         if hasattr(self._widget_core, 'patch_proxy'):
             self._widget_core.patch_proxy()
-        if hasattr(self._widget_core, 'refresh_widget_palettes'):
-            self._widget_core.refresh_widget_palettes()
-
-        self._cached_values["text"] = str(initial_text)
 
     @Slot(str)
-    def _on_core_changed(self, port_name: str) -> None:
+    def _on_value_changed(self, port: str) -> None:
         try:
-            if port_name == "text":
-                self.on_ui_change()
-                self.text_changed.emit(
-                    str(self._widget_core.get_port_value("text"))
-                )
+            # Mark dirty to trigger re-evaluation
+            self.on_ui_change()
         except Exception as exc:
-            log.error(f"Exception in StringInputNode._on_core_changed: {exc}")
+            log.error(f"Exception in {self.__class__.__name__}._on_value_changed: {exc}")
+
+    @Slot(str, object)
+    def _on_port_value_written(self, port: str, value: Any) -> None:
+        pass
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Returns the current line-edit text."""
         try:
-            return {"text": str(self._widget_core.get_port_value("text"))}
+            val = inputs.get("text")
+            return {"text": str(val) if val is not None else ""}
         except Exception as exc:
-            log.error(f"Exception in StringInputNode.compute: {exc}")
+            log.error(f"Exception in {self.__class__.__name__}.compute: {exc}")
             return {"text": ""}
 
+    def on_evaluate_finished(self) -> None:
+        # Emit custom signal only after graph cache is updated (§12.1)
+        val = self._get_cached_value("text")
+        if val is not None:
+            self.text_changed.emit(val)
+        super().on_evaluate_finished()
+
     def cleanup(self) -> None:
-        """Release resources and break reference cycles safely."""
         super().cleanup()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TextBoxInputNode
 # ══════════════════════════════════════════════════════════════════════════════
-
 @register_node
 class TextBoxInputNode(ActiveNode):
-    """
-    Source node with an editable multi-line ``QTextEdit``.
-    Propagates downstream on every text change.
-
-    Type: Active (propagates downstream on every text change).
-    """
+    """Source node with an editable multi-line ``QTextEdit``."""
 
     text_changed = Signal(str)
 
-    node_class: ClassVar[str] = "Basic"
-    node_subclass: ClassVar[str] = "Input"
-    node_name: ClassVar[str] = "Text Box"
-    node_description: ClassVar[str] = "Multi-line text editor source"
-    node_tags: ClassVar[List[str]] = ["text", "multiline", "editor", "input", "primitive"]
-    node_icon: ClassVar[str] = "node"
+    node_class:        ClassVar[str]                 = "Basic"
+    node_subclass:     ClassVar[str]                 = "Input"
+    node_name:         ClassVar[Optional[str]]       = "Text Box"
+    node_description:  ClassVar[Optional[str]]       = "Multi-line text editor source"
+    node_tags:         ClassVar[Optional[List[str]]] = ["text", "multiline", "editor", "input", "primitive"]
+    vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
-    def __init__(
-        self,
-        title: str = "Text Box",
-        initial_text: str = "",
-        min_width: int = 180,
-        min_height: int = 90,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, title: str = "Text Box", initial_text: str = "", min_width: int = 180, min_height: int = 90, **kwargs: Any) -> None:
         super().__init__(title=title, **kwargs)
 
-        # ── WidgetCore + QTextEdit ────────────────────────────────────
-        self._widget_core = WidgetCore()
+        # Step 1: Add ports
+        self.add_output("text", datatype="str")
+
+        # Step 2: Build layout + WidgetCore
+        form = QFormLayout()
+        form.setContentsMargins(5, 5, 5, 5)
+        form.setSpacing(4)
+        self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
+        # Step 3: Create widgets, place in layout, register with WidgetCore
         self._editor = QTextEdit()
         self._editor.setPlainText(str(initial_text))
         self._editor.setMinimumSize(int(min_width), int(min_height))
         self._editor.setAcceptRichText(False)
 
+        form.addRow("Content:", self._editor)
+
         self._widget_core.register_widget(
-            port_name="text",
-            widget=self._editor,
-            role="OUTPUT",
-            datatype="string",
-            default="",
+            "text", self._editor,
+            role=PortRole.OUTPUT, datatype="str", default=str(initial_text),
             getter=lambda: self._editor.toPlainText(),
             setter=lambda v: self._editor.setPlainText(str(v)),
+            add_to_layout=False,
         )
 
-        self.add_output("text", datatype="string")
+        # Step 4: Wire signals
+        self._widget_core.value_changed.connect(self._on_value_changed)
+        self._widget_core.port_value_written.connect(self._on_port_value_written)
 
-        # textChanged has no arguments — use a lambda shim
-        self._editor.textChanged.connect(lambda: self._on_core_changed("text"))
+        # Step 5 + 6: Mount & patch proxy
         self.set_content_widget(self._widget_core)
-        
         if hasattr(self._widget_core, 'patch_proxy'):
             self._widget_core.patch_proxy()
-        if hasattr(self._widget_core, 'refresh_widget_palettes'):
-            self._widget_core.refresh_widget_palettes()
-
-        self._cached_values["text"] = str(initial_text)
 
     @Slot(str)
-    def _on_core_changed(self, port_name: str) -> None:
+    def _on_value_changed(self, port: str) -> None:
         try:
-            if port_name == "text":
-                self.on_ui_change()
-                self.text_changed.emit(
-                    str(self._widget_core.get_port_value("text"))
-                )
+            # Mark dirty to trigger re-evaluation
+            self.on_ui_change()
         except Exception as exc:
-            log.error(f"Exception in TextBoxInputNode._on_core_changed: {exc}")
+            log.error(f"Exception in {self.__class__.__name__}._on_value_changed: {exc}")
+
+    @Slot(str, object)
+    def _on_port_value_written(self, port: str, value: Any) -> None:
+        pass
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Returns the current editor plain-text."""
         try:
-            return {"text": str(self._widget_core.get_port_value("text"))}
+            val = inputs.get("text")
+            return {"text": str(val) if val is not None else ""}
         except Exception as exc:
-            log.error(f"Exception in TextBoxInputNode.compute: {exc}")
+            log.error(f"Exception in {self.__class__.__name__}.compute: {exc}")
             return {"text": ""}
 
+    def on_evaluate_finished(self) -> None:
+        # Emit custom signal only after graph cache is updated (§12.1)
+        val = self._get_cached_value("text")
+        if val is not None:
+            self.text_changed.emit(val)
+        super().on_evaluate_finished()
+
     def cleanup(self) -> None:
-        """Release resources and break reference cycles safely."""
         super().cleanup()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # RangeListNode
 # ══════════════════════════════════════════════════════════════════════════════
-
 @register_node
 class RangeListNode(ActiveNode):
-    """
-    List generator node using Python's built-in ``range``.
+    """List generator node using Python's built-in ``range``."""
 
-    Generates integer sequences with configurable start, stop, and step
-    values via embedded spinboxes.  There are no input ports — all parameters
-    are controlled exclusively through the node body widgets.
-
-    Type: Active (Updates downstream on parameter change).
-    """
     list_changed = Signal(list)
 
-    node_class: ClassVar[str] = "Basic"
-    node_subclass: ClassVar[str] = "Generator"
-    node_name: ClassVar[str] = "Range List"
-    node_description: ClassVar[str] = "Creates numerical lists"
-    node_tags: ClassVar[List[str]] = ["list", "range", "generator"]
-    node_icon: ClassVar[str] = "node"
+    node_class:        ClassVar[str]                 = "Basic"
+    node_subclass:     ClassVar[str]                 = "Generator"
+    node_name:         ClassVar[Optional[str]]       = "Range List"
+    node_description:  ClassVar[Optional[str]]       = "Creates numerical lists"
+    node_tags:         ClassVar[Optional[List[str]]] = ["list", "range", "generator"]
+    vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
     def __init__(self, title: str = "Range List", **kwargs: Any) -> None:
         super().__init__(title=title, **kwargs)
 
+        # Step 1: Add ports
         self.add_output("list", datatype="list")
 
+        # Step 2: Build layout + WidgetCore
         form = QFormLayout()
         form.setContentsMargins(5, 5, 5, 5)
         form.setSpacing(4)
-        
         self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
+        # Step 3: Create widgets, place in layout, register with WidgetCore (INTERNAL)
         spin_start = QSpinBox()
         spin_start.setRange(int(-9999), int(9999))
         spin_start.setValue(0)
+        form.addRow("Start:", spin_start)
+        self._widget_core.register_widget("start", spin_start, role=PortRole.INTERNAL, datatype="int", default=0, add_to_layout=False)
 
         spin_stop = QSpinBox()
         spin_stop.setRange(int(-9999), int(9999))
         spin_stop.setValue(10)
+        form.addRow("Stop:", spin_stop)
+        self._widget_core.register_widget("stop", spin_stop, role=PortRole.INTERNAL, datatype="int", default=10, add_to_layout=False)
 
         spin_step = QSpinBox()
         spin_step.setRange(int(1), int(9999))
         spin_step.setValue(1)
+        form.addRow("Step:", spin_step)
+        self._widget_core.register_widget("step", spin_step, role=PortRole.INTERNAL, datatype="int", default=1, add_to_layout=False)
 
-        form.addRow("Start:", spin_start)
-        form.addRow("Stop:",  spin_stop)
-        form.addRow("Step:",  spin_step)
+        # Step 4: Wire signals
+        self._widget_core.value_changed.connect(self._on_value_changed)
+        self._widget_core.port_value_written.connect(self._on_port_value_written)
 
-        # Registered as INTERNAL so they do not auto-generate unintended output ports
-        self._widget_core.register_widget(
-            port_name="start",
-            widget=spin_start,
-            role="INTERNAL",
-            datatype="int",
-            default=0,
-            add_to_layout=False,
-        )
-        self._widget_core.register_widget(
-            port_name="stop",
-            widget=spin_stop,
-            role="INTERNAL",
-            datatype="int",
-            default=10,
-            add_to_layout=False,
-        )
-        self._widget_core.register_widget(
-            port_name="step",
-            widget=spin_step,
-            role="INTERNAL",
-            datatype="int",
-            default=1,
-            add_to_layout=False,
-        )
-
-        self._widget_core.value_changed.connect(self._on_core_changed)
-
+        # Step 5 + 6: Mount & patch proxy
         self.set_content_widget(self._widget_core)
-        
         if hasattr(self._widget_core, 'patch_proxy'):
             self._widget_core.patch_proxy()
-        if hasattr(self._widget_core, 'refresh_widget_palettes'):
-            self._widget_core.refresh_widget_palettes()
 
     @Slot(str)
-    def _on_core_changed(self, port_name: str) -> None:
-        """Propagates UI changes to the graph logic."""
+    def _on_value_changed(self, port: str) -> None:
         try:
+            # Mark dirty to trigger re-evaluation
             self.on_ui_change()
         except Exception as e:
-            log.error(f"Exception in RangeListNode._on_core_changed: {e}")
+            log.error(f"Exception in {self.__class__.__name__}._on_value_changed: {e}")
+
+    @Slot(str, object)
+    def _on_port_value_written(self, port: str, value: Any) -> None:
+        pass
 
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Generates a list using Python's range() from the widget values."""
         try:
-            start = int(self._widget_core.get_port_value("start") or 0)
-            stop  = int(self._widget_core.get_port_value("stop")  or 10)
-            step  = int(self._widget_core.get_port_value("step")  or 1)
+            start = int(inputs.get("start") or 0)
+            stop  = int(inputs.get("stop")  or 10)
+            step  = int(inputs.get("step")  or 1)
 
             if step == 0:
                 step = 1
 
             result_list = list(range(start, stop, step))
-            self.list_changed.emit(result_list)
             return {"list": result_list}
-
         except Exception as e:
-            log.error(f"Exception in RangeListNode.compute: {e}")
+            log.error(f"Exception in {self.__class__.__name__}.compute: {e}")
             return {"list": []}
 
+    def on_evaluate_finished(self) -> None:
+        # Emit custom signal only after graph cache is updated (§12.1)
+        val = self._get_cached_value("list")
+        if val is not None:
+            self.list_changed.emit(val)
+        super().on_evaluate_finished()
+
     def cleanup(self) -> None:
-        """Release resources and break reference cycles safely."""
         super().cleanup()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TextListNode
 # ══════════════════════════════════════════════════════════════════════════════
-
 @register_node
 class TextListNode(ActiveNode):
-    """
-    Source node that emits a ``list[str]`` built from a multi-line
-    ``QTextEdit``.  Each non-empty line becomes one element.
-    """
+    """Source node that emits a ``list[str]`` built from a multi-line ``QTextEdit``."""
 
     list_changed = Signal(list)
 
-    node_class: ClassVar[str] = "Basic"
-    node_subclass: ClassVar[str] = "Generator"
-    node_name: ClassVar[str] = "Text List"
-    node_description: ClassVar[str] = "Builds a list from newline-separated editor text"
-    node_tags: ClassVar[List[str]] = ["list", "generator", "text", "input", "primitive"]
-    node_icon: ClassVar[str] = "node"
+    node_class:        ClassVar[str]                 = "Basic"
+    node_subclass:     ClassVar[str]                 = "Generator"
+    node_name:         ClassVar[Optional[str]]       = "Text List"
+    node_description:  ClassVar[Optional[str]]       = "Builds a list from newline-separated editor text"
+    node_tags:         ClassVar[Optional[List[str]]] = ["list", "generator", "text", "input", "primitive"]
+    vertical_size_policy: ClassVar[VerticalSizePolicy] = VerticalSizePolicy.FIT
 
-    def __init__(
-        self,
-        title: str = "Text List",
-        initial_text: str = "",
-        min_width: int = 160,
-        min_height: int = 90,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, title: str = "Text List", initial_text: str = "", min_width: int = 160, min_height: int = 90, **kwargs: Any) -> None:
         super().__init__(title=title, **kwargs)
 
+        # Step 1: Add ports
         self.add_output("list", datatype="list")
 
-        # ── WidgetCore + QTextEdit ────────────────────────────────────
-        self._widget_core = WidgetCore()
+        # Step 2: Build layout + WidgetCore
+        form = QFormLayout()
+        form.setContentsMargins(5, 5, 5, 5)
+        form.setSpacing(4)
+        self._widget_core = WidgetCore(layout=form)
         self._widget_core.set_node(self)
 
+        # Step 3: Create widgets, place in layout, register with WidgetCore (INTERNAL)
         self._editor = QTextEdit()
         self._editor.setPlainText(str(initial_text))
         self._editor.setMinimumSize(int(min_width), int(min_height))
         self._editor.setAcceptRichText(False)
         self._editor.setPlaceholderText("One item per line…")
 
+        form.addRow("Lines:", self._editor)
+
         self._widget_core.register_widget(
-            port_name="text",
-            widget=self._editor,
-            role="DISPLAY",
-            datatype="string",
-            default="",
+            "text", self._editor,
+            role=PortRole.INTERNAL, datatype="str", default=str(initial_text),
             getter=lambda: self._editor.toPlainText(),
             setter=lambda v: self._editor.setPlainText(str(v)),
+            add_to_layout=False,
         )
 
-        self._editor.textChanged.connect(lambda: self._on_editor_changed())
+        # Step 4: Wire signals
+        self._widget_core.value_changed.connect(self._on_value_changed)
+        self._widget_core.port_value_written.connect(self._on_port_value_written)
+
+        # Step 5 + 6: Mount & patch proxy
         self.set_content_widget(self._widget_core)
-        
         if hasattr(self._widget_core, 'patch_proxy'):
             self._widget_core.patch_proxy()
-        if hasattr(self._widget_core, 'refresh_widget_palettes'):
-            self._widget_core.refresh_widget_palettes()
 
-        self._cached_values["list"] = self._parse_lines(str(initial_text))
+    @Slot(str)
+    def _on_value_changed(self, port: str) -> None:
+        try:
+            # Mark dirty to trigger re-evaluation
+            self.on_ui_change()
+        except Exception as exc:
+            log.error(f"Exception in {self.__class__.__name__}._on_value_changed: {exc}")
 
-    # ── Helpers ──────────────────────────────────────────────────────
+    @Slot(str, object)
+    def _on_port_value_written(self, port: str, value: Any) -> None:
+        pass
 
     @staticmethod
     def _parse_lines(raw: str) -> List[str]:
-        """Split *raw* on newlines, strip each line, drop empties."""
         return [line.strip() for line in raw.splitlines() if line.strip()]
 
-    # ── Signal handling ──────────────────────────────────────────────
-
-    def _on_editor_changed(self) -> None:
-        try:
-            self.on_ui_change()
-            self.list_changed.emit(
-                self._parse_lines(self._editor.toPlainText())
-            )
-        except Exception as exc:
-            log.error(f"Exception in TextListNode._on_editor_changed: {exc}")
-
-    # ── Computation ──────────────────────────────────────────────────
-
     def compute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Parses the editor text and returns the item list."""
         try:
-            result = self._parse_lines(self._editor.toPlainText())
+            val = inputs.get("text")
+            result = self._parse_lines(str(val) if val is not None else "")
             return {"list": result}
         except Exception as exc:
-            log.error(f"Exception in TextListNode.compute: {exc}")
+            log.error(f"Exception in {self.__class__.__name__}.compute: {exc}")
             return {"list": []}
 
+    def on_evaluate_finished(self) -> None:
+        # Emit custom signal only after graph cache is updated (§12.1)
+        val = self._get_cached_value("list")
+        if val is not None:
+            self.list_changed.emit(val)
+        super().on_evaluate_finished()
+
     def cleanup(self) -> None:
-        """Release resources and break reference cycles safely."""
         super().cleanup()
